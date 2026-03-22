@@ -515,6 +515,52 @@ static void addGlobalSymbol(pdb::GSIStreamBuilder &builder, uint16_t modIndex,
   }
 }
 
+static bool symbolUsesGlobalProcRef(const CVSymbol &sym) {
+  switch (sym.kind()) {
+  case SymbolKind::S_GPROC32:
+  case SymbolKind::S_LPROC32:
+  case SymbolKind::S_GPROC32_ID:
+  case SymbolKind::S_LPROC32_ID:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static void addGlobalProcRefSymbol(pdb::GSIStreamBuilder &builder,
+                                   uint16_t modIndex, unsigned symOffset,
+                                   CVSymbol sym) {
+  SymbolRecordKind k = SymbolRecordKind::ProcRefSym;
+  if (sym.kind() == SymbolKind::S_LPROC32 ||
+      sym.kind() == SymbolKind::S_LPROC32_ID)
+    k = SymbolRecordKind::LocalProcRef;
+
+  ProcRefSym ps(k);
+  ps.Module = modIndex;
+  // For some reason, MSVC seems to add one to this value.
+  ++ps.Module;
+  ps.Name = getSymbolName(sym);
+  ps.SumName = 0;
+  ps.SymOffset = symOffset;
+  builder.addGlobalSymbol(ps);
+}
+
+static void advanceRelocIndexForSymbol(SectionChunk *debugChunk,
+                                       ArrayRef<uint8_t> sectionContents,
+                                       ArrayRef<uint8_t> symbolContents,
+                                       uint32_t &nextRelocIndex) {
+  size_t vaBegin = std::distance(sectionContents.begin(), symbolContents.begin());
+  size_t vaEnd = std::distance(sectionContents.begin(), symbolContents.end());
+  ArrayRef<coff_relocation> relocs = debugChunk->getRelocs();
+  for (; nextRelocIndex < relocs.size(); ++nextRelocIndex) {
+    const coff_relocation &rel = relocs[nextRelocIndex];
+    if (rel.VirtualAddress < vaBegin)
+      continue;
+    if (rel.VirtualAddress + 1 >= vaEnd)
+      break;
+  }
+}
+
 // Check if the given symbol record was padded for alignment. If so, zero out
 // the padding bytes and update the record prefix with the new size.
 static void fixRecordAlignment(MutableArrayRef<uint8_t> recordBytes,
@@ -597,12 +643,20 @@ void PDBLinker::analyzeSymbolSubsection(
         // Copy global records. Some global records (mainly procedures)
         // reference the current offset into the module stream.
         if (symbolGoesInGlobalsStream(sym, scopeLevel)) {
-          storage.clear();
-          writeSymbolRecord(debugChunk, sectionContents, sym, alignedSize,
-                            nextRelocIndex, storage);
-          addGlobalSymbol(builder.getGsiBuilder(),
-                          file->moduleDBI->getModuleIndex(), moduleSymOffset,
-                          storage);
+          if (symbolUsesGlobalProcRef(sym)) {
+            advanceRelocIndexForSymbol(debugChunk, sectionContents, sym.data(),
+                                       nextRelocIndex);
+            addGlobalProcRefSymbol(builder.getGsiBuilder(),
+                                   file->moduleDBI->getModuleIndex(),
+                                   moduleSymOffset, sym);
+          } else {
+            storage.clear();
+            writeSymbolRecord(debugChunk, sectionContents, sym, alignedSize,
+                              nextRelocIndex, storage);
+            addGlobalSymbol(builder.getGsiBuilder(),
+                            file->moduleDBI->getModuleIndex(), moduleSymOffset,
+                            storage);
+          }
 
           if (ctx.pdbStats.has_value())
             ++ctx.pdbStats->globalSymbols;
