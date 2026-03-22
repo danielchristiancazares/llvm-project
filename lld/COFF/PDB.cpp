@@ -61,6 +61,68 @@ using llvm::object::coff_section;
 using llvm::pdb::StringTableFixup;
 
 namespace {
+enum class SymbolRecordWritePhase : uint8_t { Global, Module };
+enum class SymbolRewriteKind : uint8_t {
+  NoTypeRefs,
+  ProcIdEndOnly,
+  ProcIdFixedIndex,
+  Generic,
+};
+
+constexpr uint32_t procIdTypeRefOffset = 24;
+
+struct SymbolRecordRewriteTimers {
+  Timer &total;
+  Timer &relocate;
+  Timer &typeRemap;
+  Timer &idTranslation;
+};
+
+static SymbolRecordRewriteTimers
+getSymbolRecordRewriteTimers(COFFLinkerContext &ctx,
+                             SymbolRecordWritePhase phase) {
+  if (phase == SymbolRecordWritePhase::Module)
+    return {ctx.moduleSymbolRecordWriteTimer, ctx.moduleSymbolRelocateTimer,
+            ctx.moduleSymbolTypeRemapTimer, ctx.moduleSymbolIdTranslateTimer};
+
+  return {ctx.globalSymbolRecordWriteTimer, ctx.globalSymbolRelocateTimer,
+          ctx.globalSymbolTypeRemapTimer, ctx.globalSymbolIdTranslateTimer};
+}
+
+static SymbolRewriteKind classifySymbolRewrite(SymbolKind kind) {
+  switch (kind) {
+  case SymbolKind::S_PROC_ID_END:
+    return SymbolRewriteKind::ProcIdEndOnly;
+  case SymbolKind::S_GPROC32_ID:
+  case SymbolKind::S_LPROC32_ID:
+    return SymbolRewriteKind::ProcIdFixedIndex;
+  case SymbolKind::S_DEFRANGE_REGISTER:
+  case SymbolKind::S_DEFRANGE_REGISTER_REL:
+  case SymbolKind::S_DEFRANGE_REGISTER_REL_INDIR:
+  case SymbolKind::S_DEFRANGE_FRAMEPOINTER_REL:
+  case SymbolKind::S_DEFRANGE_FRAMEPOINTER_REL_FULL_SCOPE:
+  case SymbolKind::S_DEFRANGE_SUBFIELD_REGISTER:
+  case SymbolKind::S_DEFRANGE_SUBFIELD:
+  case SymbolKind::S_LABEL32:
+  case SymbolKind::S_OBJNAME:
+  case SymbolKind::S_COMPILE:
+  case SymbolKind::S_COMPILE2:
+  case SymbolKind::S_COMPILE3:
+  case SymbolKind::S_ENVBLOCK:
+  case SymbolKind::S_BLOCK32:
+  case SymbolKind::S_FRAMEPROC:
+  case SymbolKind::S_THUNK32:
+  case SymbolKind::S_FRAMECOOKIE:
+  case SymbolKind::S_UNAMESPACE:
+  case SymbolKind::S_ARMSWITCHTABLE:
+  case SymbolKind::S_END:
+  case SymbolKind::S_INLINESITE_END:
+    return SymbolRewriteKind::NoTypeRefs;
+  default:
+    return SymbolRewriteKind::Generic;
+  }
+}
+
 class DebugSHandler;
 
 class PDBLinker {
@@ -125,6 +187,7 @@ public:
   void writeSymbolRecord(SectionChunk *debugChunk,
                          ArrayRef<uint8_t> sectionContents, CVSymbol sym,
                          size_t alignedSize, uint32_t &nextRelocIndex,
+                         const SymbolRecordRewriteTimers &timers,
                          std::vector<uint8_t> &storage);
 
   /// Add the section map and section contributions to the PDB.
@@ -138,8 +201,11 @@ public:
 
 private:
   void pdbMakeAbsolute(SmallVectorImpl<char> &fileName);
+  TypeIndex &remapFixedTypeIndex(MutableArrayRef<uint8_t> &recordData,
+                                 TpiSource *source, uint32_t contentOffset,
+                                 TiRefKind refKind);
   void translateIdSymbols(MutableArrayRef<uint8_t> &recordData,
-                          TpiSource *source);
+                          TpiSource *source, TypeIndex *procIdType = nullptr);
   void addCommonLinkerModuleSymbols(StringRef path,
                                     pdb::DbiModuleDescriptorBuilder &mod);
 
@@ -322,9 +388,35 @@ static SymbolKind symbolKind(ArrayRef<uint8_t> recordData) {
   return static_cast<SymbolKind>(uint16_t(prefix->RecordKind));
 }
 
+TypeIndex &PDBLinker::remapFixedTypeIndex(MutableArrayRef<uint8_t> &recordData,
+                                         TpiSource *source,
+                                         uint32_t contentOffset,
+                                         TiRefKind refKind) {
+  MutableArrayRef<uint8_t> content = recordData.drop_front(sizeof(RecordPrefix));
+  if (content.size() < contentOffset + sizeof(TypeIndex))
+    Fatal(ctx) << "symbol record too short";
+
+  TypeIndex *ti =
+      reinterpret_cast<TypeIndex *>(content.data() + contentOffset);
+  if (!source->remapTypeIndex(*ti, refKind)) {
+    if (ctx.config.verbose) {
+      uint16_t kind =
+          reinterpret_cast<const RecordPrefix *>(recordData.data())->RecordKind;
+      StringRef fname = source->file ? source->file->getName() : "<unknown PDB>";
+      Log(ctx) << "failed to remap type index in record of kind 0x"
+               << utohexstr(kind) << " in " << fname << " with bad "
+               << (refKind == TiRefKind::IndexRef ? "item" : "type")
+               << " index 0x" << utohexstr(ti->getIndex());
+    }
+    *ti = TypeIndex(SimpleTypeKind::NotTranslated);
+  }
+
+  return *ti;
+}
+
 /// MSVC translates S_PROC_ID_END to S_END, and S_[LG]PROC32_ID to S_[LG]PROC32
 void PDBLinker::translateIdSymbols(MutableArrayRef<uint8_t> &recordData,
-                                   TpiSource *source) {
+                                   TpiSource *source, TypeIndex *procIdType) {
   RecordPrefix *prefix = reinterpret_cast<RecordPrefix *>(recordData.data());
 
   SymbolKind kind = symbolKind(recordData);
@@ -340,15 +432,17 @@ void PDBLinker::translateIdSymbols(MutableArrayRef<uint8_t> &recordData,
   // symbol that refers to the type stream index space.  So we remap again from
   // ID index space to type index space.
   if (kind == SymbolKind::S_GPROC32_ID || kind == SymbolKind::S_LPROC32_ID) {
-    SmallVector<TiReference, 1> refs;
-    auto content = recordData.drop_front(sizeof(RecordPrefix));
-    CVSymbol sym(recordData);
-    discoverTypeIndicesInSymbol(sym, refs);
-    assert(refs.size() == 1);
-    assert(refs.front().Count == 1);
+    TypeIndex *ti = procIdType;
+    if (!ti) {
+      SmallVector<TiReference, 1> refs;
+      auto content = recordData.drop_front(sizeof(RecordPrefix));
+      CVSymbol sym(recordData);
+      discoverTypeIndicesInSymbol(sym, refs);
+      assert(refs.size() == 1);
+      assert(refs.front().Count == 1);
+      ti = reinterpret_cast<TypeIndex *>(content.data() + refs[0].Offset);
+    }
 
-    TypeIndex *ti =
-        reinterpret_cast<TypeIndex *>(content.data() + refs[0].Offset);
     // `ti` is the index of a FuncIdRecord or MemberFuncIdRecord which lives in
     // the IPI stream, whose `FunctionType` member refers to the TPI stream.
     // Note that LF_FUNC_ID and LF_MFUNC_ID have the same record layout, and
@@ -589,27 +683,60 @@ void PDBLinker::writeSymbolRecord(SectionChunk *debugChunk,
                                   ArrayRef<uint8_t> sectionContents,
                                   CVSymbol sym, size_t alignedSize,
                                   uint32_t &nextRelocIndex,
+                                  const SymbolRecordRewriteTimers &timers,
                                   std::vector<uint8_t> &storage) {
+  ScopedTimer totalTimer(timers.total);
+
   // Allocate space for the new record at the end of the storage.
   storage.resize(storage.size() + alignedSize);
   auto recordBytes = MutableArrayRef<uint8_t>(storage).take_back(alignedSize);
 
   // Copy the symbol record and relocate it.
-  debugChunk->writeAndRelocateSubsection(sectionContents, sym.data(),
-                                         nextRelocIndex, recordBytes.data());
-  fixRecordAlignment(recordBytes, sym.length());
+  {
+    ScopedTimer t(timers.relocate);
+    debugChunk->writeAndRelocateSubsection(sectionContents, sym.data(),
+                                           nextRelocIndex,
+                                           recordBytes.data());
+    fixRecordAlignment(recordBytes, sym.length());
+  }
 
   // Re-map all the type index references.
   TpiSource *source = debugChunk->file->debugTypesObj;
-  if (!source->remapTypesInSymbolRecord(recordBytes)) {
-    Log(ctx) << "ignoring unknown symbol record with kind 0x"
-             << utohexstr(sym.kind());
-    replaceWithSkipRecord(recordBytes);
+  switch (classifySymbolRewrite(sym.kind())) {
+  case SymbolRewriteKind::NoTypeRefs:
+    break;
+  case SymbolRewriteKind::ProcIdEndOnly: {
+    ScopedTimer t(timers.idTranslation);
+    translateIdSymbols(recordBytes, source);
+    break;
   }
+  case SymbolRewriteKind::ProcIdFixedIndex: {
+    TypeIndex *procIdType = nullptr;
+    {
+      ScopedTimer t(timers.typeRemap);
+      procIdType = &remapFixedTypeIndex(recordBytes, source, procIdTypeRefOffset,
+                                        TiRefKind::IndexRef);
+    }
 
-  // An object file may have S_xxx_ID symbols, but these get converted to
-  // "real" symbols in a PDB.
-  translateIdSymbols(recordBytes, source);
+    // An object file may have S_xxx_ID symbols, but these get converted to
+    // "real" symbols in a PDB.
+    {
+      ScopedTimer t(timers.idTranslation);
+      translateIdSymbols(recordBytes, source, procIdType);
+    }
+    break;
+  }
+  case SymbolRewriteKind::Generic:
+    {
+      ScopedTimer t(timers.typeRemap);
+      if (!source->remapTypesInSymbolRecord(recordBytes)) {
+        Log(ctx) << "ignoring unknown symbol record with kind 0x"
+                 << utohexstr(sym.kind());
+        replaceWithSkipRecord(recordBytes);
+      }
+    }
+    break;
+  }
 }
 
 void PDBLinker::analyzeSymbolSubsection(
@@ -618,6 +745,8 @@ void PDBLinker::analyzeSymbolSubsection(
     BinaryStreamRef symData) {
   ObjFile *file = debugChunk->file;
   uint32_t moduleSymStart = moduleSymOffset;
+  const auto rewriteTimers =
+      getSymbolRecordRewriteTimers(ctx, SymbolRecordWritePhase::Global);
 
   uint32_t scopeLevel = 0;
   std::vector<uint8_t> storage;
@@ -652,7 +781,7 @@ void PDBLinker::analyzeSymbolSubsection(
           } else {
             storage.clear();
             writeSymbolRecord(debugChunk, sectionContents, sym, alignedSize,
-                              nextRelocIndex, storage);
+                              nextRelocIndex, rewriteTimers, storage);
             addGlobalSymbol(builder.getGsiBuilder(),
                             file->moduleDBI->getModuleIndex(), moduleSymOffset,
                             storage);
@@ -688,9 +817,12 @@ void PDBLinker::analyzeSymbolSubsection(
 
 Error PDBLinker::writeAllModuleSymbolRecords(ObjFile *file,
                                              BinaryStreamWriter &writer) {
+  ScopedTimer t(ctx.commitModuleSymbolsTimer);
   ExitOnError exitOnErr;
   std::vector<uint8_t> storage;
   SmallVector<uint32_t, 4> scopes;
+  const auto rewriteTimers =
+      getSymbolRecordRewriteTimers(ctx, SymbolRecordWritePhase::Module);
 
   // Visit all live .debug$S sections a second time, and write them to the PDB.
   for (SectionChunk *debugChunk : file->getDebugChunks()) {
@@ -730,7 +862,7 @@ Error PDBLinker::writeAllModuleSymbolRecords(ObjFile *file,
               uint32_t alignedSize =
                   alignTo(sym.length(), alignOf(CodeViewContainer::Pdb));
               writeSymbolRecord(debugChunk, sectionContents, sym, alignedSize,
-                                nextRelocIndex, storage);
+                                nextRelocIndex, rewriteTimers, storage);
             }
             return Error::success();
           });
@@ -1091,6 +1223,7 @@ void PDBLinker::addDebugSymbols(TpiSource *source) {
       continue;
 
     if (isDebugS) {
+      ScopedTimer t(ctx.handleDebugSTimer);
       dsh.handleDebugS(debugChunk);
     } else if (isDebugF) {
       // Handle old FPO data .debug$F sections. These are relatively rare.

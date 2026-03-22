@@ -244,6 +244,7 @@ private:
   void initializeChunks();
   void initializeSymbols();
   void initializeFlags();
+  void initializePchSignature();
   void initializeDependencies();
   void initializeECThunks();
 
