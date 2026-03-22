@@ -91,6 +91,15 @@ public:
   // All timers used in the COFF linker.
   Timer rootTimer;
   Timer inputFileTimer;
+  Timer inputParseTimer;
+  Timer initializeChunksTimer;
+  Timer initializeSymbolsTimer;
+  Timer initializeSymbolsMainPassTimer;
+  Timer initializeSymbolsPendingTimer;
+  Timer initializeSymbolsWeakAliasesTimer;
+  Timer initializeFlagsTimer;
+  Timer initializeDependenciesTimer;
+  Timer initializeECThunksTimer;
   Timer ltoTimer;
   Timer gcTimer;
   Timer icfTimer;
@@ -110,9 +119,19 @@ public:
   Timer loadGHashTimer;
   Timer mergeGHashTimer;
   Timer symbolMergingTimer;
+  Timer handleDebugSTimer;
+  Timer globalSymbolRecordWriteTimer;
+  Timer globalSymbolRelocateTimer;
+  Timer globalSymbolTypeRemapTimer;
+  Timer globalSymbolIdTranslateTimer;
   Timer publicsLayoutTimer;
   Timer tpiStreamLayoutTimer;
   Timer diskCommitTimer;
+  Timer commitModuleSymbolsTimer;
+  Timer moduleSymbolRecordWriteTimer;
+  Timer moduleSymbolRelocateTimer;
+  Timer moduleSymbolTypeRemapTimer;
+  Timer moduleSymbolIdTranslateTimer;
 
   std::optional<PDBStats> pdbStats;
 

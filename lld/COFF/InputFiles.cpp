@@ -341,11 +341,26 @@ void ObjFile::initializeECThunks() {
 
 void ObjFile::parse() {
   // Read section and symbol tables.
-  initializeChunks();
-  initializeSymbols();
-  initializeFlags();
-  initializeDependencies();
-  initializeECThunks();
+  {
+    ScopedTimer t(symtab.ctx.initializeChunksTimer);
+    initializeChunks();
+  }
+  {
+    ScopedTimer t(symtab.ctx.initializeSymbolsTimer);
+    initializeSymbols();
+  }
+  {
+    ScopedTimer t(symtab.ctx.initializeFlagsTimer);
+    initializeFlags();
+  }
+  {
+    ScopedTimer t(symtab.ctx.initializeDependenciesTimer);
+    initializeDependencies();
+  }
+  {
+    ScopedTimer t(symtab.ctx.initializeECThunksTimer);
+    initializeECThunks();
+  }
 }
 
 const coff_section *ObjFile::getSection(uint32_t i) {
@@ -435,9 +450,9 @@ SectionChunk *ObjFile::readSection(uint32_t sectionNumber,
 
   // CodeView sections are stored to a different vector because they are not
   // linked in the regular manner.
-  if (c->isCodeView())
+  if (c->isCodeView()) {
     debugChunks.push_back(c);
-  else if (name == ".gfids$y")
+  } else if (name == ".gfids$y")
     guardFidChunks.push_back(c);
   else if (name == ".giats$y")
     guardIATChunks.push_back(c);
@@ -587,81 +602,91 @@ void ObjFile::initializeSymbols() {
       coffObj->getNumberOfSections() + 1);
   COFFLinkerContext &ctx = symtab.ctx;
 
-  for (uint32_t i = 0; i < numSymbols; ++i) {
-    COFFSymbolRef coffSym = check(coffObj->getSymbol(i));
-    bool prevailingComdat;
-    if (coffSym.isUndefined()) {
-      symbols[i] = createUndefined(coffSym, false);
-    } else if (coffSym.isWeakExternal()) {
-      auto aux = coffSym.getAux<coff_aux_weak_external>();
-      bool overrideLazy = true;
+  {
+    ScopedTimer t(ctx.initializeSymbolsMainPassTimer);
+    for (uint32_t i = 0; i < numSymbols; ++i) {
+      COFFSymbolRef coffSym = check(coffObj->getSymbol(i));
+      bool prevailingComdat;
+      if (coffSym.isUndefined()) {
+        symbols[i] = createUndefined(coffSym, false);
+      } else if (coffSym.isWeakExternal()) {
+        auto aux = coffSym.getAux<coff_aux_weak_external>();
+        bool overrideLazy = true;
 
-      // On ARM64EC, external function calls emit a pair of weak-dependency
-      // aliases: func to #func and #func to the func guess exit thunk
-      // (instead of a single undefined func symbol, which would be emitted on
-      // other targets). Allow such aliases to be overridden by lazy archive
-      // symbols, just as we would for undefined symbols.
-      if (isArm64EC(getMachineType()) &&
-          aux->Characteristics == IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY) {
-        COFFSymbolRef targetSym = check(coffObj->getSymbol(aux->TagIndex));
-        if (!targetSym.isAnyUndefined()) {
-          // If the target is defined, it may be either a guess exit thunk or
-          // the actual implementation. If it's the latter, consider the alias
-          // to be part of the implementation and override potential lazy
-          // archive symbols.
-          StringRef targetName = check(coffObj->getSymbolName(targetSym));
-          StringRef name = check(coffObj->getSymbolName(coffSym));
-          std::optional<std::string> mangledName =
-              getArm64ECMangledFunctionName(name);
-          overrideLazy = mangledName == targetName;
-        } else {
-          overrideLazy = false;
+        // On ARM64EC, external function calls emit a pair of weak-dependency
+        // aliases: func to #func and #func to the func guess exit thunk
+        // (instead of a single undefined func symbol, which would be emitted
+        // on other targets). Allow such aliases to be overridden by lazy
+        // archive symbols, just as we would for undefined symbols.
+        if (isArm64EC(getMachineType()) &&
+            aux->Characteristics == IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY) {
+          COFFSymbolRef targetSym = check(coffObj->getSymbol(aux->TagIndex));
+          if (!targetSym.isAnyUndefined()) {
+            // If the target is defined, it may be either a guess exit thunk or
+            // the actual implementation. If it's the latter, consider the
+            // alias to be part of the implementation and override potential
+            // lazy archive symbols.
+            StringRef targetName = check(coffObj->getSymbolName(targetSym));
+            StringRef name = check(coffObj->getSymbolName(coffSym));
+            std::optional<std::string> mangledName =
+                getArm64ECMangledFunctionName(name);
+            overrideLazy = mangledName == targetName;
+          } else {
+            overrideLazy = false;
+          }
         }
+        symbols[i] = createUndefined(coffSym, overrideLazy);
+        weakAliases.emplace_back(symbols[i], aux);
+      } else if (std::optional<Symbol *> optSym =
+                     createDefined(coffSym, comdatDefs, prevailingComdat)) {
+        symbols[i] = *optSym;
+        if (ctx.config.mingw && prevailingComdat)
+          recordPrevailingSymbolForMingw(coffSym, prevailingSectionMap);
+      } else {
+        // createDefined() returns std::nullopt if a symbol belongs to a
+        // section that was pending at the point when the symbol was read. This
+        // can happen in two cases:
+        // 1) section definition symbol for a comdat leader;
+        // 2) symbol belongs to a comdat section associated with another
+        //    section.
+        // In both of these cases, we can expect the section to be resolved by
+        // the time we finish visiting the remaining symbols in the symbol
+        // table. So we postpone the handling of this symbol until that time.
+        pendingIndexes.push_back(i);
       }
-      symbols[i] = createUndefined(coffSym, overrideLazy);
-      weakAliases.emplace_back(symbols[i], aux);
-    } else if (std::optional<Symbol *> optSym =
-                   createDefined(coffSym, comdatDefs, prevailingComdat)) {
-      symbols[i] = *optSym;
-      if (ctx.config.mingw && prevailingComdat)
-        recordPrevailingSymbolForMingw(coffSym, prevailingSectionMap);
-    } else {
-      // createDefined() returns std::nullopt if a symbol belongs to a section
-      // that was pending at the point when the symbol was read. This can happen
-      // in two cases:
-      // 1) section definition symbol for a comdat leader;
-      // 2) symbol belongs to a comdat section associated with another section.
-      // In both of these cases, we can expect the section to be resolved by
-      // the time we finish visiting the remaining symbols in the symbol
-      // table. So we postpone the handling of this symbol until that time.
-      pendingIndexes.push_back(i);
+      i += coffSym.getNumberOfAuxSymbols();
     }
-    i += coffSym.getNumberOfAuxSymbols();
   }
 
-  for (uint32_t i : pendingIndexes) {
-    COFFSymbolRef sym = check(coffObj->getSymbol(i));
-    if (const coff_aux_section_definition *def = sym.getSectionDefinition()) {
-      if (def->Selection == IMAGE_COMDAT_SELECT_ASSOCIATIVE)
-        readAssociativeDefinition(sym, def);
-      else if (ctx.config.mingw)
-        maybeAssociateSEHForMingw(sym, def, prevailingSectionMap);
+  {
+    ScopedTimer t(ctx.initializeSymbolsPendingTimer);
+    for (uint32_t i : pendingIndexes) {
+      COFFSymbolRef sym = check(coffObj->getSymbol(i));
+      if (const coff_aux_section_definition *def = sym.getSectionDefinition()) {
+        if (def->Selection == IMAGE_COMDAT_SELECT_ASSOCIATIVE)
+          readAssociativeDefinition(sym, def);
+        else if (ctx.config.mingw)
+          maybeAssociateSEHForMingw(sym, def, prevailingSectionMap);
+      }
+      if (sparseChunks[sym.getSectionNumber()] == pendingComdat) {
+        StringRef name = check(coffObj->getSymbolName(sym));
+        Log(ctx) << "comdat section " << name
+                 << " without leader and unassociated, discarding";
+        continue;
+      }
+      symbols[i] = createRegular(sym);
     }
-    if (sparseChunks[sym.getSectionNumber()] == pendingComdat) {
-      StringRef name = check(coffObj->getSymbolName(sym));
-      Log(ctx) << "comdat section " << name
-               << " without leader and unassociated, discarding";
-      continue;
-    }
-    symbols[i] = createRegular(sym);
   }
 
-  for (auto &kv : weakAliases) {
-    Symbol *sym = kv.first;
-    const coff_aux_weak_external *aux = kv.second;
-    checkAndSetWeakAlias(symtab, this, sym, symbols[aux->TagIndex],
-                         aux->Characteristics ==
-                             IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY);
+  {
+    ScopedTimer t(ctx.initializeSymbolsWeakAliasesTimer);
+    for (auto &kv : weakAliases) {
+      Symbol *sym = kv.first;
+      const coff_aux_weak_external *aux = kv.second;
+      checkAndSetWeakAlias(symtab, this, sym, symbols[aux->TagIndex],
+                           aux->Characteristics ==
+                               IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY);
+    }
   }
 
   // Free the memory used by sparseChunks now that symbol loading is finished.
@@ -967,51 +992,76 @@ ArrayRef<uint8_t> ObjFile::getDebugSection(StringRef secName) {
   return {};
 }
 
-// OBJ files systematically store critical information in a .debug$S stream,
-// even if the TU was compiled with no debug info. At least two records are
-// always there. S_OBJNAME stores a 32-bit signature, which is loaded into the
-// PCHSignature member. S_COMPILE3 stores compile-time cmd-line flags. This is
-// currently used to initialize the hotPatchable member.
-void ObjFile::initializeFlags() {
-  ArrayRef<uint8_t> data = getDebugSection(".debug$S");
-  if (data.empty())
-    return;
-
+static Error forEachPrefixSymbolRecord(ArrayRef<uint8_t> data,
+                                       unsigned maxRecords,
+                                       llvm::function_ref<Error(CVSymbol)> fn) {
   DebugSubsectionArray subsections;
-
   BinaryStreamReader reader(data, llvm::endianness::little);
-  ExitOnError exitOnErr;
-  exitOnErr(reader.readArray(subsections, data.size()));
+  if (Error e = reader.readArray(subsections, data.size()))
+    return e;
 
   for (const DebugSubsectionRecord &ss : subsections) {
     if (ss.kind() != DebugSubsectionKind::Symbols)
       continue;
 
     unsigned offset = 0;
-
-    // Only parse the first two records. We are only looking for S_OBJNAME
-    // and S_COMPILE3, and they usually appear at the beginning of the
-    // stream.
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0;
+         i < maxRecords && offset < ss.getRecordData().getLength();
+         ++i) {
       Expected<CVSymbol> sym = readSymbolFromStream(ss.getRecordData(), offset);
-      if (!sym) {
-        consumeError(sym.takeError());
-        return;
-      }
-      if (sym->kind() == SymbolKind::S_COMPILE3) {
-        auto cs =
-            cantFail(SymbolDeserializer::deserializeAs<Compile3Sym>(sym.get()));
-        hotPatchable =
-            (cs.Flags & CompileSym3Flags::HotPatch) != CompileSym3Flags::None;
-      }
-      if (sym->kind() == SymbolKind::S_OBJNAME) {
-        auto objName = cantFail(SymbolDeserializer::deserializeAs<ObjNameSym>(
-            sym.get()));
-        if (objName.Signature)
-          pchSignature = objName.Signature;
-      }
+      if (!sym)
+        return sym.takeError();
+      if (Error e = fn(*sym))
+        return e;
       offset += sym->length();
     }
+    break;
+  }
+  return Error::success();
+}
+
+// Only /FUNCTIONPADMIN needs the S_COMPILE3 flags during input parsing.
+void ObjFile::initializeFlags() {
+  if (!symtab.ctx.config.needsHotPatchableSymbols)
+    return;
+
+  ArrayRef<uint8_t> data = getDebugSection(".debug$S");
+  if (data.empty())
+    return;
+
+  if (Error e = forEachPrefixSymbolRecord(
+          data, 2, [&](CVSymbol sym) -> Error {
+            if (sym.kind() != SymbolKind::S_COMPILE3)
+              return Error::success();
+            auto cs = cantFail(
+                SymbolDeserializer::deserializeAs<Compile3Sym>(sym));
+            hotPatchable = (cs.Flags & CompileSym3Flags::HotPatch) !=
+                           CompileSym3Flags::None;
+            return Error::success();
+          })) {
+    consumeError(std::move(e));
+  }
+}
+
+void ObjFile::initializePchSignature() {
+  if (pchSignature && *pchSignature)
+    return;
+
+  ArrayRef<uint8_t> data = getDebugSection(".debug$S");
+  if (data.empty())
+    return;
+
+  if (Error e = forEachPrefixSymbolRecord(
+          data, 2, [&](CVSymbol sym) -> Error {
+            if (sym.kind() != SymbolKind::S_OBJNAME)
+              return Error::success();
+            auto objName =
+                cantFail(SymbolDeserializer::deserializeAs<ObjNameSym>(sym));
+            if (objName.Signature)
+              pchSignature = objName.Signature;
+            return Error::success();
+          })) {
+    consumeError(std::move(e));
   }
 }
 
@@ -1057,6 +1107,7 @@ void ObjFile::initializeDependencies() {
 
   // This object file is a PCH file that others will depend on.
   if (isPCH) {
+    initializePchSignature();
     debugTypesObj = makePrecompSource(ctx, this);
     return;
   }

@@ -212,7 +212,10 @@ void LinkerDriver::addFile(InputFile *file) {
       cast<ObjFile>(file)->parseLazy();
   } else {
     ctx.consumedInputsSize += file->mb.getBufferSize();
-    file->parse();
+    {
+      ScopedTimer t(ctx.inputParseTimer);
+      file->parse();
+    }
     if (auto *f = dyn_cast<ObjFile>(file)) {
       ctx.objFileInstances.push_back(f);
     } else if (auto *f = dyn_cast<BitcodeFile>(file)) {
@@ -1813,6 +1816,19 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
 
   // Handle /debugtype
   config->debugTypes = parseDebugTypes(ctx, args);
+
+  for (auto *arg : args.filtered(OPT_functionpadmin, OPT_functionpadmin_opt)) {
+    StringRef padArg = arg->getNumValues() ? arg->getValue() : "";
+    if (padArg.empty()) {
+      config->needsHotPatchableSymbols = true;
+      break;
+    }
+    uint32_t pad = 0;
+    if (padArg.getAsInteger(0, pad) || pad != 0) {
+      config->needsHotPatchableSymbols = true;
+      break;
+    }
+  }
 
   // Handle /driver[:uponly|:wdm].
   config->driverUponly = args.hasArg(OPT_driver_uponly) ||
