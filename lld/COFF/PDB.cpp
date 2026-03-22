@@ -45,6 +45,7 @@
 #include "llvm/Support/CRC.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Support/TimeProfiler.h"
@@ -1675,15 +1676,28 @@ void PDBLinker::addSections(ArrayRef<uint8_t> sectionTable) {
   linkerModule.setPdbFilePathNI(pdbFilePathNI);
   addCommonLinkerModuleSymbols(nativePath, linkerModule);
 
+  size_t numChunks = 0;
+  for (OutputSection *os : ctx.outputSections)
+    numChunks += os->chunks.size();
+
+  std::vector<pdb::SectionContrib> sectionContribs(numChunks);
+  std::vector<std::pair<Chunk *, size_t>> workList;
+  workList.reserve(numChunks);
+
   // Add section contributions. They must be ordered by ascending RVA.
+  size_t chunkIndex = 0;
   for (OutputSection *os : ctx.outputSections) {
     addLinkerModuleSectionSymbol(linkerModule, *os, ctx.config.mingw);
-    for (Chunk *c : os->chunks) {
-      pdb::SectionContrib sc =
-          createSectionContrib(ctx, c, linkerModule.getModuleIndex());
-      builder.getDbiBuilder().addSectionContrib(sc);
-    }
+    for (Chunk *c : os->chunks)
+      workList.emplace_back(c, chunkIndex++);
   }
+
+  parallelForEach(workList, [&](const std::pair<Chunk *, size_t> &item) {
+    sectionContribs[item.second] =
+        createSectionContrib(ctx, item.first, linkerModule.getModuleIndex());
+  });
+  for (const pdb::SectionContrib &sc : sectionContribs)
+    builder.getDbiBuilder().addSectionContrib(sc);
 
   // The * Linker * first section contrib is only used along with /INCREMENTAL,
   // to provide trampolines thunks for incremental function patching. Set this
