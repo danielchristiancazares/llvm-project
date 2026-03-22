@@ -122,6 +122,7 @@ document soon.
 NewLLD
 WebAssembly
 windows_support
+windows_x64_speed_audit
 missingkeyfunction
 error_handling_script
 ReleaseNotes
