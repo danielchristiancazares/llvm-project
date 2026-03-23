@@ -85,7 +85,7 @@ public:
   void addClangLibSearchPaths(const std::string &argv0);
 
   // Used by ArchiveFile to enqueue members.
-  void enqueueArchiveMember(const Archive::Child &c, const Archive::Symbol &sym,
+  void enqueueArchiveMember(const Archive::Child &c, StringRef symName,
                             StringRef parentName);
 
   enum class InputOpt { None, DefaultLib, WholeArchive };
@@ -98,6 +98,7 @@ public:
 
   // Returns a list of chunks of selected symbols.
   std::vector<Chunk *> getChunks() const;
+  llvm::ArrayRef<MemoryBufferRef> getResources() const { return resources; }
 
   std::unique_ptr<llvm::TarWriter> tar; // for /linkrepro
 
@@ -185,6 +186,7 @@ private:
                         StringRef parentName, uint64_t offsetInArchive,
                         bool lazy);
   void addThinArchiveBuffer(MemoryBufferRef mbref, StringRef symName,
+                            StringRef parentName, uint64_t offsetInArchive,
                             bool lazy);
 
   void enqueueTask(std::function<void()> task);

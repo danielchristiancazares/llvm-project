@@ -16,7 +16,7 @@ namespace lld::coff {
 namespace {
 
 constexpr char stateMagic[8] = {'L', 'L', 'I', 'L', 'K', '6', '4', '\0'};
-constexpr uint32_t stateVersion = 1;
+constexpr uint32_t stateVersion = 2;
 
 struct FileHeader {
   char magic[8];
@@ -27,6 +27,9 @@ struct FileHeader {
   ulittle64_t outputSize;
   ulittle64_t hardConfigHash;
   ulittle64_t softConfigHash;
+  ulittle64_t importTopologyHash;
+  ulittle64_t exportTopologyHash;
+  ulittle64_t resourceInputHash;
   ulittle64_t sizeOfHeaders;
   ulittle64_t sizeOfImage;
   ulittle64_t outputPathOffset;
@@ -36,6 +39,8 @@ struct FileHeader {
   ulittle64_t sectionCount;
   ulittle64_t chunkTableOffset;
   ulittle64_t chunkCount;
+  ulittle64_t symbolTableOffset;
+  ulittle64_t symbolCount;
   ulittle64_t stringTableOffset;
   ulittle64_t stringTableSize;
 };
@@ -43,6 +48,7 @@ struct FileHeader {
 struct InputRecord {
   ulittle64_t nameOffset;
   ulittle64_t parentOffset;
+  ulittle64_t archiveOffset;
   ulittle64_t contentHash;
   ulittle64_t size;
 };
@@ -73,6 +79,15 @@ struct ChunkRecord {
   ulittle64_t slotCapacity;
   ulittle64_t contentHash;
   ulittle64_t symbolHash;
+};
+
+struct SymbolRecord {
+  ulittle64_t nameOffset;
+  ulittle64_t auxiliaryKeyOffset;
+  ulittle32_t inputIndex;
+  ulittle16_t kind;
+  ulittle16_t reserved;
+  ulittle64_t value;
 };
 
 template <typename T>
@@ -178,6 +193,9 @@ Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
   state.outputSize = header.outputSize;
   state.hardConfigHash = header.hardConfigHash;
   state.softConfigHash = header.softConfigHash;
+  state.importTopologyHash = header.importTopologyHash;
+  state.exportTopologyHash = header.exportTopologyHash;
+  state.resourceInputHash = header.resourceInputHash;
   state.sizeOfHeaders = header.sizeOfHeaders;
   state.sizeOfImage = header.sizeOfImage;
   Expected<StringRef> outputPathOrErr =
@@ -201,6 +219,7 @@ Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
       return parentOrErr.takeError();
     input.name = nameOrErr->str();
     input.parentName = parentOrErr->str();
+    input.archiveOffset = record.archiveOffset;
     input.contentHash = record.contentHash;
     input.size = record.size;
     state.inputs.push_back(std::move(input));
@@ -252,6 +271,27 @@ Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
     state.chunks.push_back(std::move(chunk));
   }
 
+  Expected<std::vector<SymbolRecord>> symbolsOrErr =
+      readTable<SymbolRecord>(bytes, header.symbolTableOffset, header.symbolCount);
+  if (!symbolsOrErr)
+    return symbolsOrErr.takeError();
+  state.symbols.reserve(symbolsOrErr->size());
+  for (const SymbolRecord &record : *symbolsOrErr) {
+    IncrementalSymbolState symbol;
+    Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
+    if (!nameOrErr)
+      return nameOrErr.takeError();
+    Expected<StringRef> keyOrErr = loadString(strings, record.auxiliaryKeyOffset);
+    if (!keyOrErr)
+      return keyOrErr.takeError();
+    symbol.name = nameOrErr->str();
+    symbol.auxiliaryKey = keyOrErr->str();
+    symbol.kind = static_cast<IncrementalSymbolKind>(uint16_t(record.kind));
+    symbol.inputIndex = record.inputIndex;
+    symbol.value = record.value;
+    state.symbols.push_back(std::move(symbol));
+  }
+
   return state;
 }
 
@@ -265,6 +305,9 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
   header.outputSize = state.outputSize;
   header.hardConfigHash = state.hardConfigHash;
   header.softConfigHash = state.softConfigHash;
+  header.importTopologyHash = state.importTopologyHash;
+  header.exportTopologyHash = state.exportTopologyHash;
+  header.resourceInputHash = state.resourceInputHash;
   header.sizeOfHeaders = state.sizeOfHeaders;
   header.sizeOfImage = state.sizeOfImage;
 
@@ -272,6 +315,7 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
   std::vector<InputRecord> inputRecords;
   std::vector<SectionRecord> sectionRecords;
   std::vector<ChunkRecord> chunkRecords;
+  std::vector<SymbolRecord> symbolRecords;
 
   header.outputPathOffset = strings.add(state.outputPath);
 
@@ -280,6 +324,7 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
     InputRecord record = {};
     record.nameOffset = strings.add(input.name);
     record.parentOffset = strings.add(input.parentName);
+    record.archiveOffset = input.archiveOffset;
     record.contentHash = input.contentHash;
     record.size = input.size;
     inputRecords.push_back(record);
@@ -317,6 +362,17 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
     chunkRecords.push_back(record);
   }
 
+  symbolRecords.reserve(state.symbols.size());
+  for (const IncrementalSymbolState &symbol : state.symbols) {
+    SymbolRecord record = {};
+    record.nameOffset = strings.add(symbol.name);
+    record.auxiliaryKeyOffset = strings.add(symbol.auxiliaryKey);
+    record.inputIndex = symbol.inputIndex;
+    record.kind = static_cast<uint16_t>(symbol.kind);
+    record.value = symbol.value;
+    symbolRecords.push_back(record);
+  }
+
   header.inputTableOffset = sizeof(FileHeader);
   header.inputCount = inputRecords.size();
   header.sectionTableOffset =
@@ -325,8 +381,11 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
   header.chunkTableOffset =
       header.sectionTableOffset + sectionRecords.size() * sizeof(SectionRecord);
   header.chunkCount = chunkRecords.size();
-  header.stringTableOffset =
+  header.symbolTableOffset =
       header.chunkTableOffset + chunkRecords.size() * sizeof(ChunkRecord);
+  header.symbolCount = symbolRecords.size();
+  header.stringTableOffset =
+      header.symbolTableOffset + symbolRecords.size() * sizeof(SymbolRecord);
   header.stringTableSize = strings.data().size();
 
   std::vector<char> buffer;
@@ -337,6 +396,8 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
   for (const SectionRecord &record : sectionRecords)
     appendObject(buffer, record);
   for (const ChunkRecord &record : chunkRecords)
+    appendObject(buffer, record);
+  for (const SymbolRecord &record : symbolRecords)
     appendObject(buffer, record);
   buffer.insert(buffer.end(), strings.data().begin(), strings.data().end());
 

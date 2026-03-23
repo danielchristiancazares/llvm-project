@@ -1,0 +1,13 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir
+# RUN: llvm-mc -filetype=obj -triple=x86_64-windows-msvc main.s -o main.obj
+# RUN: lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf,lldtailmerge -out:%t.exe -verbose main.obj 2>&1 | FileCheck %s
+
+# CHECK: incremental: fallback: TailMergeEnabled
+
+#--- main.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  xorl %eax, %eax
+  retq

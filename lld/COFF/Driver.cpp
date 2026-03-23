@@ -220,6 +220,8 @@ void LinkerDriver::addFile(InputFile *file) {
     }
     if (auto *f = dyn_cast<ObjFile>(file)) {
       ctx.objFileInstances.push_back(f);
+    } else if (auto *f = dyn_cast<ArchiveFile>(file)) {
+      ctx.archiveFileInstances.push_back(f);
     } else if (auto *f = dyn_cast<BitcodeFile>(file)) {
       if (ltoCompilationDone) {
         Err(ctx) << "LTO object file " << toString(file)
@@ -334,7 +336,8 @@ void LinkerDriver::addBuffer(std::unique_ptr<MemoryBuffer> mb,
           addArchiveBuffer(m, "<whole-archive>", filename, memberIndex++,
                            !wholeArchive);
         else
-          addThinArchiveBuffer(m, "<whole-archive>", !wholeArchive);
+          addThinArchiveBuffer(m, "<whole-archive>", filename, 0,
+                               !wholeArchive);
       }
 
       return;
@@ -488,28 +491,56 @@ void LinkerDriver::addArchiveBuffer(MemoryBufferRef mb, StringRef symName,
     return;
   }
 
+  obj->archiveName = parentName;
+  obj->archiveOffset = offsetInArchive;
+  noteIncrementalArchiveMemberLoad(ctx, obj->archiveName, obj->archiveOffset,
+                                   obj->getName());
   Log(ctx) << "Loaded " << obj << " for " << symName;
 }
 
 void LinkerDriver::addThinArchiveBuffer(MemoryBufferRef mb, StringRef symName,
-                                        bool lazy) {
+                                        StringRef parentName,
+                                        uint64_t offsetInArchive, bool lazy) {
   // Pass an empty string as the archive name and an offset of 0 so that
   // the original filename is used as the buffer identifier. This is
   // useful for DTLTO, where having the member identifier be the actual
   // path on disk enables distribution of bitcode files during ThinLTO.
-  addArchiveBuffer(mb, symName, /*parentName=*/"", /*OffsetInArchive=*/0, lazy);
+  file_magic magic = identify_magic(mb.getBuffer());
+  InputFile *obj;
+  if (magic == file_magic::coff_object) {
+    obj = addObjectFile(ctx, mb, /*archiveName=*/"", /*offsetInArchive=*/0,
+                        lazy);
+  } else if (magic == file_magic::bitcode) {
+    obj = BitcodeFile::create(ctx, mb, /*archiveName=*/"",
+                              /*offsetInArchive=*/0, lazy);
+    obj->parentName = "";
+    addFile(obj);
+  } else if (magic == file_magic::coff_cl_gl_object) {
+    Err(ctx) << mb.getBufferIdentifier()
+             << ": is not a native COFF file. Recompile without /GL?";
+    return;
+  } else {
+    Err(ctx) << "unknown file type: " << mb.getBufferIdentifier();
+    return;
+  }
+
+  obj->archiveName = parentName;
+  obj->archiveOffset = offsetInArchive;
+  noteIncrementalArchiveMemberLoad(ctx, obj->archiveName, obj->archiveOffset,
+                                   obj->getName());
+  Log(ctx) << "Loaded " << obj << " for " << symName;
 }
 
 void LinkerDriver::enqueueArchiveMember(const Archive::Child &c,
-                                        const Archive::Symbol &sym,
+                                        StringRef symName,
                                         StringRef parentName) {
 
   auto reportBufferError = [=](Error &&e) {
     StringRef childName = CHECK(
         c.getName(), "could not get child name for archive " + parentName +
-                         " while loading symbol " + toCOFFString(ctx, sym));
+                         " while loading symbol " + symName);
     Fatal(ctx) << "could not get the buffer for the member defining symbol "
-               << &sym << ": " << parentName << "(" << childName
+               << symName << ": " << parentName << "(" << childName
                << "): " << std::move(e);
   };
 
@@ -521,8 +552,8 @@ void LinkerDriver::enqueueArchiveMember(const Archive::Child &c,
     MemoryBufferRef mb = mbOrErr.get();
     enqueueTask([=]() {
       llvm::TimeTraceScope timeScope("Archive: ", mb.getBufferIdentifier());
-      ctx.driver.addArchiveBuffer(mb, toCOFFString(ctx, sym), parentName,
-                                  offsetInArchive, false);
+      ctx.driver.addArchiveBuffer(mb, symName, parentName, offsetInArchive,
+                                  false);
     });
     return;
   }
@@ -530,7 +561,7 @@ void LinkerDriver::enqueueArchiveMember(const Archive::Child &c,
   std::string childName =
       CHECK(c.getFullName(),
             "could not get the filename for the member defining symbol " +
-                toCOFFString(ctx, sym));
+                symName);
   auto future = std::make_shared<std::future<MBErrPair>>(
       createFutureForFile(childName, ctx.config.prefetchInputs));
   enqueueTask([=]() {
@@ -540,7 +571,8 @@ void LinkerDriver::enqueueArchiveMember(const Archive::Child &c,
     llvm::TimeTraceScope timeScope("Archive: ",
                                    mbOrErr.first->getBufferIdentifier());
     ctx.driver.addThinArchiveBuffer(takeBuffer(std::move(mbOrErr.first)),
-                                    toCOFFString(ctx, sym), false);
+                                    symName, parentName, c.getChildOffset(),
+                                    false);
   });
 }
 
@@ -2728,6 +2760,11 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
         symtab.addUndefined(symtab.mangle("__buildid"));
   });
 
+  prepareIncrementalLink(ctx);
+  run();
+  if (errorCount())
+    return;
+
   // This code may add new undefined symbols to the link, which may enqueue more
   // symbol resolution tasks, so we need to continue executing tasks until we
   // converge.
@@ -3031,7 +3068,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     doICF(ctx);
   }
 
-  prepareIncrementalLink(ctx);
+  finalizeIncrementalLinkPlan(ctx);
 
   // Write the result.
   writeResult(ctx);
