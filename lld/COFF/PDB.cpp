@@ -188,7 +188,7 @@ public:
                          ArrayRef<uint8_t> sectionContents, CVSymbol sym,
                          size_t alignedSize, uint32_t &nextRelocIndex,
                          const SymbolRecordRewriteTimers &timers,
-                         std::vector<uint8_t> &storage);
+                         SmallVectorImpl<uint8_t> &storage);
 
   /// Add the section map and section contributions to the PDB.
   void addSections(ArrayRef<uint8_t> sectionTable);
@@ -495,14 +495,14 @@ static ScopeRecord *getSymbolScopeFields(void *sym) {
 // To open a scope, push the offset of the current symbol record onto the
 // stack.
 static void scopeStackOpen(SmallVectorImpl<uint32_t> &stack,
-                           std::vector<uint8_t> &storage) {
+                           SmallVectorImpl<uint8_t> &storage) {
   stack.push_back(storage.size());
 }
 
 // To close a scope, update the record that opened the scope.
 static void scopeStackClose(COFFLinkerContext &ctx,
                             SmallVectorImpl<uint32_t> &stack,
-                            std::vector<uint8_t> &storage,
+                            SmallVectorImpl<uint8_t> &storage,
                             uint32_t storageBaseOffset, ObjFile *file) {
   if (stack.empty()) {
     Warn(ctx) << "symbol scopes are not balanced in " << file->getName();
@@ -571,7 +571,7 @@ static bool symbolGoesInGlobalsStream(const CVSymbol &sym,
 
 static void addGlobalSymbol(pdb::GSIStreamBuilder &builder, uint16_t modIndex,
                             unsigned symOffset,
-                            std::vector<uint8_t> &symStorage) {
+                            SmallVectorImpl<uint8_t> &symStorage) {
   CVSymbol sym{ArrayRef(symStorage)};
   switch (sym.kind()) {
   case SymbolKind::S_CONSTANT:
@@ -684,11 +684,11 @@ void PDBLinker::writeSymbolRecord(SectionChunk *debugChunk,
                                   CVSymbol sym, size_t alignedSize,
                                   uint32_t &nextRelocIndex,
                                   const SymbolRecordRewriteTimers &timers,
-                                  std::vector<uint8_t> &storage) {
+                                  SmallVectorImpl<uint8_t> &storage) {
   ScopedTimer totalTimer(timers.total);
 
   // Allocate space for the new record at the end of the storage.
-  storage.resize(storage.size() + alignedSize);
+  storage.resize_for_overwrite(storage.size() + alignedSize);
   auto recordBytes = MutableArrayRef<uint8_t>(storage).take_back(alignedSize);
 
   // Copy the symbol record and relocate it.
@@ -749,7 +749,7 @@ void PDBLinker::analyzeSymbolSubsection(
       getSymbolRecordRewriteTimers(ctx, SymbolRecordWritePhase::Global);
 
   uint32_t scopeLevel = 0;
-  std::vector<uint8_t> storage;
+  SmallVector<uint8_t, 0> storage;
   ArrayRef<uint8_t> sectionContents = debugChunk->getContents();
 
   ArrayRef<uint8_t> symsBuffer;
@@ -819,7 +819,7 @@ Error PDBLinker::writeAllModuleSymbolRecords(ObjFile *file,
                                              BinaryStreamWriter &writer) {
   ScopedTimer t(ctx.commitModuleSymbolsTimer);
   ExitOnError exitOnErr;
-  std::vector<uint8_t> storage;
+  SmallVector<uint8_t, 0> storage;
   SmallVector<uint32_t, 4> scopes;
   const auto rewriteTimers =
       getSymbolRecordRewriteTimers(ctx, SymbolRecordWritePhase::Module);
