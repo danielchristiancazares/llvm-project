@@ -62,7 +62,6 @@ autoconf/autom4te.cache
 .claude/
 /GEMINI.md
 .gemini/
-AGENTS.md
 .codex/
 # Cursor specific files
 .cursor
