@@ -222,8 +222,8 @@ defm highentropyva : B<"highentropyva",
 defm hotpatchcompatible : B<"hotpatchcompatible", "Mark executable image as compatible with hotpatch",
                             "Don't mark executable image as compatible with hotpatch (default)">;
 defm incremental : B<"incremental",
-                     "Keep original import library if contents are unchanged",
-                     "Overwrite import library even if contents are unchanged">;
+                     "Enable incremental linking and keep original import library if contents are unchanged",
+                     "Disable incremental linking and overwrite import library even if contents are unchanged">;
 defm inferasanlibs : B<"inferasanlibs",
                        "Unused, generates a warning",
                        "No effect (default)">;

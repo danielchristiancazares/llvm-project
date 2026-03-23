@@ -110,6 +110,19 @@ enum class BuildIDHash {
   Binary,
 };
 
+enum class IncrementalFallbackReason {
+  None,
+  MissingState,
+  InvalidState,
+  UnsupportedMachine,
+  LtoInput,
+  TailMergeEnabled,
+  ConfigChanged,
+  OutputMismatch,
+  LayoutChanged,
+  SlotOverflow,
+};
+
 // Global configuration.
 struct Configuration {
   enum ManifestKind { Default, SideBySide, Embed, No };
@@ -337,7 +350,10 @@ struct Configuration {
   bool warnLongSectionNames = true;
   bool warnStdcallFixup = true;
   bool warnImportedDllMain = true;
-  bool incremental = true;
+  bool keepUnchangedImplib = true;
+  bool incrementalLinkRequested = true;
+  bool incrementalLinkEligible = false;
+  bool incrementalLinkActive = false;
   bool integrityCheck = false;
   bool killAt = false;
   bool repro = false;
@@ -354,6 +370,10 @@ struct Configuration {
   EmitKind emit = EmitKind::Obj;
   bool allowDuplicateWeak = false;
   BuildIDHash buildIDHash = BuildIDHash::None;
+  llvm::SmallString<128> incrementalStatePath;
+  IncrementalFallbackReason incrementalFallbackReason =
+      IncrementalFallbackReason::None;
+  std::string incrementalFallbackDetail;
 };
 
 struct COFFSyncStream : SyncStream {

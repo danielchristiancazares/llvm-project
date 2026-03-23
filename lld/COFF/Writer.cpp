@@ -11,6 +11,8 @@
 #include "CallGraphSort.h"
 #include "Config.h"
 #include "DLL.h"
+#include "Incremental.h"
+#include "IncrementalLayout.h"
 #include "InputFiles.h"
 #include "LLDMapFile.h"
 #include "MapFile.h"
@@ -791,6 +793,12 @@ void Writer::run() {
     removeUnusedSections();
     layoutSections();
     finalizeAddresses();
+    IncrementalLayoutResult incrementalLayout;
+    if (applyIncrementalLayout(ctx, incrementalLayout)) {
+      fileSize = incrementalLayout.fileSize;
+      sizeOfImage = incrementalLayout.sizeOfImage;
+      sizeOfHeaders = incrementalLayout.sizeOfHeaders;
+    }
     removeEmptySections();
     assignOutputSectionIndices();
     setSectionPermissions();

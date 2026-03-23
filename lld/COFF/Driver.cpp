@@ -11,6 +11,7 @@
 #include "Config.h"
 #include "DebugTypes.h"
 #include "ICF.h"
+#include "Incremental.h"
 #include "InputFiles.h"
 #include "MarkLive.h"
 #include "MinGW.h"
@@ -1067,7 +1068,7 @@ void LinkerDriver::createImportLibrary(bool asLib) {
   std::string libName = getImportName(asLib);
   std::string path = getImplibPath();
 
-  if (!ctx.config.incremental) {
+  if (!ctx.config.keepUnchangedImplib) {
     checkError(writeImportLibrary(libName, path, exports, ctx.config.machine,
                                   ctx.config.mingw, nativeExports));
     return;
@@ -1777,7 +1778,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
       }
       if (s == "none") {
         config->debug = false;
-        config->incremental = false;
+        config->keepUnchangedImplib = false;
+        config->incrementalLinkRequested = false;
         config->includeDwarfChunks = false;
         config->debugGHashes = false;
         config->writeSymtab = false;
@@ -1785,7 +1787,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
         doGC = true;
       } else if (s == "full" || s == "ghash" || s == "noghash") {
         config->debug = true;
-        config->incremental = true;
+        config->keepUnchangedImplib = true;
+        config->incrementalLinkRequested = true;
         config->includeDwarfChunks = true;
         if (s == "full" || s == "ghash")
           config->debugGHashes = true;
@@ -1793,7 +1796,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
         doGC = false;
       } else if (s == "dwarf") {
         config->debug = true;
-        config->incremental = true;
+        config->keepUnchangedImplib = true;
+        config->incrementalLinkRequested = true;
         config->includeDwarfChunks = true;
         config->writeSymtab = true;
         config->warnLongSectionNames = false;
@@ -2235,10 +2239,13 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   config->allowBind = args.hasFlag(OPT_allowbind, OPT_allowbind_no, true);
   config->allowIsolation =
       args.hasFlag(OPT_allowisolation, OPT_allowisolation_no, true);
-  config->incremental =
+  config->incrementalLinkRequested =
       args.hasFlag(OPT_incremental, OPT_incremental_no,
                    !config->doGC && config->doICF == ICFLevel::None &&
                        !args.hasArg(OPT_order) && !args.hasArg(OPT_profile));
+  config->keepUnchangedImplib = config->incrementalLinkRequested;
+  if (auto *arg = args.getLastArg(OPT_ilk))
+    config->incrementalStatePath = arg->getValue();
   config->integrityCheck =
       args.hasFlag(OPT_integritycheck, OPT_integritycheck_no, false);
   config->cetCompat = args.hasFlag(OPT_cetcompat, OPT_cetcompat_no, false);
@@ -2271,28 +2278,32 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   if (args.hasFlag(OPT_inferasanlibs, OPT_inferasanlibs_no, false))
     Warn(ctx) << "ignoring '/inferasanlibs', this flag is not supported";
 
-  if (config->incremental && args.hasArg(OPT_profile)) {
+  if (config->incrementalLinkRequested && args.hasArg(OPT_profile)) {
     Warn(ctx) << "ignoring '/incremental' due to '/profile' specification";
-    config->incremental = false;
+    config->incrementalLinkRequested = false;
+    config->keepUnchangedImplib = false;
   }
 
-  if (config->incremental && args.hasArg(OPT_order)) {
+  if (config->incrementalLinkRequested && args.hasArg(OPT_order)) {
     Warn(ctx) << "ignoring '/incremental' due to '/order' specification";
-    config->incremental = false;
+    config->incrementalLinkRequested = false;
+    config->keepUnchangedImplib = false;
   }
 
-  if (config->incremental && config->doGC) {
+  if (config->incrementalLinkRequested && config->doGC) {
     Warn(ctx) << "ignoring '/incremental' because REF is enabled; use "
                  "'/opt:noref' to "
                  "disable";
-    config->incremental = false;
+    config->incrementalLinkRequested = false;
+    config->keepUnchangedImplib = false;
   }
 
-  if (config->incremental && config->doICF != ICFLevel::None) {
+  if (config->incrementalLinkRequested && config->doICF != ICFLevel::None) {
     Warn(ctx) << "ignoring '/incremental' because ICF is enabled; use "
                  "'/opt:noicf' to "
                  "disable";
-    config->incremental = false;
+    config->incrementalLinkRequested = false;
+    config->keepUnchangedImplib = false;
   }
 
   if (args.hasFlag(OPT_prefetch_inputs, OPT_prefetch_inputs_no, false))
@@ -2943,8 +2954,11 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     doICF(ctx);
   }
 
+  prepareIncrementalLink(ctx);
+
   // Write the result.
   writeResult(ctx);
+  finalizeIncrementalLink(ctx);
 
   // Stop early so we can print the results.
   rootTimer.stop();

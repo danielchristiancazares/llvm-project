@@ -8,6 +8,7 @@
 
 #include "Chunks.h"
 #include "COFFLinkerContext.h"
+#include "Incremental.h"
 #include "InputFiles.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
@@ -403,6 +404,16 @@ static void maybeReportRelocationToDiscarded(const SectionChunk *fromChunk,
 void SectionChunk::writeTo(uint8_t *buf) const {
   if (!hasData)
     return;
+  COFFLinkerContext &ctx = file->symtab.ctx;
+  if (ctx.incrementalSession && ctx.config.incrementalLinkActive) {
+    auto it = ctx.incrementalSession->reusedChunkData.find(this);
+    if (it != ctx.incrementalSession->reusedChunkData.end()) {
+      ArrayRef<uint8_t> reused = it->second;
+      if (!reused.empty())
+        memcpy(buf, reused.data(), reused.size());
+      return;
+    }
+  }
   // Copy section contents from source object file to output file.
   ArrayRef<uint8_t> a = getContents();
   if (!a.empty())
