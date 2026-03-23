@@ -1,0 +1,14 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir
+# RUN: %python -c "import os, sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe
+# RUN: llvm-mc -filetype=obj -triple=i386-windows-msvc main.s -o main.obj
+# RUN: lld-link -entry:main -subsystem:console -machine:x86 -safeseh:no -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj 2>&1 | FileCheck %s --check-prefix=X86
+
+# X86: incremental: fallback: UnsupportedMachine
+
+#--- main.s
+.text
+.globl _main
+_main:
+  xorl %eax, %eax
+  retl

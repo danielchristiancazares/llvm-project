@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "COFFLinkerContext.h"
+#include "Incremental.h"
 #include "Symbols.h"
 #include "llvm/BinaryFormat/COFF.h"
 
@@ -68,4 +69,6 @@ COFFLinkerContext::COFFLinkerContext()
                                  moduleSymbolRecordWriteTimer),
       moduleSymbolIdTranslateTimer("Translate Module IDs",
                                    moduleSymbolRecordWriteTimer) {}
+
+COFFLinkerContext::~COFFLinkerContext() = default;
 } // namespace lld::coff

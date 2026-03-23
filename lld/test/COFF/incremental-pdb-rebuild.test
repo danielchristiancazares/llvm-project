@@ -1,0 +1,27 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir
+# RUN: %python -c "import os, sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.pdb
+# RUN: llvm-mc -filetype=obj -triple=x86_64-windows-msvc v1.s -o main.obj
+# RUN: lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj
+# RUN: llvm-mc -filetype=obj -triple=x86_64-windows-msvc v2.s -o main.obj
+# RUN: lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj 2>&1 | FileCheck %s --check-prefix=REUSE
+# RUN: llvm-pdbutil dump -section-contribs %t.pdb | FileCheck %s --check-prefix=PDB
+
+# REUSE: incremental: using state
+# REUSE: incremental: exact-layout reuse active
+# PDB: Section Contributions
+# PDB: SC[.text]
+
+#--- v1.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  movl $1, %eax
+  retq
+
+#--- v2.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  movl $9, %eax
+  retq

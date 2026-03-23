@@ -1,0 +1,40 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir
+# RUN: %python -c "import os, sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.pdb before.txt after.txt
+# RUN: llvm-mc -filetype=obj -triple=x86_64-windows-msvc v1.s -o main.obj
+# RUN: lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj
+# RUN: llvm-readobj --symbols %t.exe > before.txt
+# RUN: llvm-mc -filetype=obj -triple=x86_64-windows-msvc v2.s -o main.obj
+# RUN: lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj 2>&1 | FileCheck %s --check-prefix=REUSE
+# RUN: llvm-readobj --symbols %t.exe > after.txt
+# RUN: cmd /c fc before.txt after.txt > nul
+
+# REUSE: incremental: using state
+# REUSE: incremental: exact-layout reuse active
+
+#--- v1.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  movl $1, %eax
+  addl $2, %eax
+  retq
+
+.section .text,"xr",one_only,helper
+.globl helper
+helper:
+  movl $7, %eax
+  retq
+
+#--- v2.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  xorl %eax, %eax
+  retq
+
+.section .text,"xr",one_only,helper
+.globl helper
+helper:
+  movl $7, %eax
+  retq
