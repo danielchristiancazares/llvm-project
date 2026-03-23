@@ -6,6 +6,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include <memory>
 #include <string>
@@ -32,13 +33,22 @@ public:
   std::vector<uint64_t> currentInputHashes;
   std::vector<std::string> currentInputNames;
   std::vector<std::string> currentParentNames;
+  std::vector<uint64_t> currentArchiveOffsets;
   llvm::DenseMap<const ObjFile *, uint32_t> inputIndices;
   llvm::DenseSet<const ObjFile *> changedInputs;
   llvm::DenseMap<const SectionChunk *, llvm::ArrayRef<uint8_t>> reusedChunkData;
+  llvm::StringSet<> replayableArchives;
+  llvm::StringSet<> expectedArchiveMembers;
+  llvm::StringSet<> loadedArchiveMembers;
 };
 
 void prepareIncrementalLink(COFFLinkerContext &ctx);
+void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx);
 void finalizeIncrementalLink(COFFLinkerContext &ctx);
+void noteIncrementalArchiveMemberLoad(COFFLinkerContext &ctx,
+                                      llvm::StringRef archiveName,
+                                      uint64_t archiveOffset,
+                                      llvm::StringRef memberName);
 
 void setIncrementalFallback(COFFLinkerContext &ctx,
                             IncrementalFallbackReason reason,

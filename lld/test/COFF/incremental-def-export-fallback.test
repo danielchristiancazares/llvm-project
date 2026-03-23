@@ -1,0 +1,38 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.dll %t.out %t.lib && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc funcs.s -o funcs.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -dll -noentry -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.dll -def:one.def funcs.obj && \
+# RUN:   echo CHANGED > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -dll -noentry -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.dll -def:two.def -verbose funcs.obj >> %t.out 2>&1 && \
+# RUN:   echo REUSE >> %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -dll -noentry -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.dll -def:two.def -verbose funcs.obj >> %t.out 2>&1 && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: CHANGED
+# CHECK: incremental: fallback: LayoutChanged
+# CHECK: incremental: detail: export topology changed
+# CHECK: REUSE
+# CHECK: incremental: using state
+# CHECK: incremental: exact-layout reuse active
+
+#--- funcs.s
+.text
+.globl f1
+f1:
+  retq
+
+.globl f2
+f2:
+  retq
+
+#--- one.def
+LIBRARY test.dll
+EXPORTS
+  f1
+
+#--- two.def
+LIBRARY test.dll
+EXPORTS
+  f1
+  f2

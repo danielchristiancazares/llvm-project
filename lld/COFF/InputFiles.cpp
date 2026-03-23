@@ -232,6 +232,48 @@ void ArchiveFile::addMember(const Archive::Symbol &sym) {
   const Archive::Child &c =
       CHECK(sym.getMember(), "could not get the member for symbol " +
                                  toCOFFString(symtab.ctx, sym));
+  addMember(c, saver().save(toCOFFString(symtab.ctx, sym)));
+}
+
+void ArchiveFile::addMemberByOffset(uint64_t offset, StringRef reason) {
+  Error err = Error::success();
+  for (const Archive::Child &c : file->children(err)) {
+    if (c.getChildOffset() != offset)
+      continue;
+    addMember(c, reason);
+    consumeError(std::move(err));
+    return;
+  }
+  if (err)
+    Fatal(symtab.ctx) << file->getFileName()
+                      << ": Archive::children failed: " << toString(std::move(err));
+  Err(symtab.ctx) << file->getFileName()
+                  << ": could not find archive member at offset " << offset
+                  << " for " << reason;
+}
+
+void ArchiveFile::addMemberByName(StringRef memberName, StringRef reason) {
+  Error err = Error::success();
+  for (const Archive::Child &c : file->children(err)) {
+    Expected<std::string> fullNameOrErr = c.getFullName();
+    if (!fullNameOrErr)
+      Fatal(symtab.ctx) << file->getFileName()
+                        << ": could not get the filename for archive member "
+                        << reason << ": " << fullNameOrErr.takeError();
+    if (*fullNameOrErr != memberName)
+      continue;
+    addMember(c, reason);
+    consumeError(std::move(err));
+    return;
+  }
+  if (err)
+    Fatal(symtab.ctx) << file->getFileName()
+                      << ": Archive::children failed: " << toString(std::move(err));
+  Err(symtab.ctx) << file->getFileName() << ": could not find archive member '"
+                  << memberName << "' for " << reason;
+}
+
+void ArchiveFile::addMember(const Archive::Child &c, StringRef reason) {
 
   // Return an empty buffer if we have already returned the same buffer.
   // FIXME: Remove this once we resolve all defineds before all undefineds in
@@ -239,7 +281,7 @@ void ArchiveFile::addMember(const Archive::Symbol &sym) {
   if (!seen.insert(c.getChildOffset()).second)
     return;
 
-  symtab.ctx.driver.enqueueArchiveMember(c, sym, getName());
+  symtab.ctx.driver.enqueueArchiveMember(c, reason, getName());
 }
 
 std::vector<MemoryBufferRef>

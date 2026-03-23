@@ -15,9 +15,20 @@ enum class IncrementalChunkKind : uint16_t {
   Synthetic = 2,
 };
 
+enum class IncrementalSymbolKind : uint16_t {
+  Regular = 1,
+  Common = 2,
+  ImportData = 3,
+  ImportThunk = 4,
+  LocalImport = 5,
+  Absolute = 6,
+  Synthetic = 7,
+};
+
 struct IncrementalInputState {
   std::string name;
   std::string parentName;
+  uint64_t archiveOffset = 0;
   uint64_t contentHash = 0;
   uint64_t size = 0;
 };
@@ -48,19 +59,31 @@ struct IncrementalChunkState {
   uint64_t symbolHash = 0;
 };
 
+struct IncrementalSymbolState {
+  std::string name;
+  std::string auxiliaryKey;
+  IncrementalSymbolKind kind = IncrementalSymbolKind::Regular;
+  uint32_t inputIndex = UINT32_MAX;
+  uint64_t value = 0;
+};
+
 struct IncrementalStateFile {
-  uint32_t version = 1;
+  uint32_t version = 2;
   llvm::COFF::MachineTypes machine = IMAGE_FILE_MACHINE_UNKNOWN;
   uint64_t outputHash = 0;
   uint64_t outputSize = 0;
   uint64_t hardConfigHash = 0;
   uint64_t softConfigHash = 0;
+  uint64_t importTopologyHash = 0;
+  uint64_t exportTopologyHash = 0;
+  uint64_t resourceInputHash = 0;
   uint64_t sizeOfHeaders = 0;
   uint64_t sizeOfImage = 0;
   std::string outputPath;
   std::vector<IncrementalInputState> inputs;
   std::vector<IncrementalSectionState> sections;
   std::vector<IncrementalChunkState> chunks;
+  std::vector<IncrementalSymbolState> symbols;
 };
 
 llvm::Expected<IncrementalStateFile> loadIncrementalState(llvm::StringRef path);

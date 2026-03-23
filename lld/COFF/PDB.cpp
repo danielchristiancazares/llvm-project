@@ -1886,9 +1886,10 @@ void PDBLinker::addSections(ArrayRef<uint8_t> sectionTable) {
   for (const pdb::SectionContrib &sc : sectionContribs)
     builder.getDbiBuilder().addSectionContrib(sc);
 
-  // The * Linker * first section contrib is only used along with /INCREMENTAL,
-  // to provide trampolines thunks for incremental function patching. Set this
-  // as "unused" because LLD doesn't support /INCREMENTAL link.
+  // The * Linker * first section contrib is only used by link.exe's
+  // trampoline-based /INCREMENTAL scheme. LLD's Phase 1 incremental relink
+  // keeps doing a full PDB rebuild, so leave this "unused" until we add a
+  // compatible trampoline model.
   pdb::SectionContrib sc =
       createSectionContrib(ctx, nullptr, llvm::pdb::kInvalidStreamIndex);
   linkerModule.setFirstSectionContrib(sc);

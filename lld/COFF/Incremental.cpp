@@ -64,6 +64,161 @@ static void ensureIncrementalStatePath(Configuration &config) {
   sys::path::replace_extension(config.incrementalStatePath, ".llilk");
 }
 
+static std::string getIncrementalArchiveMemberKey(StringRef archiveName,
+                                                  uint64_t archiveOffset,
+                                                  StringRef memberName) {
+  SmallString<256> buffer;
+  raw_svector_ostream os(buffer);
+  os << archiveName << '\n' << archiveOffset << '\n' << memberName;
+  return std::string(buffer);
+}
+
+static uint64_t computeIncrementalImportTopologyHash(COFFLinkerContext &ctx) {
+  SmallVector<std::string, 16> records;
+  records.reserve(ctx.importFileInstances.size());
+  for (ImportFile *file : ctx.importFileInstances) {
+    std::string record;
+    raw_string_ostream os(record);
+    os << file->dllName << '\n'
+       << file->externalName << '\n'
+       << file->hdr->OrdinalHint << '\n'
+       << file->hdr->TypeInfo << '\n';
+    records.push_back(std::move(record));
+  }
+  llvm::sort(records);
+
+  SmallString<512> buffer;
+  raw_svector_ostream os(buffer);
+  for (const std::string &record : records)
+    os << record;
+  return xxh3_64bits(buffer);
+}
+
+static uint64_t computeIncrementalExportTopologyHash(COFFLinkerContext &ctx) {
+  SmallVector<std::string, 16> records;
+  ctx.forEachActiveSymtab([&](SymbolTable &symtab) {
+    for (const Export &e : symtab.exports) {
+      std::string record;
+      raw_string_ostream os(record);
+      os << e.name << '\n'
+         << e.extName << '\n'
+         << e.exportAs << '\n'
+         << e.importName << '\n'
+         << e.forwardTo << '\n'
+         << e.exportName << '\n'
+         << e.symbolName << '\n'
+         << e.ordinal << '\n'
+         << e.noname << '\n'
+         << e.data << '\n'
+         << e.isPrivate << '\n'
+         << e.constant << '\n'
+         << unsigned(e.source) << '\n';
+      records.push_back(std::move(record));
+    }
+  });
+  llvm::sort(records);
+
+  SmallString<512> buffer;
+  raw_svector_ostream os(buffer);
+  for (const std::string &record : records)
+    os << record;
+  return xxh3_64bits(buffer);
+}
+
+static uint64_t computeIncrementalResourceInputHash(COFFLinkerContext &ctx) {
+  SmallVector<std::string, 8> records;
+  for (MemoryBufferRef mb : ctx.driver.getResources()) {
+    std::string record;
+    raw_string_ostream os(record);
+    os << mb.getBufferIdentifier() << '\n'
+       << xxh3_64bits(mb.getBuffer()) << '\n';
+    records.push_back(std::move(record));
+  }
+  llvm::sort(records);
+
+  SmallString<256> buffer;
+  raw_svector_ostream os(buffer);
+  for (const std::string &record : records)
+    os << record;
+  return xxh3_64bits(buffer);
+}
+
+static std::vector<IncrementalSymbolState>
+buildIncrementalSymbolStates(COFFLinkerContext &ctx,
+                             IncrementalLinkSession &session) {
+  std::vector<IncrementalSymbolState> states;
+  ctx.forEachActiveSymtab([&](SymbolTable &symtab) {
+    symtab.forEachSymbol([&](Symbol *sym) {
+      auto *def = dyn_cast<Defined>(sym);
+      if (!def)
+        return;
+      if (auto *coff = dyn_cast<DefinedCOFF>(sym))
+        if (!coff->getCOFFSymbol().isExternal())
+          return;
+
+      IncrementalSymbolState state;
+      state.name = sym->getName().str();
+
+      if (auto *reg = dyn_cast<DefinedRegular>(sym)) {
+        state.kind = IncrementalSymbolKind::Regular;
+        if (auto *file = dyn_cast<ObjFile>(reg->getFile()))
+          if (auto it = session.inputIndices.find(file);
+              it != session.inputIndices.end())
+            state.inputIndex = it->second;
+        state.value = reg->getValue();
+        if (SectionChunk *chunk = reg->getChunk())
+          state.auxiliaryKey = getIncrementalChunkKey(session, *chunk);
+      } else if (auto *common = dyn_cast<DefinedCommon>(sym)) {
+        state.kind = IncrementalSymbolKind::Common;
+        if (auto *file = dyn_cast<ObjFile>(common->getFile()))
+          if (auto it = session.inputIndices.find(file);
+              it != session.inputIndices.end())
+            state.inputIndex = it->second;
+        state.value = common->getChunk()->getSize();
+        std::string key;
+        raw_string_ostream os(key);
+        os << common->getChunk()->getAlignment();
+        state.auxiliaryKey = os.str();
+      } else if (auto *imp = dyn_cast<DefinedImportData>(sym)) {
+        state.kind = IncrementalSymbolKind::ImportData;
+        state.value = imp->getOrdinal();
+        std::string key;
+        raw_string_ostream os(key);
+        os << imp->getDLLName() << '\n' << imp->getExternalName() << '\n'
+           << imp->file->hdr->TypeInfo;
+        state.auxiliaryKey = os.str();
+      } else if (auto *thunk = dyn_cast<DefinedImportThunk>(sym)) {
+        state.kind = IncrementalSymbolKind::ImportThunk;
+        state.auxiliaryKey = thunk->wrappedSym->getName().str();
+      } else if (auto *localImport = dyn_cast<DefinedLocalImport>(sym)) {
+        state.kind = IncrementalSymbolKind::LocalImport;
+        if (Chunk *chunk = localImport->getChunk())
+          state.auxiliaryKey = chunk->getDebugName().str();
+      } else if (auto *absolute = dyn_cast<DefinedAbsolute>(sym)) {
+        state.kind = IncrementalSymbolKind::Absolute;
+        state.value = absolute->getVA();
+      } else if (auto *synthetic = dyn_cast<DefinedSynthetic>(sym)) {
+        state.kind = IncrementalSymbolKind::Synthetic;
+        if (Chunk *chunk = synthetic->getChunk())
+          state.auxiliaryKey = chunk->getDebugName().str();
+      } else {
+        return;
+      }
+
+      states.push_back(std::move(state));
+    });
+  });
+
+  llvm::sort(states, [](const IncrementalSymbolState &lhs,
+                        const IncrementalSymbolState &rhs) {
+    return std::tie(lhs.name, lhs.kind, lhs.inputIndex, lhs.value,
+                    lhs.auxiliaryKey) <
+           std::tie(rhs.name, rhs.kind, rhs.inputIndex, rhs.value,
+                    rhs.auxiliaryKey);
+  });
+  return states;
+}
+
 static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
                                                   IncrementalLinkSession &session) {
   IncrementalStateFile state;
@@ -71,6 +226,9 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
   state.outputPath = ctx.config.outputFile;
   state.hardConfigHash = computeIncrementalHardConfigHash(ctx.config);
   state.softConfigHash = computeIncrementalSoftConfigHash(ctx.config);
+  state.importTopologyHash = computeIncrementalImportTopologyHash(ctx);
+  state.exportTopologyHash = computeIncrementalExportTopologyHash(ctx);
+  state.resourceInputHash = computeIncrementalResourceInputHash(ctx);
 
   ErrorOr<std::unique_ptr<MemoryBuffer>> output = MemoryBuffer::getFile(
       ctx.config.outputFile, /*IsText=*/false, /*RequiresNullTerminator=*/false);
@@ -108,6 +266,7 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
     IncrementalInputState input;
     input.name = session.currentInputNames[i];
     input.parentName = session.currentParentNames[i];
+    input.archiveOffset = session.currentArchiveOffsets[i];
     input.contentHash = session.currentInputHashes[i];
     input.size = ctx.objFileInstances[i]->mb.getBufferSize();
     state.inputs.push_back(std::move(input));
@@ -153,6 +312,8 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
       state.chunks.push_back(std::move(chunkState));
     }
   }
+
+  state.symbols = buildIncrementalSymbolStates(ctx, session);
 
   return state;
 }
@@ -254,6 +415,7 @@ bool prepareCurrentIncrementalInputs(COFFLinkerContext &ctx,
   session.currentInputHashes.clear();
   session.currentInputNames.clear();
   session.currentParentNames.clear();
+  session.currentArchiveOffsets.clear();
   session.inputIndices.clear();
   session.changedInputs.clear();
   session.reusedChunkData.clear();
@@ -262,7 +424,8 @@ bool prepareCurrentIncrementalInputs(COFFLinkerContext &ctx,
     session.inputIndices[file] = i;
     session.currentInputHashes.push_back(xxh3_64bits(file->mb.getBuffer()));
     session.currentInputNames.push_back(file->getName().str());
-    session.currentParentNames.push_back(file->parentName.str());
+    session.currentParentNames.push_back(file->archiveName.str());
+    session.currentArchiveOffsets.push_back(file->archiveOffset);
   }
   return true;
 }
@@ -321,6 +484,43 @@ uint64_t computeIncrementalSymbolHash(const SectionChunk &chunk) {
   return xxh3_64bits(buffer);
 }
 
+static void disableIncrementalStateReuse(COFFLinkerContext &ctx) {
+  if (!ctx.incrementalSession)
+    return;
+  ctx.incrementalSession->stateLoaded = false;
+  ctx.incrementalSession->changedInputs.clear();
+  ctx.incrementalSession->reusedChunkData.clear();
+}
+
+static bool validateIncrementalSymbolStates(COFFLinkerContext &ctx,
+                                            IncrementalLinkSession &session) {
+  std::vector<IncrementalSymbolState> currentSymbols =
+      buildIncrementalSymbolStates(ctx, session);
+  if (currentSymbols.size() != session.state.symbols.size()) {
+    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
+                           "resolved symbol count changed");
+    disableIncrementalStateReuse(ctx);
+    return false;
+  }
+
+  for (size_t i = 0; i < currentSymbols.size(); ++i) {
+    const IncrementalSymbolState &current = currentSymbols[i];
+    const IncrementalSymbolState &old = session.state.symbols[i];
+    if (current.name != old.name || current.kind != old.kind ||
+        current.inputIndex != old.inputIndex || current.value != old.value ||
+        current.auxiliaryKey != old.auxiliaryKey) {
+      std::string detail;
+      raw_string_ostream os(detail);
+      os << "symbol winner changed: " << current.name;
+      setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
+                             os.str());
+      disableIncrementalStateReuse(ctx);
+      return false;
+    }
+  }
+  return true;
+}
+
 void prepareIncrementalLink(COFFLinkerContext &ctx) {
   ctx.config.incrementalLinkActive = false;
   ctx.config.incrementalLinkEligible = false;
@@ -334,7 +534,6 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   ensureIncrementalStatePath(ctx.config);
   auto session = std::make_unique<IncrementalLinkSession>();
   session->canWriteState = true;
-  prepareCurrentIncrementalInputs(ctx, *session);
 
   if (ctx.config.machine != AMD64) {
     session->canWriteState = false;
@@ -382,23 +581,11 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
     setIncrementalFallback(ctx, IncrementalFallbackReason::ConfigChanged);
     return;
   }
-
-  if (stateOrErr->inputs.size() != session->currentInputHashes.size()) {
+  if (stateOrErr->outputPath != ctx.config.outputFile) {
     ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged);
+    setIncrementalFallback(ctx, IncrementalFallbackReason::OutputMismatch,
+                           "incremental state was written for a different output");
     return;
-  }
-
-  for (size_t i = 0; i < stateOrErr->inputs.size(); ++i) {
-    const IncrementalInputState &input = stateOrErr->inputs[i];
-    if (input.name != session->currentInputNames[i] ||
-        input.parentName != session->currentParentNames[i]) {
-      ctx.incrementalSession = std::move(session);
-      setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged);
-      return;
-    }
-    if (input.contentHash != session->currentInputHashes[i])
-      session->changedInputs.insert(ctx.objFileInstances[i]);
   }
 
   ErrorOr<std::unique_ptr<MemoryBuffer>> oldImage = MemoryBuffer::getFile(
@@ -418,11 +605,112 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   session->state = std::move(*stateOrErr);
   session->oldImage = std::move(*oldImage);
   session->stateLoaded = true;
-  session->softConfigChanged =
-      session->state.softConfigHash != softHash;
+  session->softConfigChanged = session->state.softConfigHash != softHash;
+  for (ArchiveFile *file : ctx.archiveFileInstances)
+    session->replayableArchives.insert(file->getName());
+
+  StringMap<ArchiveFile *> archives;
+  for (ArchiveFile *file : ctx.archiveFileInstances)
+    archives[file->getName()] = file;
+
+  for (const IncrementalInputState &input : session->state.inputs) {
+    if (input.parentName.empty())
+      continue;
+    auto archiveIt = archives.find(input.parentName);
+    if (archiveIt == archives.end())
+      continue;
+
+    session->expectedArchiveMembers.insert(getIncrementalArchiveMemberKey(
+        input.parentName, input.archiveOffset, input.name));
+    if (input.archiveOffset != 0)
+      archiveIt->second->addMemberByOffset(input.archiveOffset, input.name);
+    else
+      archiveIt->second->addMemberByName(input.name, input.name);
+  }
+
   ctx.incrementalSession = std::move(session);
-  if (ctx.config.verbose)
+}
+
+void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
+  if (!ctx.incrementalSession || !ctx.incrementalSession->stateLoaded)
+    return;
+
+  IncrementalLinkSession &session = *ctx.incrementalSession;
+
+  if (hasBitcodeInputs(ctx)) {
+    session.canWriteState = false;
+    setIncrementalFallback(ctx, IncrementalFallbackReason::LtoInput);
+    disableIncrementalStateReuse(ctx);
+    return;
+  }
+
+  uint64_t resourceHash = computeIncrementalResourceInputHash(ctx);
+  if (resourceHash != session.state.resourceInputHash) {
+    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
+                           "resource or manifest inputs changed");
+    disableIncrementalStateReuse(ctx);
+    return;
+  }
+
+  prepareCurrentIncrementalInputs(ctx, session);
+
+  if (session.state.inputs.size() != session.currentInputHashes.size()) {
+    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
+                           "input count changed");
+    disableIncrementalStateReuse(ctx);
+    return;
+  }
+
+  for (size_t i = 0; i < session.state.inputs.size(); ++i) {
+    const IncrementalInputState &input = session.state.inputs[i];
+    if (input.name != session.currentInputNames[i] ||
+        input.parentName != session.currentParentNames[i] ||
+        input.archiveOffset != session.currentArchiveOffsets[i]) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
+                             "input order changed");
+      disableIncrementalStateReuse(ctx);
+      return;
+    }
+    if (input.contentHash != session.currentInputHashes[i])
+      session.changedInputs.insert(ctx.objFileInstances[i]);
+  }
+
+  if (session.loadedArchiveMembers.size() != session.expectedArchiveMembers.size()) {
+    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
+                           "archive member extraction changed");
+    disableIncrementalStateReuse(ctx);
+    return;
+  }
+  for (const auto &entry : session.expectedArchiveMembers) {
+    if (!session.loadedArchiveMembers.contains(entry.getKey())) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
+                             "archive member extraction changed");
+      disableIncrementalStateReuse(ctx);
+      return;
+    }
+  }
+
+  if (session.state.importTopologyHash != computeIncrementalImportTopologyHash(ctx)) {
+    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
+                           "import topology changed");
+    disableIncrementalStateReuse(ctx);
+    return;
+  }
+  if (session.state.exportTopologyHash != computeIncrementalExportTopologyHash(ctx)) {
+    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
+                           "export topology changed");
+    disableIncrementalStateReuse(ctx);
+    return;
+  }
+
+  if (!validateIncrementalSymbolStates(ctx, session))
+    return;
+
+  if (ctx.config.verbose) {
     Log(ctx) << "incremental: using state " << ctx.config.incrementalStatePath;
+    if (session.softConfigChanged)
+      Log(ctx) << "incremental: soft-config metadata changed; rebuilding PDB metadata";
+  }
 }
 
 void finalizeIncrementalLink(COFFLinkerContext &ctx) {
@@ -430,10 +718,25 @@ void finalizeIncrementalLink(COFFLinkerContext &ctx) {
       !ctx.incrementalSession->canWriteState)
     return;
 
+  prepareCurrentIncrementalInputs(ctx, *ctx.incrementalSession);
   IncrementalStateFile state =
       buildIncrementalState(ctx, *ctx.incrementalSession);
   if (Error err = writeIncrementalState(ctx.config.incrementalStatePath, state))
     Warn(ctx) << "failed to write incremental state: " << toString(std::move(err));
+}
+
+void noteIncrementalArchiveMemberLoad(COFFLinkerContext &ctx,
+                                      StringRef archiveName,
+                                      uint64_t archiveOffset,
+                                      StringRef memberName) {
+  if (!ctx.incrementalSession || archiveName.empty())
+    return;
+
+  IncrementalLinkSession &session = *ctx.incrementalSession;
+  if (!session.replayableArchives.contains(archiveName))
+    return;
+  session.loadedArchiveMembers.insert(
+      getIncrementalArchiveMemberKey(archiveName, archiveOffset, memberName));
 }
 
 } // namespace lld::coff
