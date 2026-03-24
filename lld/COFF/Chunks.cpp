@@ -77,6 +77,20 @@ MachineTypes SectionChunk::getMachine() const {
 // below is the size of this class on x64 platforms.
 static_assert(sizeof(SectionChunk) <= 88, "SectionChunk grew unexpectedly");
 
+IncrementalPaddingChunk::IncrementalPaddingChunk(StringRef secName,
+                                                 uint32_t chars, uint32_t size,
+                                                 uint8_t fillByte)
+    : NonSectionChunk(IncrementalPaddingKind), secName(secName.str()),
+      chars(chars), size(size), fillByte(fillByte) {
+  setAlignment(1);
+}
+
+void IncrementalPaddingChunk::writeTo(uint8_t *buf) const {
+  if (size == 0)
+    return;
+  memset(buf, fillByte, size);
+}
+
 static void add16(uint8_t *p, int16_t v) { write16le(p, read16le(p) + v); }
 static void add32(uint8_t *p, int32_t v) { write32le(p, read32le(p) + v); }
 static void add64(uint8_t *p, int64_t v) { write64le(p, read64le(p) + v); }

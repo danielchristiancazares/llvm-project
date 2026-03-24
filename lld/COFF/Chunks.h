@@ -59,6 +59,7 @@ public:
     SectionKind,
     SectionECKind,
     OtherKind,
+    IncrementalPaddingKind,
     ImportThunkKind,
     ECExportThunkKind
   };
@@ -209,6 +210,29 @@ public:
 
 protected:
   NonSectionCodeChunk(Kind k = OtherKind) : NonSectionChunk(k) {}
+};
+
+class IncrementalPaddingChunk : public NonSectionChunk {
+public:
+  IncrementalPaddingChunk(StringRef secName, uint32_t chars, uint32_t size,
+                          uint8_t fillByte);
+  static bool classof(const Chunk *c) {
+    return c->kind() == IncrementalPaddingKind;
+  }
+
+  size_t getSize() const override { return size; }
+  uint32_t getOutputCharacteristics() const override { return chars; }
+  StringRef getSectionName() const override { return secName; }
+  void writeTo(uint8_t *buf) const override;
+  StringRef getDebugName() const override { return "incremental-padding"; }
+
+  uint8_t getFillByte() const { return fillByte; }
+
+private:
+  std::string secName;
+  uint32_t chars;
+  uint32_t size;
+  uint8_t fillByte;
 };
 
 // MinGW specific; information about one individual location in the image

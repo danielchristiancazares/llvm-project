@@ -121,6 +121,9 @@ enum class IncrementalFallbackReason {
   OutputMismatch,
   LayoutChanged,
   SlotOverflow,
+  MergeChunkParticipantChanged,
+  PackedSectionOverflow,
+  Amd64Rel32OutOfRange,
 };
 
 // Global configuration.
@@ -351,6 +354,7 @@ struct Configuration {
   bool warnStdcallFixup = true;
   bool warnImportedDllMain = true;
   bool keepUnchangedImplib = true;
+  bool incrementalLinkSpecified = false;
   bool incrementalLinkRequested = true;
   bool incrementalLinkEligible = false;
   bool incrementalLinkActive = false;

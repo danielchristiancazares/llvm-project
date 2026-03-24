@@ -2268,6 +2268,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   config->allowBind = args.hasFlag(OPT_allowbind, OPT_allowbind_no, true);
   config->allowIsolation =
       args.hasFlag(OPT_allowisolation, OPT_allowisolation_no, true);
+  config->incrementalLinkSpecified =
+      args.hasArg(OPT_incremental) || args.hasArg(OPT_incremental_no);
   config->incrementalLinkRequested =
       args.hasFlag(OPT_incremental, OPT_incremental_no,
                    !config->doGC && config->doICF == ICFLevel::None &&

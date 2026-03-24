@@ -236,6 +236,7 @@ private:
   void createECCodeMap();
   void finalizeAddresses();
   void removeEmptySections();
+  void refreshExceptionTableRanges();
   void assignOutputSectionIndices();
   void createSymbolAndStringTable();
   void openFile(StringRef outputPath);
@@ -377,6 +378,19 @@ void OutputSection::insertChunkAtStart(Chunk *c) {
 void OutputSection::setPermissions(uint32_t c) {
   header.Characteristics &= ~permMask;
   header.Characteristics |= c;
+}
+
+static bool isIncrementalPreservedSection(const COFFLinkerContext &ctx,
+                                          const OutputSection *section) {
+  if (!ctx.incrementalSession || !ctx.incrementalSession->stateLoaded ||
+      ctx.incrementalSession->state.layoutMode != IncrementalLayoutMode::Slotted)
+    return false;
+  for (const IncrementalSectionState &oldSection :
+       ctx.incrementalSession->state.sections)
+    if (section->name == oldSection.name &&
+        section->header.Characteristics == oldSection.characteristics)
+      return true;
+  return false;
 }
 
 void OutputSection::merge(OutputSection *other) {
@@ -800,6 +814,8 @@ void Writer::run() {
       sizeOfHeaders = incrementalLayout.sizeOfHeaders;
     }
     removeEmptySections();
+    if (ctx.config.incrementalLinkActive)
+      refreshExceptionTableRanges();
     assignOutputSectionIndices();
     setSectionPermissions();
     setECSymbols();
@@ -1452,6 +1468,8 @@ void Writer::removeUnusedSections() {
   auto isUnused = [this](OutputSection *s) {
     if (s == relocSec)
       return false; // This section is populated later.
+    if (isIncrementalPreservedSection(ctx, s))
+      return false;
     // MergeChunks have zero size at this point, as their size is finalized
     // later. Only remove sections that have no Chunks at all.
     return s->chunks.empty();
@@ -1490,8 +1508,44 @@ void Writer::layoutSections() {
 // so we remove them if any.
 void Writer::removeEmptySections() {
   llvm::TimeTraceScope timeScope("Remove empty sections");
-  auto isEmpty = [](OutputSection *s) { return s->getVirtualSize() == 0; };
+  auto isEmpty = [this](OutputSection *s) {
+    return s->getVirtualSize() == 0 && !isIncrementalPreservedSection(ctx, s);
+  };
   llvm::erase_if(ctx.outputSections, isEmpty);
+}
+
+void Writer::refreshExceptionTableRanges() {
+  pdata = {};
+  hybridPdata = {};
+  if (!pdataSec || pdataSec->chunks.empty())
+    return;
+
+  if (ctx.config.machine == AMD64) {
+    pdata.first = pdataSec->chunks.front();
+    pdata.last = pdataSec->chunks.back();
+    return;
+  }
+
+  if (isArm64EC(ctx.config.machine)) {
+    llvm::stable_sort(pdataSec->chunks, [=](const Chunk *a, const Chunk *b) {
+      return (a->getMachine() == AMD64) < (b->getMachine() == AMD64);
+    });
+
+    for (Chunk *chunk : pdataSec->chunks) {
+      if (chunk->getMachine() == AMD64) {
+        hybridPdata.first = chunk;
+        hybridPdata.last = pdataSec->chunks.back();
+        break;
+      }
+      if (!pdata.first)
+        pdata.first = chunk;
+      pdata.last = chunk;
+    }
+    return;
+  }
+
+  pdata.first = pdataSec->chunks.front();
+  pdata.last = pdataSec->chunks.back();
 }
 
 void Writer::assignOutputSectionIndices() {

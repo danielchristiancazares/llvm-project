@@ -6,6 +6,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstring>
+#include <limits>
 
 using namespace llvm;
 using namespace llvm::support;
@@ -16,9 +17,12 @@ namespace lld::coff {
 namespace {
 
 constexpr char stateMagic[8] = {'L', 'L', 'I', 'L', 'K', '6', '4', '\0'};
-constexpr uint32_t stateVersion = 2;
+constexpr uint32_t exactStateVersion = 2;
+constexpr uint32_t slottedStateVersion = 3;
+constexpr uint16_t envelopeFlagPackedActivePrefix = 1u << 0;
+constexpr uint16_t envelopeFlagSlotReuseEnabled = 1u << 1;
 
-struct FileHeader {
+struct FileHeaderV2 {
   char magic[8];
   ulittle32_t version;
   ulittle16_t machine;
@@ -41,6 +45,45 @@ struct FileHeader {
   ulittle64_t chunkCount;
   ulittle64_t symbolTableOffset;
   ulittle64_t symbolCount;
+  ulittle64_t stringTableOffset;
+  ulittle64_t stringTableSize;
+};
+
+struct FileHeaderV3 {
+  char magic[8];
+  ulittle32_t version;
+  ulittle16_t machine;
+  ulittle16_t flags;
+  ulittle16_t layoutMode;
+  ulittle16_t reserved0;
+  ulittle64_t outputHash;
+  ulittle64_t outputSize;
+  ulittle64_t hardConfigHash;
+  ulittle64_t softConfigHash;
+  ulittle64_t importTopologyHash;
+  ulittle64_t exportTopologyHash;
+  ulittle64_t resourceInputHash;
+  ulittle64_t sizeOfHeaders;
+  ulittle64_t sizeOfImage;
+  ulittle64_t outputPathOffset;
+  ulittle64_t inputTableOffset;
+  ulittle64_t inputCount;
+  ulittle64_t sectionTableOffset;
+  ulittle64_t sectionCount;
+  ulittle64_t chunkTableOffset;
+  ulittle64_t chunkCount;
+  ulittle64_t symbolTableOffset;
+  ulittle64_t symbolCount;
+  ulittle64_t envelopeTableOffset;
+  ulittle64_t envelopeCount;
+  ulittle64_t slotTableOffset;
+  ulittle64_t slotCount;
+  ulittle64_t packedSectionTableOffset;
+  ulittle64_t packedSectionCount;
+  ulittle64_t packedKeyTableOffset;
+  ulittle64_t packedKeyCount;
+  ulittle64_t placementTableOffset;
+  ulittle64_t placementCount;
   ulittle64_t stringTableOffset;
   ulittle64_t stringTableSize;
 };
@@ -88,6 +131,51 @@ struct SymbolRecord {
   ulittle16_t kind;
   ulittle16_t reserved;
   ulittle64_t value;
+};
+
+struct EnvelopeRecord {
+  ulittle64_t nameOffset;
+  ulittle32_t characteristics;
+  ulittle16_t slotClass;
+  ulittle16_t flags;
+  ulittle64_t sectionRVA;
+  ulittle64_t maxSectionEndRVA;
+  ulittle64_t activeEndRVA;
+};
+
+struct SlotRecord {
+  ulittle64_t occupantKeyOffset;
+  ulittle32_t envelopeIndex;
+  ulittle32_t minAlignment;
+  ulittle16_t state;
+  uint8_t fillByte;
+  uint8_t reserved0;
+  ulittle64_t startRVA;
+  ulittle64_t capacity;
+  ulittle64_t committedSize;
+};
+
+struct PackedSectionRecord {
+  ulittle32_t envelopeIndex;
+  ulittle32_t firstRecordKey;
+  ulittle32_t recordKeyCount;
+  ulittle32_t reserved;
+  ulittle64_t activePrefixSize;
+  ulittle64_t reserveSize;
+};
+
+struct PackedKeyRecord {
+  ulittle64_t keyOffset;
+};
+
+struct PlacementRecord {
+  ulittle64_t keyOffset;
+  ulittle32_t envelopeIndex;
+  ulittle32_t alignment;
+  ulittle16_t kind;
+  ulittle16_t reserved;
+  ulittle64_t startRVA;
+  ulittle64_t size;
 };
 
 template <typename T>
@@ -156,29 +244,10 @@ template <typename T> void appendObject(std::vector<char> &out, const T &obj) {
   memcpy(out.data() + oldSize, &obj, sizeof(T));
 }
 
-} // namespace
-
-Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
-  ErrorOr<std::unique_ptr<MemoryBuffer>> buffer = MemoryBuffer::getFile(
-      path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
-  if (!buffer)
-    return createFileError(path, errorCodeToError(buffer.getError()));
-
-  ArrayRef<uint8_t> bytes(reinterpret_cast<const uint8_t *>(
-                              (*buffer)->getBufferStart()),
-                          (*buffer)->getBufferSize());
-  Expected<FileHeader> headerOrErr = readObject<FileHeader>(bytes, 0);
-  if (!headerOrErr)
-    return headerOrErr.takeError();
-  FileHeader header = *headerOrErr;
-
-  if (memcmp(header.magic, stateMagic, sizeof(stateMagic)) != 0)
-    return createStringError(inconvertibleErrorCode(),
-                             "incremental state file has an invalid magic");
-  if (header.version != stateVersion)
-    return createStringError(inconvertibleErrorCode(),
-                             "incremental state file has an unsupported version");
-
+template <typename HeaderT>
+Expected<IncrementalStateFile>
+loadCommonState(ArrayRef<uint8_t> bytes, const HeaderT &header,
+                IncrementalLayoutMode layoutMode) {
   if (header.stringTableOffset > bytes.size() ||
       header.stringTableSize > bytes.size() - header.stringTableOffset)
     return createStringError(inconvertibleErrorCode(),
@@ -188,7 +257,9 @@ Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
 
   IncrementalStateFile state;
   state.version = header.version;
-  state.machine = static_cast<llvm::COFF::MachineTypes>(uint16_t(header.machine));
+  state.layoutMode = layoutMode;
+  state.machine =
+      static_cast<llvm::COFF::MachineTypes>(uint16_t(header.machine));
   state.outputHash = header.outputHash;
   state.outputSize = header.outputSize;
   state.hardConfigHash = header.hardConfigHash;
@@ -198,6 +269,7 @@ Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
   state.resourceInputHash = header.resourceInputHash;
   state.sizeOfHeaders = header.sizeOfHeaders;
   state.sizeOfImage = header.sizeOfImage;
+
   Expected<StringRef> outputPathOrErr =
       loadString(strings, header.outputPathOffset);
   if (!outputPathOrErr)
@@ -272,7 +344,8 @@ Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
   }
 
   Expected<std::vector<SymbolRecord>> symbolsOrErr =
-      readTable<SymbolRecord>(bytes, header.symbolTableOffset, header.symbolCount);
+      readTable<SymbolRecord>(bytes, header.symbolTableOffset,
+                              header.symbolCount);
   if (!symbolsOrErr)
     return symbolsOrErr.takeError();
   state.symbols.reserve(symbolsOrErr->size());
@@ -281,7 +354,8 @@ Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
     Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
     if (!nameOrErr)
       return nameOrErr.takeError();
-    Expected<StringRef> keyOrErr = loadString(strings, record.auxiliaryKeyOffset);
+    Expected<StringRef> keyOrErr =
+        loadString(strings, record.auxiliaryKeyOffset);
     if (!keyOrErr)
       return keyOrErr.takeError();
     symbol.name = nameOrErr->str();
@@ -295,12 +369,195 @@ Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
   return state;
 }
 
+Expected<IncrementalStateFile> loadIncrementalStateV2(ArrayRef<uint8_t> bytes,
+                                                      const FileHeaderV2 &header) {
+  return loadCommonState(bytes, header, IncrementalLayoutMode::Exact);
+}
+
+Expected<IncrementalStateFile> loadIncrementalStateV3(ArrayRef<uint8_t> bytes,
+                                                      const FileHeaderV3 &header) {
+  Expected<IncrementalStateFile> stateOrErr =
+      loadCommonState(bytes, header,
+                      static_cast<IncrementalLayoutMode>(uint16_t(header.layoutMode)));
+  if (!stateOrErr)
+    return stateOrErr.takeError();
+
+  IncrementalStateFile state = std::move(*stateOrErr);
+  if (state.layoutMode != IncrementalLayoutMode::Exact &&
+      state.layoutMode != IncrementalLayoutMode::Slotted)
+    return createStringError(inconvertibleErrorCode(),
+                             "incremental state file has an invalid layout mode");
+
+  if (header.envelopeCount != 0) {
+    Expected<std::vector<EnvelopeRecord>> envelopesOrErr = readTable<EnvelopeRecord>(
+        bytes, header.envelopeTableOffset, header.envelopeCount);
+    if (!envelopesOrErr)
+      return envelopesOrErr.takeError();
+
+    ArrayRef<uint8_t> strings =
+        bytes.slice(header.stringTableOffset, header.stringTableSize);
+    state.sectionEnvelopes.reserve(envelopesOrErr->size());
+    for (const EnvelopeRecord &record : *envelopesOrErr) {
+      IncrementalSectionEnvelopeState envelope;
+      Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
+      if (!nameOrErr)
+        return nameOrErr.takeError();
+      envelope.name = nameOrErr->str();
+      envelope.characteristics = record.characteristics;
+      envelope.sectionRVA = record.sectionRVA;
+      envelope.maxSectionEndRVA = record.maxSectionEndRVA;
+      envelope.activeEndRVA = record.activeEndRVA;
+      envelope.slotClass =
+          static_cast<IncrementalSlotClass>(uint16_t(record.slotClass));
+      envelope.packedActivePrefix =
+          (record.flags & envelopeFlagPackedActivePrefix) != 0;
+      envelope.slotReuseEnabled =
+          (record.flags & envelopeFlagSlotReuseEnabled) != 0;
+      state.sectionEnvelopes.push_back(std::move(envelope));
+    }
+  }
+
+  if (header.slotCount != 0) {
+    Expected<std::vector<SlotRecord>> slotsOrErr =
+        readTable<SlotRecord>(bytes, header.slotTableOffset, header.slotCount);
+    if (!slotsOrErr)
+      return slotsOrErr.takeError();
+
+    ArrayRef<uint8_t> strings =
+        bytes.slice(header.stringTableOffset, header.stringTableSize);
+    state.slotRecords.reserve(slotsOrErr->size());
+    for (const SlotRecord &record : *slotsOrErr) {
+      IncrementalSlotRecordState slot;
+      Expected<StringRef> keyOrErr =
+          loadString(strings, record.occupantKeyOffset);
+      if (!keyOrErr)
+        return keyOrErr.takeError();
+      slot.envelopeIndex = record.envelopeIndex;
+      slot.startRVA = record.startRVA;
+      slot.capacity = record.capacity;
+      slot.committedSize = record.committedSize;
+      slot.minAlignment = record.minAlignment;
+      slot.fillByte = record.fillByte;
+      slot.state = static_cast<IncrementalSlotState>(uint16_t(record.state));
+      slot.occupantKey = keyOrErr->str();
+      state.slotRecords.push_back(std::move(slot));
+    }
+  }
+
+  SmallVector<StringRef, 32> packedKeys;
+  if (header.packedKeyCount != 0) {
+    Expected<std::vector<PackedKeyRecord>> packedKeysOrErr =
+        readTable<PackedKeyRecord>(bytes, header.packedKeyTableOffset,
+                                   header.packedKeyCount);
+    if (!packedKeysOrErr)
+      return packedKeysOrErr.takeError();
+
+    ArrayRef<uint8_t> strings =
+        bytes.slice(header.stringTableOffset, header.stringTableSize);
+    packedKeys.reserve(packedKeysOrErr->size());
+    for (const PackedKeyRecord &record : *packedKeysOrErr) {
+      Expected<StringRef> keyOrErr = loadString(strings, record.keyOffset);
+      if (!keyOrErr)
+        return keyOrErr.takeError();
+      packedKeys.push_back(*keyOrErr);
+    }
+  }
+
+  if (header.packedSectionCount != 0) {
+    Expected<std::vector<PackedSectionRecord>> packedSectionsOrErr =
+        readTable<PackedSectionRecord>(bytes, header.packedSectionTableOffset,
+                                       header.packedSectionCount);
+    if (!packedSectionsOrErr)
+      return packedSectionsOrErr.takeError();
+
+    state.packedSections.reserve(packedSectionsOrErr->size());
+    for (const PackedSectionRecord &record : *packedSectionsOrErr) {
+      if (record.firstRecordKey > packedKeys.size() ||
+          packedKeys.size() - record.firstRecordKey < record.recordKeyCount)
+        return createStringError(inconvertibleErrorCode(),
+                                 "incremental packed section key range is invalid");
+      IncrementalPackedSectionState packedSection;
+      packedSection.envelopeIndex = record.envelopeIndex;
+      packedSection.activePrefixSize = record.activePrefixSize;
+      packedSection.reserveSize = record.reserveSize;
+      packedSection.recordKeys.reserve(record.recordKeyCount);
+      for (StringRef key : ArrayRef<StringRef>(packedKeys).slice(
+               record.firstRecordKey, record.recordKeyCount))
+        packedSection.recordKeys.push_back(key.str());
+      state.packedSections.push_back(std::move(packedSection));
+    }
+  }
+
+  if (header.placementCount != 0) {
+    Expected<std::vector<PlacementRecord>> placementsOrErr =
+        readTable<PlacementRecord>(bytes, header.placementTableOffset,
+                                   header.placementCount);
+    if (!placementsOrErr)
+      return placementsOrErr.takeError();
+
+    ArrayRef<uint8_t> strings =
+        bytes.slice(header.stringTableOffset, header.stringTableSize);
+    state.placements.reserve(placementsOrErr->size());
+    for (const PlacementRecord &record : *placementsOrErr) {
+      IncrementalPlacementState placement;
+      Expected<StringRef> keyOrErr = loadString(strings, record.keyOffset);
+      if (!keyOrErr)
+        return keyOrErr.takeError();
+      placement.key = keyOrErr->str();
+      placement.envelopeIndex = record.envelopeIndex;
+      placement.kind =
+          static_cast<IncrementalPlacementKind>(uint16_t(record.kind));
+      placement.startRVA = record.startRVA;
+      placement.size = record.size;
+      placement.alignment = record.alignment;
+      state.placements.push_back(std::move(placement));
+    }
+  }
+
+  return state;
+}
+
+} // namespace
+
+Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
+  ErrorOr<std::unique_ptr<MemoryBuffer>> buffer = MemoryBuffer::getFile(
+      path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
+  if (!buffer)
+    return createFileError(path, errorCodeToError(buffer.getError()));
+
+  ArrayRef<uint8_t> bytes(reinterpret_cast<const uint8_t *>(
+                              (*buffer)->getBufferStart()),
+                          (*buffer)->getBufferSize());
+  Expected<FileHeaderV2> prefixOrErr = readObject<FileHeaderV2>(bytes, 0);
+  if (!prefixOrErr)
+    return prefixOrErr.takeError();
+
+  if (memcmp(prefixOrErr->magic, stateMagic, sizeof(stateMagic)) != 0)
+    return createStringError(inconvertibleErrorCode(),
+                             "incremental state file has an invalid magic");
+
+  switch (uint32_t(prefixOrErr->version)) {
+  case exactStateVersion:
+    return loadIncrementalStateV2(bytes, *prefixOrErr);
+  case slottedStateVersion: {
+    Expected<FileHeaderV3> headerOrErr = readObject<FileHeaderV3>(bytes, 0);
+    if (!headerOrErr)
+      return headerOrErr.takeError();
+    return loadIncrementalStateV3(bytes, *headerOrErr);
+  }
+  default:
+    return createStringError(inconvertibleErrorCode(),
+                             "incremental state file has an unsupported version");
+  }
+}
+
 Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
-  FileHeader header = {};
+  FileHeaderV3 header = {};
   memcpy(header.magic, stateMagic, sizeof(stateMagic));
-  header.version = stateVersion;
+  header.version = slottedStateVersion;
   header.machine = state.machine;
   header.flags = 0;
+  header.layoutMode = static_cast<uint16_t>(state.layoutMode);
   header.outputHash = state.outputHash;
   header.outputSize = state.outputSize;
   header.hardConfigHash = state.hardConfigHash;
@@ -316,6 +573,11 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
   std::vector<SectionRecord> sectionRecords;
   std::vector<ChunkRecord> chunkRecords;
   std::vector<SymbolRecord> symbolRecords;
+  std::vector<EnvelopeRecord> envelopeRecords;
+  std::vector<SlotRecord> slotRecords;
+  std::vector<PackedSectionRecord> packedSectionRecords;
+  std::vector<PackedKeyRecord> packedKeyRecords;
+  std::vector<PlacementRecord> placementRecords;
 
   header.outputPathOffset = strings.add(state.outputPath);
 
@@ -373,7 +635,65 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
     symbolRecords.push_back(record);
   }
 
-  header.inputTableOffset = sizeof(FileHeader);
+  envelopeRecords.reserve(state.sectionEnvelopes.size());
+  for (const IncrementalSectionEnvelopeState &envelope : state.sectionEnvelopes) {
+    EnvelopeRecord record = {};
+    record.nameOffset = strings.add(envelope.name);
+    record.characteristics = envelope.characteristics;
+    record.slotClass = static_cast<uint16_t>(envelope.slotClass);
+    if (envelope.packedActivePrefix)
+      record.flags |= envelopeFlagPackedActivePrefix;
+    if (envelope.slotReuseEnabled)
+      record.flags |= envelopeFlagSlotReuseEnabled;
+    record.sectionRVA = envelope.sectionRVA;
+    record.maxSectionEndRVA = envelope.maxSectionEndRVA;
+    record.activeEndRVA = envelope.activeEndRVA;
+    envelopeRecords.push_back(record);
+  }
+
+  slotRecords.reserve(state.slotRecords.size());
+  for (const IncrementalSlotRecordState &slot : state.slotRecords) {
+    SlotRecord record = {};
+    record.occupantKeyOffset = strings.add(slot.occupantKey);
+    record.envelopeIndex = slot.envelopeIndex;
+    record.minAlignment = slot.minAlignment;
+    record.state = static_cast<uint16_t>(slot.state);
+    record.fillByte = slot.fillByte;
+    record.startRVA = slot.startRVA;
+    record.capacity = slot.capacity;
+    record.committedSize = slot.committedSize;
+    slotRecords.push_back(record);
+  }
+
+  packedSectionRecords.reserve(state.packedSections.size());
+  for (const IncrementalPackedSectionState &packedSection : state.packedSections) {
+    PackedSectionRecord record = {};
+    record.envelopeIndex = packedSection.envelopeIndex;
+    record.firstRecordKey = packedKeyRecords.size();
+    record.recordKeyCount = packedSection.recordKeys.size();
+    record.activePrefixSize = packedSection.activePrefixSize;
+    record.reserveSize = packedSection.reserveSize;
+    for (StringRef key : packedSection.recordKeys) {
+      PackedKeyRecord keyRecord = {};
+      keyRecord.keyOffset = strings.add(key);
+      packedKeyRecords.push_back(keyRecord);
+    }
+    packedSectionRecords.push_back(record);
+  }
+
+  placementRecords.reserve(state.placements.size());
+  for (const IncrementalPlacementState &placement : state.placements) {
+    PlacementRecord record = {};
+    record.keyOffset = strings.add(placement.key);
+    record.envelopeIndex = placement.envelopeIndex;
+    record.alignment = placement.alignment;
+    record.kind = static_cast<uint16_t>(placement.kind);
+    record.startRVA = placement.startRVA;
+    record.size = placement.size;
+    placementRecords.push_back(record);
+  }
+
+  header.inputTableOffset = sizeof(FileHeaderV3);
   header.inputCount = inputRecords.size();
   header.sectionTableOffset =
       header.inputTableOffset + inputRecords.size() * sizeof(InputRecord);
@@ -384,8 +704,24 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
   header.symbolTableOffset =
       header.chunkTableOffset + chunkRecords.size() * sizeof(ChunkRecord);
   header.symbolCount = symbolRecords.size();
-  header.stringTableOffset =
+  header.envelopeTableOffset =
       header.symbolTableOffset + symbolRecords.size() * sizeof(SymbolRecord);
+  header.envelopeCount = envelopeRecords.size();
+  header.slotTableOffset =
+      header.envelopeTableOffset + envelopeRecords.size() * sizeof(EnvelopeRecord);
+  header.slotCount = slotRecords.size();
+  header.packedSectionTableOffset =
+      header.slotTableOffset + slotRecords.size() * sizeof(SlotRecord);
+  header.packedSectionCount = packedSectionRecords.size();
+  header.packedKeyTableOffset =
+      header.packedSectionTableOffset +
+      packedSectionRecords.size() * sizeof(PackedSectionRecord);
+  header.packedKeyCount = packedKeyRecords.size();
+  header.placementTableOffset =
+      header.packedKeyTableOffset + packedKeyRecords.size() * sizeof(PackedKeyRecord);
+  header.placementCount = placementRecords.size();
+  header.stringTableOffset =
+      header.placementTableOffset + placementRecords.size() * sizeof(PlacementRecord);
   header.stringTableSize = strings.data().size();
 
   std::vector<char> buffer;
@@ -398,6 +734,16 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
   for (const ChunkRecord &record : chunkRecords)
     appendObject(buffer, record);
   for (const SymbolRecord &record : symbolRecords)
+    appendObject(buffer, record);
+  for (const EnvelopeRecord &record : envelopeRecords)
+    appendObject(buffer, record);
+  for (const SlotRecord &record : slotRecords)
+    appendObject(buffer, record);
+  for (const PackedSectionRecord &record : packedSectionRecords)
+    appendObject(buffer, record);
+  for (const PackedKeyRecord &record : packedKeyRecords)
+    appendObject(buffer, record);
+  for (const PlacementRecord &record : placementRecords)
     appendObject(buffer, record);
   buffer.insert(buffer.end(), strings.data().begin(), strings.data().end());
 
