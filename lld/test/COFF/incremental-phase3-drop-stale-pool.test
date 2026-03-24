@@ -1,0 +1,54 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.pdb %t.out pool.txt && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc caller.s -o caller.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc callee1.s -o callee.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe caller.obj callee.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc callee2.s -o callee.obj && \
+# RUN:   echo SECOND > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose caller.obj callee.obj >> %t.out 2>&1 && \
+# RUN:   %python -c "import pathlib,struct; path=pathlib.Path(r'%t.llilk'); data=bytearray(path.read_bytes()); hdr=struct.unpack_from('<8sIHHHH' + 'Q'*34, data, 0); off,count=hdr[34],hdr[35]; fmt='<QQQQQQB7x'; assert count == 1; rec=list(struct.unpack_from(fmt, data, off)); rec[5]=rec[2] + 16; struct.pack_into(fmt, data, off, *rec); path.write_bytes(data)" && \
+# RUN:   echo THIRD >> %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose caller.obj callee.obj >> %t.out 2>&1 && \
+# RUN:   %python -c "import pathlib,struct; data=pathlib.Path(r'%t.llilk').read_bytes(); hdr=struct.unpack_from('<8sIHHHH' + 'Q'*34, data, 0); off,count=hdr[34],hdr[35]; fmt='<QQQQQQB7x'; assert count == 1; rec=struct.unpack_from(fmt, data, off); pathlib.Path('pool.txt').write_text(f'{rec[5]}\\n')" && \
+# RUN:   FileCheck %s < %t.out && \
+# RUN:   FileCheck %s --check-prefix=POOL < pool.txt
+
+# CHECK: SECOND
+# CHECK: incremental: installed legacy redirect .text
+# CHECK: THIRD
+# CHECK: incremental: installed legacy redirect .text
+# CHECK-NOT: incremental: allocated long thunk pool
+
+# POOL: 0
+
+#--- caller.s
+.section .text,"xr",one_only,caller
+.globl caller
+caller:
+  callq callee
+  retq
+
+.section .text,"xr",one_only,main
+.globl main
+main:
+  callq caller
+  xorl %eax, %eax
+  retq
+
+#--- callee1.s
+.section .text,"xr",one_only,callee
+.globl callee
+callee:
+  movl $1, %eax
+  retq
+
+#--- callee2.s
+.section .text,"xr",one_only,callee
+.globl callee
+callee:
+  movl $2, %eax
+  .rept 32
+  nop
+  .endr
+  retq

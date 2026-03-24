@@ -1,0 +1,31 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.pdb %t.out && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main.s -o main.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj && \
+# RUN:   %python -c "import pathlib,struct; path=pathlib.Path(r'%t.llilk'); data=bytearray(path.read_bytes()); hdr=struct.unpack_from('<8sIHHHH' + 'Q'*36, data, 0); off,count=hdr[26],hdr[27]; fmt='<QIIHBBQQQ'; assert count >= 1; rec=list(struct.unpack_from(fmt, data, off)); rec[7]=0xffffffffffffffff; struct.pack_into(fmt, data, off, *rec); path.write_bytes(data)" && \
+# RUN:   echo INVALID > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
+# RUN:   echo REUSE >> %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: INVALID
+# CHECK: incremental: fallback: InvalidState
+# CHECK: incremental: detail: slot table contains invalid preserved range
+# CHECK: REUSE
+# CHECK: incremental: using state
+# CHECK: incremental: exact-layout reuse active
+
+#--- main.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  xorl %eax, %eax
+  retq
+
+.section .text,"xr",one_only,helper
+.globl helper
+helper:
+  movl $7, %eax
+  retq

@@ -170,7 +170,7 @@ struct IncrementalTextThunkPoolState {
 };
 
 struct IncrementalStateFile {
-  uint32_t version = 4;
+  uint32_t version = 5;
   IncrementalLayoutMode layoutMode = IncrementalLayoutMode::Slotted;
   llvm::COFF::MachineTypes machine = IMAGE_FILE_MACHINE_UNKNOWN;
   uint64_t outputHash = 0;
@@ -191,7 +191,6 @@ struct IncrementalStateFile {
   std::vector<IncrementalSlotRecordState> slotRecords;
   std::vector<IncrementalPackedSectionState> packedSections;
   std::vector<IncrementalPlacementState> placements;
-  std::vector<IncrementalEdgeState> edges;
   std::vector<IncrementalTextRedirectState> textRedirects;
   IncrementalTextThunkPoolState textThunkPool;
 };

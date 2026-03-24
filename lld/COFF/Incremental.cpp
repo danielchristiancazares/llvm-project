@@ -6,6 +6,7 @@
 #include "Writer.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
@@ -196,21 +197,41 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
         state.sectionEnvelopes[envelopeIndex];
 
     if (envelope.slotReuseEnabled) {
+      auto disableStateWrite = [&](const Twine &detail) {
+        session.canWriteState = false;
+        if (ctx.config.verbose)
+          Log(ctx) << "incremental: not writing state: " << detail;
+      };
+      auto isPersistedSlotChunk = [&](Chunk *chunk) {
+        return isIncrementalPersistedSlotChunk(envelope.slotClass, *chunk);
+      };
       for (size_t chunkIndex = 0; chunkIndex < section->chunks.size();
            ++chunkIndex) {
         Chunk *chunk = section->chunks[chunkIndex];
-        if (chunk->getSize() == 0)
+        if (!isPersistedSlotChunk(chunk))
           continue;
         std::string key = getIncrementalChunkKey(session, *chunk);
         bool isPadding = isa<IncrementalPaddingChunk>(chunk);
 
+        uint64_t slotEnd = envelope.activeEndRVA;
+        for (size_t nextIndex = chunkIndex + 1; nextIndex < section->chunks.size();
+             ++nextIndex) {
+          Chunk *nextChunk = section->chunks[nextIndex];
+          if (!isPersistedSlotChunk(nextChunk))
+            continue;
+          slotEnd = nextChunk->getRVA();
+          break;
+        }
+        if (slotEnd < chunk->getRVA() ||
+            slotEnd - chunk->getRVA() < chunk->getSize()) {
+          disableStateWrite("slot table builder found an invalid persisted range");
+          return;
+        }
+
         IncrementalSlotRecordState slot;
         slot.envelopeIndex = envelopeIndex;
         slot.startRVA = chunk->getRVA();
-        slot.capacity =
-            chunkIndex + 1 < section->chunks.size()
-                ? section->chunks[chunkIndex + 1]->getRVA() - chunk->getRVA()
-                : envelope.activeEndRVA - chunk->getRVA();
+        slot.capacity = slotEnd - chunk->getRVA();
         slot.committedSize = chunk->getSize();
         slot.minAlignment = chunk->getAlignment();
         slot.fillByte = isPadding ? cast<IncrementalPaddingChunk>(chunk)->getFillByte()
@@ -437,7 +458,6 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
   }
 
   buildIncrementalLayoutTables(ctx, session, state);
-  state.edges = buildIncrementalEdgeStates(ctx, session);
   state.textRedirects = session.currentTextRedirects;
   state.textThunkPool = session.currentTextThunkPool;
   state.symbols = buildIncrementalSymbolStates(ctx, session);
@@ -508,6 +528,14 @@ uint8_t getIncrementalFillByte(IncrementalSlotClass slotClass) {
   llvm_unreachable("unknown incremental slot class");
 }
 
+bool isIncrementalPersistedSlotChunk(IncrementalSlotClass slotClass,
+                                     const Chunk &chunk) {
+  if (chunk.getSize() == 0)
+    return false;
+  return slotClass != IncrementalSlotClass::Text ||
+         !isa<IncrementalLongThunkChunkX64>(&chunk);
+}
+
 std::optional<size_t> findBestFitIncrementalFreeSlot(
     ArrayRef<IncrementalSlotRecordState> slots, uint64_t size,
     uint32_t alignment) {
@@ -532,6 +560,98 @@ std::optional<uint64_t> allocateIncrementalTailReserve(uint64_t tailCursor,
   if (startRVA > maxSectionEndRVA || maxSectionEndRVA - startRVA < size)
     return std::nullopt;
   return startRVA;
+}
+
+std::optional<uint64_t>
+chooseIncrementalTextThunkRVA(uint64_t oldPoolThunkRVA, uint64_t tailCursor,
+                              uint64_t poolCursor, uint64_t poolEndRVA,
+                              ArrayRef<uint64_t> claimedThunkRVAs,
+                              ArrayRef<uint64_t> freedThunkRVAs) {
+  constexpr uint64_t thunkSize = 16;
+  auto isClaimed = [&](uint64_t rva) {
+    return llvm::is_contained(claimedThunkRVAs, rva);
+  };
+
+  auto canReuse = [&](uint64_t rva) {
+    return rva != 0 && rva % thunkSize == 0 && rva >= tailCursor &&
+           rva >= poolCursor && rva <= poolEndRVA &&
+           poolEndRVA - rva >= thunkSize && !isClaimed(rva);
+  };
+
+  if (canReuse(oldPoolThunkRVA))
+    return oldPoolThunkRVA;
+
+  std::optional<uint64_t> bestFreedThunkRVA;
+  for (uint64_t freedThunkRVA : freedThunkRVAs) {
+    if (!canReuse(freedThunkRVA))
+      continue;
+    if (!bestFreedThunkRVA || freedThunkRVA > *bestFreedThunkRVA)
+      bestFreedThunkRVA = freedThunkRVA;
+  }
+  if (bestFreedThunkRVA)
+    return bestFreedThunkRVA;
+
+  uint64_t nextCursor = poolCursor;
+  while (nextCursor > tailCursor && nextCursor - tailCursor >= thunkSize) {
+    uint64_t candidate = (nextCursor - thunkSize) & ~(thunkSize - 1);
+    if (candidate < tailCursor)
+      break;
+    if (candidate <= poolEndRVA && poolEndRVA - candidate >= thunkSize &&
+        !isClaimed(candidate))
+      return candidate;
+    nextCursor = candidate;
+  }
+  return std::nullopt;
+}
+
+void planIncrementalTextThunkAssignments(
+    MutableArrayRef<IncrementalTextThunkPlanState> plans, uint64_t tailCursor,
+    uint64_t &poolCursor, uint64_t &poolStart, uint64_t poolEndRVA,
+    bool allowPoolThunks) {
+  SmallVector<uint64_t, 8> claimedThunkRVAs;
+  SmallVector<uint64_t, 8> freedThunkRVAs;
+  auto releasePoolThunkRVA = [&](IncrementalTextThunkPlanState &plan) {
+    if (plan.poolThunkRVA != 0 &&
+        !llvm::is_contained(claimedThunkRVAs, plan.poolThunkRVA))
+      freedThunkRVAs.push_back(plan.poolThunkRVA);
+    plan.poolThunkRVA = 0;
+    plan.usedPool = false;
+  };
+
+  for (IncrementalTextThunkPlanState &plan : plans) {
+    if (!plan.active || plan.bodyRVA == 0 || plan.bodyRVA == plan.redirectRVA)
+      continue;
+
+    bool needPool = !isIncrementalAmd64Rel32InRange(
+        llvm::COFF::IMAGE_REL_AMD64_REL32, plan.redirectRVA + 1, plan.bodyRVA);
+    if (!needPool) {
+      releasePoolThunkRVA(plan);
+      continue;
+    }
+
+    if (!allowPoolThunks) {
+      plan.active = false;
+      releasePoolThunkRVA(plan);
+      continue;
+    }
+
+    std::optional<uint64_t> poolThunkRVA =
+        chooseIncrementalTextThunkRVA(plan.poolThunkRVA, tailCursor, poolCursor,
+                                      poolEndRVA, claimedThunkRVAs,
+                                      freedThunkRVAs);
+    if (!poolThunkRVA) {
+      plan.active = false;
+      releasePoolThunkRVA(plan);
+      continue;
+    }
+
+    if (poolStart == 0 || *poolThunkRVA < poolStart)
+      poolStart = *poolThunkRVA;
+    poolCursor = std::min(poolCursor, *poolThunkRVA);
+    claimedThunkRVAs.push_back(*poolThunkRVA);
+    plan.poolThunkRVA = *poolThunkRVA;
+    plan.usedPool = true;
+  }
 }
 
 bool isIncrementalAmd64Rel32InRange(uint16_t type, uint64_t sourceRVA,
@@ -898,8 +1018,6 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   session->oldImage = std::move(*oldImage);
   session->stateLoaded = true;
   session->softConfigChanged = session->state.softConfigHash != softHash;
-  for (size_t i = 0; i < session->state.textRedirects.size(); ++i)
-    session->oldRedirectIndices[session->state.textRedirects[i].targetKey] = i;
   for (ArchiveFile *file : ctx.archiveFileInstances)
     session->replayableArchives.insert(file->getName());
 
@@ -1015,6 +1133,8 @@ void finalizeIncrementalLink(COFFLinkerContext &ctx) {
   prepareCurrentIncrementalInputs(ctx, *ctx.incrementalSession);
   IncrementalStateFile state =
       buildIncrementalState(ctx, *ctx.incrementalSession);
+  if (!ctx.incrementalSession->canWriteState)
+    return;
   if (Error err = writeIncrementalState(ctx.config.incrementalStatePath, state))
     Warn(ctx) << "failed to write incremental state: " << toString(std::move(err));
 }

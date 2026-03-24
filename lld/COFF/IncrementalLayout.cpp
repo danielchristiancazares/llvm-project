@@ -43,6 +43,7 @@ struct RedirectPlanEntry {
   uint64_t poolThunkRVA = 0;
   uint32_t minAlignment = 1;
   bool active = false;
+  bool hadActiveRedirect = false;
   bool usedPool = false;
   Defined *bodyTarget = nullptr;
 };
@@ -124,10 +125,80 @@ static uint64_t getMinFragmentSize(IncrementalSlotClass slotClass) {
   llvm_unreachable("unknown incremental slot class");
 }
 
-static uint64_t alignDownTo(uint64_t value, uint64_t align) {
-  if (align == 0)
-    return value;
-  return value & ~(align - 1);
+static bool validateSlotReuseState(COFFLinkerContext &ctx,
+                                   const IncrementalSectionEnvelopeState &envelope,
+                                   uint32_t envelopeIndex,
+                                   ArrayRef<IncrementalSlotRecordState> slotRecords) {
+  if (envelope.sectionRVA > envelope.activeEndRVA ||
+      envelope.activeEndRVA > envelope.maxSectionEndRVA ||
+      envelope.maxSectionEndRVA - envelope.sectionRVA > UINT32_MAX) {
+    setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                           "slot envelope contains an invalid preserved range");
+    return false;
+  }
+
+  SmallVector<const IncrementalSlotRecordState *, 16> slots;
+  for (const IncrementalSlotRecordState &slot : slotRecords) {
+    if (slot.envelopeIndex != envelopeIndex)
+      continue;
+
+    uint64_t slotEnd = 0;
+    if (slot.capacity == 0 || slot.capacity > UINT32_MAX ||
+        slot.minAlignment == 0 || slot.startRVA < envelope.sectionRVA ||
+        slot.startRVA >= envelope.activeEndRVA ||
+        slot.startRVA > UINT64_MAX - slot.capacity) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                             "slot table contains invalid preserved range");
+      return false;
+    }
+    slotEnd = slot.startRVA + slot.capacity;
+    if (slotEnd > envelope.activeEndRVA || slot.committedSize > slot.capacity) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                             "slot table contains invalid preserved range");
+      return false;
+    }
+
+    if (slot.state != IncrementalSlotState::Occupied &&
+        slot.state != IncrementalSlotState::Free) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                             "slot table contains an invalid slot state");
+      return false;
+    }
+
+    if (slot.state == IncrementalSlotState::Occupied) {
+      if (slot.occupantKey.empty()) {
+        setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                               "occupied slot is missing its preserved occupant");
+        return false;
+      }
+      if (envelope.slotClass == IncrementalSlotClass::Text &&
+          StringRef(slot.occupantKey).starts_with("longthunk:")) {
+        setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                               "slot table contains stale long thunk state");
+        return false;
+      }
+    }
+
+    slots.push_back(&slot);
+  }
+
+  llvm::sort(slots, [](const IncrementalSlotRecordState *lhs,
+                       const IncrementalSlotRecordState *rhs) {
+    return lhs->startRVA < rhs->startRVA;
+  });
+
+  uint64_t previousEnd = envelope.sectionRVA;
+  for (const IncrementalSlotRecordState *slot : slots) {
+    uint64_t slotEnd = slot->startRVA + slot->capacity;
+    if (slot->startRVA < previousEnd) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                             "slot table contains overlapping preserved ranges");
+      return false;
+    }
+    previousEnd = slotEnd;
+  }
+
+  return true;
 }
 
 static std::string formatPlacementLog(StringRef action, StringRef sectionName,
@@ -382,6 +453,7 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
     slotByStart[slots[i].slot.startRVA] = i;
 
   StringMap<RedirectPlanEntry> redirectPlans;
+  SmallVector<RedirectPlanEntry *, 8> orderedRedirectPlans;
   if (envelope->slotClass == IncrementalSlotClass::Text) {
     for (const auto &[key, chunk] : currentEntries) {
       auto *sectionChunk = dyn_cast<SectionChunk>(chunk);
@@ -446,10 +518,17 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       plan.bodyTarget = canonicalSymbol;
       if (oldRedirect && oldRedirect->active) {
         plan.active = true;
+        plan.hadActiveRedirect = true;
         plan.poolThunkRVA = oldRedirect->poolThunkRVA;
         plan.usedPool = oldRedirect->poolThunkRVA != 0;
       }
       redirectPlans[key] = std::move(plan);
+    }
+
+    for (const auto &[key, chunk] : currentEntries) {
+      (void)chunk;
+      if (auto redirectIt = redirectPlans.find(key); redirectIt != redirectPlans.end())
+        orderedRedirectPlans.push_back(&redirectIt->second);
     }
   }
 
@@ -564,57 +643,49 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
     uint64_t poolEnd = session.state.textThunkPool.poolEndRVA != 0
                            ? session.state.textThunkPool.poolEndRVA
                            : envelope->maxSectionEndRVA;
-    SmallVector<RedirectPlanEntry *, 8> activeRedirects;
-    for (auto &entry : redirectPlans) {
-      RedirectPlanEntry &plan = entry.second;
-      if (!plan.active || plan.bodyRVA == 0 || plan.bodyRVA == plan.redirectRVA)
-        continue;
-      if (!plan.usedPool && isIncrementalAmd64Rel32InRange(
-                                llvm::COFF::IMAGE_REL_AMD64_REL32,
-                                plan.redirectRVA + 1, plan.bodyRVA)) {
-        plan.usedPool = false;
-      } else {
-        if (ctx.config.guardCF) {
-          plan.active = false;
-        } else {
-          uint64_t poolThunkRVA = plan.poolThunkRVA;
-          if (poolThunkRVA == 0) {
-            if (poolCursor <= tailCursor || poolCursor - tailCursor < 16) {
-              plan.active = false;
-            } else {
-              poolThunkRVA = alignDownTo(poolCursor - 16, 16);
-              if (poolThunkRVA < tailCursor) {
-                plan.active = false;
-              } else {
-                poolCursor = poolThunkRVA;
-                if (poolStart == 0 || poolThunkRVA < poolStart)
-                  poolStart = poolThunkRVA;
-              }
-            }
-          }
-          if (plan.active) {
-            if (poolStart == 0 || poolThunkRVA < poolStart)
-              poolStart = poolThunkRVA;
-            poolCursor = std::min(poolCursor, poolThunkRVA);
-            auto *poolChunk = make<IncrementalLongThunkChunkX64>(
-                saver().save("phase3-pool:" + plan.targetKey), plan.bodyTarget);
-            poolChunk->setRVA(poolThunkRVA);
-            auto *poolSymbol = make<DefinedSynthetic>(
-                makeSyntheticName("__phase3_pool", poolThunkRVA), poolChunk);
-            plannedChunks.push_back({poolThunkRVA, poolChunk});
-            plan.poolThunkRVA = poolThunkRVA;
-            plan.usedPool = true;
-            session.poolThunkSymbols[plan.targetKey] = poolSymbol;
-            plan.bodyTarget = poolSymbol;
-            verboseLogs.push_back(formatPlacementLog("allocated long thunk pool",
-                                                     currentSection.name,
-                                                     poolThunkRVA, poolChunk->getSize()));
-          }
+    SmallVector<IncrementalTextThunkPlanState, 8> thunkPlans;
+    thunkPlans.reserve(orderedRedirectPlans.size());
+    for (RedirectPlanEntry *plan : orderedRedirectPlans)
+      thunkPlans.push_back({plan->redirectRVA, plan->bodyRVA, plan->poolThunkRVA,
+                            plan->active, plan->hadActiveRedirect, plan->usedPool});
+    planIncrementalTextThunkAssignments(thunkPlans, tailCursor, poolCursor,
+                                        poolStart, poolEnd,
+                                        !ctx.config.guardCF);
+
+    for (size_t i = 0; i < orderedRedirectPlans.size(); ++i) {
+      RedirectPlanEntry &plan = *orderedRedirectPlans[i];
+      const IncrementalTextThunkPlanState &thunkPlan = thunkPlans[i];
+      uint64_t oldPoolThunkRVA = plan.poolThunkRVA;
+      plan.active = thunkPlan.active;
+      plan.poolThunkRVA = thunkPlan.poolThunkRVA;
+      plan.usedPool = thunkPlan.usedPool;
+
+      if (!plan.active) {
+        if (plan.hadActiveRedirect) {
+          session.movedTextTargets.insert(plan.targetKey);
+          exactLayoutOnly = false;
         }
+        continue;
       }
 
-      if (!plan.active)
-        continue;
+      if (plan.poolThunkRVA != oldPoolThunkRVA)
+        exactLayoutOnly = false;
+
+      if (plan.usedPool) {
+        auto *poolChunk = make<IncrementalLongThunkChunkX64>(
+            saver().save("phase3-pool:" + plan.targetKey), plan.bodyTarget,
+            ctx.config.imageBase);
+        poolChunk->setRVA(plan.poolThunkRVA);
+        auto *poolSymbol = make<DefinedSynthetic>(
+            makeSyntheticName("__phase3_pool", plan.poolThunkRVA), poolChunk);
+        plannedChunks.push_back({plan.poolThunkRVA, poolChunk});
+        session.poolThunkSymbols[plan.targetKey] = poolSymbol;
+        plan.bodyTarget = poolSymbol;
+        verboseLogs.push_back(formatPlacementLog("allocated long thunk pool",
+                                                 currentSection.name,
+                                                 plan.poolThunkRVA,
+                                                 poolChunk->getSize()));
+      }
 
       auto *redirectChunk = make<IncrementalEntryRedirectChunkX64>(
           saver().save("phase3-redirect:" + plan.targetKey), plan.bodyTarget,
@@ -634,7 +705,6 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       redirectState.active = true;
       session.currentTextRedirects.push_back(std::move(redirectState));
       session.activeRedirectTargets.insert(plan.targetKey);
-      activeRedirects.push_back(&plan);
       verboseLogs.push_back(formatPlacementLog("installed legacy redirect",
                                                currentSection.name,
                                                plan.redirectRVA,
@@ -649,24 +719,41 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
     }
   }
 
-  auto appendPadding = [&](uint64_t startRVA, uint64_t size, uint8_t fillByte) {
+  auto appendPadding = [&](uint64_t startRVA, uint64_t size,
+                           uint8_t fillByte) -> bool {
+    uint64_t endRVA = 0;
     if (size == 0)
-      return;
+      return true;
+    if (size > UINT32_MAX || startRVA < envelope->sectionRVA ||
+        startRVA > UINT64_MAX - size) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                             "padding range exceeds preserved section envelope");
+      return false;
+    }
+    endRVA = startRVA + size;
+    if (endRVA > envelope->maxSectionEndRVA) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                             "padding range exceeds preserved section envelope");
+      return false;
+    }
     auto *padding = make<IncrementalPaddingChunk>(
         currentSection.name, currentSection.header.Characteristics,
         static_cast<uint32_t>(size), fillByte);
     plannedChunks.push_back({startRVA, padding});
+    return true;
   };
 
   for (const PlannedSlot &slot : slots) {
     if (!slot.candidateFree || slot.used)
       continue;
-    appendPadding(slot.slot.startRVA, slot.slot.capacity, slot.slot.fillByte);
+    if (!appendPadding(slot.slot.startRVA, slot.slot.capacity, slot.slot.fillByte))
+      return false;
     if (slot.slot.state != IncrementalSlotState::Free)
       exactLayoutOnly = false;
   }
   for (const FreeRange &range : splitFreeRanges)
-    appendPadding(range.startRVA, range.size, range.fillByte);
+    if (!appendPadding(range.startRVA, range.size, range.fillByte))
+      return false;
 
   for (const auto &[key, chunk] : zeroSizedEntries) {
     uint64_t startRVA = envelope->sectionRVA;
@@ -681,6 +768,31 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       return lhs.startRVA < rhs.startRVA;
     return lhs.chunk->getSize() < rhs.chunk->getSize();
   });
+
+  uint64_t previousEnd = envelope->sectionRVA;
+  for (const PlannedChunk &planned : plannedChunks) {
+    uint64_t chunkEnd = planned.startRVA;
+    if (planned.chunk->getSize() != 0) {
+      if (planned.startRVA < previousEnd || planned.startRVA < envelope->sectionRVA ||
+          planned.startRVA > UINT64_MAX - uint64_t(planned.chunk->getSize())) {
+        setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                               "planned chunks exceed preserved section envelope");
+        return false;
+      }
+      chunkEnd = planned.startRVA + uint64_t(planned.chunk->getSize());
+      if (chunkEnd > envelope->maxSectionEndRVA) {
+        setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                               "planned chunks exceed preserved section envelope");
+        return false;
+      }
+      previousEnd = chunkEnd;
+    } else if (planned.startRVA < envelope->sectionRVA ||
+               planned.startRVA > envelope->maxSectionEndRVA) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                             "zero-sized placement lies outside preserved section envelope");
+      return false;
+    }
+  }
 
   currentSection.chunks.clear();
   currentSection.header.VirtualAddress = envelope->sectionRVA;
@@ -785,6 +897,27 @@ bool applyIncrementalLayout(COFFLinkerContext &ctx,
     setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                            "output section count changed");
     return false;
+  }
+
+  for (OutputSection *section : activeSections) {
+    IncrementalSlotClass slotClass = classifyIncrementalSection(
+        section->name, section->header.Characteristics);
+    if (!isIncrementalSlotReuseClass(slotClass))
+      continue;
+
+    uint32_t envelopeIndex = UINT32_MAX;
+    const IncrementalSectionEnvelopeState *envelope = findSectionEnvelope(
+        session.state, section->name, section->header.Characteristics,
+        envelopeIndex);
+    if (!envelope || !envelope->slotReuseEnabled ||
+        !isIncrementalSlotReuseClass(envelope->slotClass)) {
+      setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                             "missing slot envelope in incremental state");
+      return false;
+    }
+    if (!validateSlotReuseState(ctx, *envelope, envelopeIndex,
+                                session.state.slotRecords))
+      return false;
   }
 
   bool exactLayoutOnly = true;

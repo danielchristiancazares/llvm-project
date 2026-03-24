@@ -9,6 +9,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
 #include <climits>
+#include <cstring>
 
 using namespace lld::coff;
 using namespace llvm;
@@ -135,15 +136,6 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   placement.alignment = 16;
   state.placements.push_back(placement);
 
-  IncrementalEdgeState edge;
-  edge.sourceKey = "obj:0:comdat:caller";
-  edge.targetKey = "obj:0:comdat:main";
-  edge.kind = IncrementalRefKind::DirectCall;
-  edge.sourceOffset = 4;
-  edge.targetOffset = 0;
-  edge.redirectEligible = true;
-  state.edges.push_back(edge);
-
   IncrementalTextRedirectState redirect;
   redirect.targetKey = "obj:0:comdat:main";
   redirect.canonicalSymbol = "main";
@@ -164,7 +156,7 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   Expected<IncrementalStateFile> loaded = loadIncrementalState(path);
   ASSERT_TRUE(static_cast<bool>(loaded)) << toString(loaded.takeError());
 
-  EXPECT_EQ(loaded->version, 4u);
+  EXPECT_EQ(loaded->version, 5u);
   EXPECT_EQ(loaded->layoutMode, IncrementalLayoutMode::Slotted);
   EXPECT_EQ(loaded->machine, AMD64);
   EXPECT_EQ(loaded->importTopologyHash, state.importTopologyHash);
@@ -192,11 +184,6 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   EXPECT_EQ(loaded->placements[0].key, "obj:0:comdat:main");
   EXPECT_EQ(loaded->placements[0].kind,
             IncrementalPlacementKind::ExistingSlot);
-  ASSERT_EQ(loaded->edges.size(), 1u);
-  EXPECT_EQ(loaded->edges[0].sourceKey, "obj:0:comdat:caller");
-  EXPECT_EQ(loaded->edges[0].targetKey, "obj:0:comdat:main");
-  EXPECT_EQ(loaded->edges[0].kind, IncrementalRefKind::DirectCall);
-  EXPECT_TRUE(loaded->edges[0].redirectEligible);
   ASSERT_EQ(loaded->textRedirects.size(), 1u);
   EXPECT_EQ(loaded->textRedirects[0].canonicalSymbol, "main");
   EXPECT_EQ(loaded->textRedirects[0].redirectCapacity, 16u);
@@ -314,7 +301,7 @@ TEST(IncrementalHelpersTest, LongThunkChunkAddsDir64BaseReloc) {
   bodyChunk.setRVA(0x3000);
   DefinedSynthetic body("body", &bodyChunk);
 
-  IncrementalLongThunkChunkX64 thunk("pool", &body);
+  IncrementalLongThunkChunkX64 thunk("pool", &body, 0x140000000ULL);
   thunk.setRVA(0x1800);
 
   std::vector<Baserel> relocs;
@@ -322,6 +309,106 @@ TEST(IncrementalHelpersTest, LongThunkChunkAddsDir64BaseReloc) {
   ASSERT_EQ(relocs.size(), 1u);
   EXPECT_EQ(relocs[0].rva, 0x1802u);
   EXPECT_EQ(relocs[0].type, llvm::COFF::IMAGE_REL_BASED_DIR64);
+}
+
+TEST(IncrementalHelpersTest, LongThunkChunkWritesImageBaseAdjustedVA) {
+  EmptyChunk bodyChunk;
+  bodyChunk.setRVA(0x3000);
+  DefinedSynthetic body("body", &bodyChunk);
+
+  IncrementalLongThunkChunkX64 thunk("pool", &body, 0x140000000ULL);
+  uint8_t buf[16] = {};
+  thunk.writeTo(buf);
+
+  uint64_t immediate = 0;
+  memcpy(&immediate, buf + 2, sizeof(immediate));
+  EXPECT_EQ(buf[0], 0x48);
+  EXPECT_EQ(buf[1], 0xB8);
+  EXPECT_EQ(immediate, 0x140003000ULL);
+  EXPECT_EQ(buf[10], 0xFF);
+  EXPECT_EQ(buf[11], 0xE0);
+}
+
+TEST(IncrementalHelpersTest, PersistedSlotChunkFilterDropsTextLongThunks) {
+  EmptyChunk bodyChunk;
+  DefinedSynthetic body("body", &bodyChunk);
+  IncrementalLongThunkChunkX64 thunk("pool", &body, 0x140000000ULL);
+  IncrementalPaddingChunk padding(".text", 0x60000020, 16, 0xCC);
+
+  EXPECT_FALSE(isIncrementalPersistedSlotChunk(IncrementalSlotClass::Text, thunk));
+  EXPECT_TRUE(isIncrementalPersistedSlotChunk(IncrementalSlotClass::Text, padding));
+  EXPECT_FALSE(
+      isIncrementalPersistedSlotChunk(IncrementalSlotClass::Text, bodyChunk));
+}
+
+TEST(IncrementalHelpersTest, ChooseTextThunkRVAReusesValidExistingSlot) {
+  std::optional<uint64_t> thunkRVA =
+      chooseIncrementalTextThunkRVA(0x2ff0, 0x2400, 0x2fe0, 0x3000, {});
+  ASSERT_TRUE(thunkRVA.has_value());
+  EXPECT_EQ(*thunkRVA, 0x2ff0u);
+}
+
+TEST(IncrementalHelpersTest,
+     ChooseTextThunkRVAAllocatesFreshSlotWhenExistingOneIsInvalid) {
+  std::optional<uint64_t> thunkRVA =
+      chooseIncrementalTextThunkRVA(0x2fe0, 0x2ff8, 0x3010, 0x3020, {});
+  ASSERT_TRUE(thunkRVA.has_value());
+  EXPECT_EQ(*thunkRVA, 0x3000u);
+}
+
+TEST(IncrementalHelpersTest,
+     ChooseTextThunkRVAReusesFreedSlotBeforeScanningBelowPoolCursor) {
+  uint64_t freedThunkRVAs[] = {0x2fd0, 0x2ff0};
+  std::optional<uint64_t> thunkRVA = chooseIncrementalTextThunkRVA(
+      0, 0x2fc0, 0x2fd0, 0x3000, {}, freedThunkRVAs);
+  ASSERT_TRUE(thunkRVA.has_value());
+  EXPECT_EQ(*thunkRVA, 0x2ff0u);
+}
+
+TEST(IncrementalHelpersTest,
+     ChooseTextThunkRVAIgnoresClaimedOrInvalidFreedSlots) {
+  uint64_t claimedThunkRVAs[] = {0x2ff0};
+  uint64_t freedThunkRVAs[] = {0x2fb0, 0x2ff0, 0x2fd0};
+  std::optional<uint64_t> thunkRVA =
+      chooseIncrementalTextThunkRVA(0, 0x2fc0, 0x2fd0, 0x3000,
+                                    claimedThunkRVAs, freedThunkRVAs);
+  ASSERT_TRUE(thunkRVA.has_value());
+  EXPECT_EQ(*thunkRVA, 0x2fd0u);
+}
+
+TEST(IncrementalHelpersTest,
+     PlanTextThunkAssignmentsReusesSlotFreedEarlierInPass) {
+  std::vector<IncrementalTextThunkPlanState> plans(2);
+  plans[0].redirectRVA = 0x1200;
+  plans[0].bodyRVA = 0x1210;
+  plans[0].poolThunkRVA = 0x2ff0;
+  plans[0].active = true;
+  plans[0].hadActiveRedirect = true;
+  plans[0].usedPool = true;
+
+  plans[1].redirectRVA = 0x1300;
+  plans[1].bodyRVA = 0x90000000ULL;
+  plans[1].active = true;
+
+  uint64_t poolCursor = 0x2fd0;
+  uint64_t poolStart = 0;
+  planIncrementalTextThunkAssignments(plans, 0x2fc0, poolCursor, poolStart,
+                                      0x3000, true);
+
+  EXPECT_TRUE(plans[0].active);
+  EXPECT_FALSE(plans[0].usedPool);
+  EXPECT_EQ(plans[0].poolThunkRVA, 0u);
+
+  EXPECT_TRUE(plans[1].active);
+  EXPECT_TRUE(plans[1].usedPool);
+  EXPECT_EQ(plans[1].poolThunkRVA, 0x2ff0u);
+  EXPECT_EQ(poolCursor, 0x2fd0u);
+  EXPECT_EQ(poolStart, 0x2ff0u);
+}
+
+TEST(IncrementalHelpersTest, ChooseTextThunkRVAFailsWhenPoolIsExhausted) {
+  EXPECT_FALSE(chooseIncrementalTextThunkRVA(0x2ff0, 0x2ff8, 0x3000, 0x3000, {})
+                   .has_value());
 }
 
 TEST(IncrementalHelpersTest, RedirectStateRoundTripPreservesPoolState) {

@@ -261,7 +261,8 @@ private:
 
 class IncrementalLongThunkChunkX64 : public NonSectionCodeChunk {
 public:
-  IncrementalLongThunkChunkX64(StringRef debugName, Defined *target);
+  IncrementalLongThunkChunkX64(StringRef debugName, Defined *target,
+                               uint64_t imageBase);
   static bool classof(const Chunk *c) {
     return c->kind() == IncrementalLongThunkKind;
   }
@@ -277,6 +278,7 @@ public:
 private:
   std::string debugName;
   Defined *target;
+  uint64_t imageBase;
 };
 
 // MinGW specific; information about one individual location in the image
