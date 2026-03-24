@@ -10,9 +10,15 @@
 
 namespace lld::coff {
 
+enum class IncrementalLayoutMode : uint16_t {
+  Exact = 1,
+  Slotted = 2,
+};
+
 enum class IncrementalChunkKind : uint16_t {
   ObjSection = 1,
   Synthetic = 2,
+  Padding = 3,
 };
 
 enum class IncrementalSymbolKind : uint16_t {
@@ -23,6 +29,27 @@ enum class IncrementalSymbolKind : uint16_t {
   LocalImport = 5,
   Absolute = 6,
   Synthetic = 7,
+};
+
+enum class IncrementalSlotClass : uint16_t {
+  None = 0,
+  Text = 1,
+  RData = 2,
+  Data = 3,
+  PDataPacked = 4,
+  XDataPacked = 5,
+};
+
+enum class IncrementalSlotState : uint16_t {
+  Occupied = 1,
+  Free = 2,
+};
+
+enum class IncrementalPlacementKind : uint16_t {
+  ExistingSlot = 1,
+  ReusedFreeSlot = 2,
+  TailReserve = 3,
+  PackedPrefix = 4,
 };
 
 struct IncrementalInputState {
@@ -67,8 +94,47 @@ struct IncrementalSymbolState {
   uint64_t value = 0;
 };
 
+struct IncrementalSectionEnvelopeState {
+  std::string name;
+  uint32_t characteristics = 0;
+  uint64_t sectionRVA = 0;
+  uint64_t maxSectionEndRVA = 0;
+  uint64_t activeEndRVA = 0;
+  IncrementalSlotClass slotClass = IncrementalSlotClass::None;
+  bool packedActivePrefix = false;
+  bool slotReuseEnabled = false;
+};
+
+struct IncrementalSlotRecordState {
+  uint32_t envelopeIndex = UINT32_MAX;
+  uint64_t startRVA = 0;
+  uint64_t capacity = 0;
+  uint64_t committedSize = 0;
+  uint32_t minAlignment = 1;
+  uint8_t fillByte = 0;
+  IncrementalSlotState state = IncrementalSlotState::Free;
+  std::string occupantKey;
+};
+
+struct IncrementalPackedSectionState {
+  uint32_t envelopeIndex = UINT32_MAX;
+  uint64_t activePrefixSize = 0;
+  uint64_t reserveSize = 0;
+  std::vector<std::string> recordKeys;
+};
+
+struct IncrementalPlacementState {
+  std::string key;
+  uint32_t envelopeIndex = UINT32_MAX;
+  IncrementalPlacementKind kind = IncrementalPlacementKind::ExistingSlot;
+  uint64_t startRVA = 0;
+  uint64_t size = 0;
+  uint32_t alignment = 1;
+};
+
 struct IncrementalStateFile {
-  uint32_t version = 2;
+  uint32_t version = 3;
+  IncrementalLayoutMode layoutMode = IncrementalLayoutMode::Slotted;
   llvm::COFF::MachineTypes machine = IMAGE_FILE_MACHINE_UNKNOWN;
   uint64_t outputHash = 0;
   uint64_t outputSize = 0;
@@ -84,6 +150,10 @@ struct IncrementalStateFile {
   std::vector<IncrementalSectionState> sections;
   std::vector<IncrementalChunkState> chunks;
   std::vector<IncrementalSymbolState> symbols;
+  std::vector<IncrementalSectionEnvelopeState> sectionEnvelopes;
+  std::vector<IncrementalSlotRecordState> slotRecords;
+  std::vector<IncrementalPackedSectionState> packedSections;
+  std::vector<IncrementalPlacementState> placements;
 };
 
 llvm::Expected<IncrementalStateFile> loadIncrementalState(llvm::StringRef path);

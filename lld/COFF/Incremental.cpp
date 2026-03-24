@@ -143,6 +143,117 @@ static uint64_t computeIncrementalResourceInputHash(COFFLinkerContext &ctx) {
   return xxh3_64bits(buffer);
 }
 
+static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
+                                         IncrementalLinkSession &session,
+                                         IncrementalStateFile &state) {
+  SmallVector<OutputSection *, 16> activeSections;
+  for (OutputSection *section : ctx.outputSections)
+    if (section->getVirtualSize() != 0)
+      activeSections.push_back(section);
+
+  DenseMap<const OutputSection *, uint32_t> envelopeIndices;
+  for (size_t sectionIndex = 0; sectionIndex < activeSections.size();
+       ++sectionIndex) {
+    OutputSection *section = activeSections[sectionIndex];
+    IncrementalSlotClass slotClass = classifyIncrementalSection(
+        section->name, section->header.Characteristics);
+    if (slotClass == IncrementalSlotClass::None)
+      continue;
+
+    IncrementalSectionEnvelopeState envelope;
+    envelope.name = section->name.str();
+    envelope.characteristics = section->header.Characteristics;
+    envelope.sectionRVA = section->getRVA();
+    envelope.maxSectionEndRVA =
+        sectionIndex + 1 < activeSections.size()
+            ? activeSections[sectionIndex + 1]->getRVA()
+            : state.sizeOfImage;
+    envelope.activeEndRVA = section->getRVA() + section->getVirtualSize();
+    envelope.slotClass = slotClass;
+    envelope.packedActivePrefix = isIncrementalPackedClass(slotClass);
+    envelope.slotReuseEnabled = isIncrementalSlotReuseClass(slotClass);
+    envelopeIndices[section] = state.sectionEnvelopes.size();
+    state.sectionEnvelopes.push_back(std::move(envelope));
+  }
+
+  for (OutputSection *section : activeSections) {
+    auto envelopeIt = envelopeIndices.find(section);
+    if (envelopeIt == envelopeIndices.end())
+      continue;
+
+    uint32_t envelopeIndex = envelopeIt->second;
+    const IncrementalSectionEnvelopeState &envelope =
+        state.sectionEnvelopes[envelopeIndex];
+
+    if (envelope.slotReuseEnabled) {
+      for (size_t chunkIndex = 0; chunkIndex < section->chunks.size();
+           ++chunkIndex) {
+        Chunk *chunk = section->chunks[chunkIndex];
+        if (chunk->getSize() == 0)
+          continue;
+        std::string key = getIncrementalChunkKey(session, *chunk);
+        bool isPadding = isa<IncrementalPaddingChunk>(chunk);
+
+        IncrementalSlotRecordState slot;
+        slot.envelopeIndex = envelopeIndex;
+        slot.startRVA = chunk->getRVA();
+        slot.capacity =
+            chunkIndex + 1 < section->chunks.size()
+                ? section->chunks[chunkIndex + 1]->getRVA() - chunk->getRVA()
+                : envelope.activeEndRVA - chunk->getRVA();
+        slot.committedSize = chunk->getSize();
+        slot.minAlignment = chunk->getAlignment();
+        slot.fillByte = isPadding ? cast<IncrementalPaddingChunk>(chunk)->getFillByte()
+                                  : getIncrementalFillByte(envelope.slotClass);
+        slot.state = isPadding ? IncrementalSlotState::Free
+                               : IncrementalSlotState::Occupied;
+        if (!isPadding)
+          slot.occupantKey = key;
+        state.slotRecords.push_back(std::move(slot));
+
+        if (isPadding)
+          continue;
+
+        IncrementalPlacementState placement;
+        placement.key = key;
+        placement.envelopeIndex = envelopeIndex;
+        placement.kind = IncrementalPlacementKind::ExistingSlot;
+        placement.startRVA = chunk->getRVA();
+        placement.size = chunk->getSize();
+        placement.alignment = chunk->getAlignment();
+        state.placements.push_back(std::move(placement));
+      }
+      continue;
+    }
+
+    if (!envelope.packedActivePrefix)
+      continue;
+
+    IncrementalPackedSectionState packedSection;
+    packedSection.envelopeIndex = envelopeIndex;
+    packedSection.activePrefixSize =
+        envelope.activeEndRVA - envelope.sectionRVA;
+    packedSection.reserveSize =
+        envelope.maxSectionEndRVA - envelope.activeEndRVA;
+    for (Chunk *chunk : section->chunks) {
+      if (chunk->getSize() == 0)
+        continue;
+      std::string key = getIncrementalChunkKey(session, *chunk);
+      packedSection.recordKeys.push_back(key);
+
+      IncrementalPlacementState placement;
+      placement.key = key;
+      placement.envelopeIndex = envelopeIndex;
+      placement.kind = IncrementalPlacementKind::PackedPrefix;
+      placement.startRVA = chunk->getRVA();
+      placement.size = chunk->getSize();
+      placement.alignment = chunk->getAlignment();
+      state.placements.push_back(std::move(placement));
+    }
+    state.packedSections.push_back(std::move(packedSection));
+  }
+}
+
 static std::vector<IncrementalSymbolState>
 buildIncrementalSymbolStates(COFFLinkerContext &ctx,
                              IncrementalLinkSession &session) {
@@ -222,6 +333,8 @@ buildIncrementalSymbolStates(COFFLinkerContext &ctx,
 static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
                                                   IncrementalLinkSession &session) {
   IncrementalStateFile state;
+  state.version = 3;
+  state.layoutMode = IncrementalLayoutMode::Slotted;
   state.machine = ctx.config.machine;
   state.outputPath = ctx.config.outputFile;
   state.hardConfigHash = computeIncrementalHardConfigHash(ctx.config);
@@ -313,12 +426,128 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
     }
   }
 
+  buildIncrementalLayoutTables(ctx, session, state);
   state.symbols = buildIncrementalSymbolStates(ctx, session);
 
   return state;
 }
 
 } // namespace
+
+IncrementalSlotClass classifyIncrementalSection(StringRef name,
+                                                uint32_t characteristics) {
+  if (name == ".pdata")
+    return IncrementalSlotClass::PDataPacked;
+  if (name == ".xdata")
+    return IncrementalSlotClass::XDataPacked;
+  if (name == ".text")
+    return IncrementalSlotClass::Text;
+  if (name == ".rdata")
+    return IncrementalSlotClass::RData;
+  if (name == ".data")
+    return IncrementalSlotClass::Data;
+
+  if ((characteristics & llvm::COFF::IMAGE_SCN_CNT_CODE) &&
+      (characteristics & llvm::COFF::IMAGE_SCN_MEM_EXECUTE))
+    return IncrementalSlotClass::Text;
+  return IncrementalSlotClass::None;
+}
+
+bool isIncrementalSlotReuseClass(IncrementalSlotClass slotClass) {
+  switch (slotClass) {
+  case IncrementalSlotClass::Text:
+  case IncrementalSlotClass::RData:
+  case IncrementalSlotClass::Data:
+    return true;
+  case IncrementalSlotClass::None:
+  case IncrementalSlotClass::PDataPacked:
+  case IncrementalSlotClass::XDataPacked:
+    return false;
+  }
+  llvm_unreachable("unknown incremental slot class");
+}
+
+bool isIncrementalPackedClass(IncrementalSlotClass slotClass) {
+  switch (slotClass) {
+  case IncrementalSlotClass::PDataPacked:
+  case IncrementalSlotClass::XDataPacked:
+    return true;
+  case IncrementalSlotClass::None:
+  case IncrementalSlotClass::Text:
+  case IncrementalSlotClass::RData:
+  case IncrementalSlotClass::Data:
+    return false;
+  }
+  llvm_unreachable("unknown incremental slot class");
+}
+
+uint8_t getIncrementalFillByte(IncrementalSlotClass slotClass) {
+  switch (slotClass) {
+  case IncrementalSlotClass::Text:
+    return 0xCC;
+  case IncrementalSlotClass::RData:
+  case IncrementalSlotClass::Data:
+  case IncrementalSlotClass::PDataPacked:
+  case IncrementalSlotClass::XDataPacked:
+  case IncrementalSlotClass::None:
+    return 0x00;
+  }
+  llvm_unreachable("unknown incremental slot class");
+}
+
+std::optional<size_t> findBestFitIncrementalFreeSlot(
+    ArrayRef<IncrementalSlotRecordState> slots, uint64_t size,
+    uint32_t alignment) {
+  std::optional<size_t> bestIndex;
+  for (size_t i = 0; i < slots.size(); ++i) {
+    const IncrementalSlotRecordState &slot = slots[i];
+    if (slot.capacity < size || slot.startRVA % alignment != 0)
+      continue;
+    if (!bestIndex || slot.capacity < slots[*bestIndex].capacity ||
+        (slot.capacity == slots[*bestIndex].capacity &&
+         slot.startRVA < slots[*bestIndex].startRVA))
+      bestIndex = i;
+  }
+  return bestIndex;
+}
+
+std::optional<uint64_t> allocateIncrementalTailReserve(uint64_t tailCursor,
+                                                       uint64_t maxSectionEndRVA,
+                                                       uint64_t size,
+                                                       uint32_t alignment) {
+  uint64_t startRVA = alignTo(tailCursor, uint64_t(alignment));
+  if (startRVA > maxSectionEndRVA || maxSectionEndRVA - startRVA < size)
+    return std::nullopt;
+  return startRVA;
+}
+
+bool isIncrementalAmd64Rel32InRange(uint16_t type, uint64_t sourceRVA,
+                                    uint64_t targetRVA) {
+  int64_t adjustment = 0;
+  switch (type) {
+  case llvm::COFF::IMAGE_REL_AMD64_REL32:
+    adjustment = 4;
+    break;
+  case llvm::COFF::IMAGE_REL_AMD64_REL32_1:
+    adjustment = 5;
+    break;
+  case llvm::COFF::IMAGE_REL_AMD64_REL32_2:
+    adjustment = 6;
+    break;
+  case llvm::COFF::IMAGE_REL_AMD64_REL32_3:
+    adjustment = 7;
+    break;
+  case llvm::COFF::IMAGE_REL_AMD64_REL32_4:
+    adjustment = 8;
+    break;
+  case llvm::COFF::IMAGE_REL_AMD64_REL32_5:
+    adjustment = 9;
+    break;
+  default:
+    return true;
+  }
+  return isInt<32>(int64_t(targetRVA) - int64_t(sourceRVA) - adjustment);
+}
 
 StringRef incrementalFallbackReasonToString(IncrementalFallbackReason reason) {
   switch (reason) {
@@ -342,6 +571,12 @@ StringRef incrementalFallbackReasonToString(IncrementalFallbackReason reason) {
     return "LayoutChanged";
   case IncrementalFallbackReason::SlotOverflow:
     return "SlotOverflow";
+  case IncrementalFallbackReason::MergeChunkParticipantChanged:
+    return "MergeChunkParticipantChanged";
+  case IncrementalFallbackReason::PackedSectionOverflow:
+    return "PackedSectionOverflow";
+  case IncrementalFallbackReason::Amd64Rel32OutOfRange:
+    return "Amd64Rel32OutOfRange";
   }
   llvm_unreachable("unknown incremental fallback reason");
 }
@@ -431,6 +666,8 @@ bool prepareCurrentIncrementalInputs(COFFLinkerContext &ctx,
 }
 
 IncrementalChunkKind classifyIncrementalChunk(const Chunk &chunk) {
+  if (isa<IncrementalPaddingChunk>(&chunk))
+    return IncrementalChunkKind::Padding;
   if (auto *section = dyn_cast<SectionChunk>(&chunk))
     if (section->file)
       return IncrementalChunkKind::ObjSection;
@@ -441,6 +678,12 @@ std::string getIncrementalChunkKey(const IncrementalLinkSession &session,
                                    const Chunk &chunk) {
   std::string key;
   raw_string_ostream os(key);
+  if (auto *padding = dyn_cast<IncrementalPaddingChunk>(&chunk)) {
+    os << "pad:" << padding->getSectionName() << ':' << chunk.getOutputCharacteristics()
+       << ':' << chunk.getRVA() << ':' << chunk.getSize() << ':'
+       << unsigned(padding->getFillByte());
+    return os.str();
+  }
   if (auto *section = dyn_cast<SectionChunk>(&chunk)) {
     auto it = session.inputIndices.find(section->file);
     if (it != session.inputIndices.end())
@@ -496,16 +739,32 @@ static bool validateIncrementalSymbolStates(COFFLinkerContext &ctx,
                                             IncrementalLinkSession &session) {
   std::vector<IncrementalSymbolState> currentSymbols =
       buildIncrementalSymbolStates(ctx, session);
-  if (currentSymbols.size() != session.state.symbols.size()) {
+  auto shouldCompareStrictly = [&](const IncrementalSymbolState &state) {
+    if (session.state.layoutMode != IncrementalLayoutMode::Slotted)
+      return true;
+    return state.kind != IncrementalSymbolKind::Regular &&
+           state.kind != IncrementalSymbolKind::Common;
+  };
+
+  SmallVector<const IncrementalSymbolState *, 32> filteredCurrentSymbols;
+  SmallVector<const IncrementalSymbolState *, 32> filteredOldSymbols;
+  for (const IncrementalSymbolState &symbol : currentSymbols)
+    if (shouldCompareStrictly(symbol))
+      filteredCurrentSymbols.push_back(&symbol);
+  for (const IncrementalSymbolState &symbol : session.state.symbols)
+    if (shouldCompareStrictly(symbol))
+      filteredOldSymbols.push_back(&symbol);
+
+  if (filteredCurrentSymbols.size() != filteredOldSymbols.size()) {
     setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                            "resolved symbol count changed");
     disableIncrementalStateReuse(ctx);
     return false;
   }
 
-  for (size_t i = 0; i < currentSymbols.size(); ++i) {
-    const IncrementalSymbolState &current = currentSymbols[i];
-    const IncrementalSymbolState &old = session.state.symbols[i];
+  for (size_t i = 0; i < filteredCurrentSymbols.size(); ++i) {
+    const IncrementalSymbolState &current = *filteredCurrentSymbols[i];
+    const IncrementalSymbolState &old = *filteredOldSymbols[i];
     if (current.name != old.name || current.kind != old.kind ||
         current.inputIndex != old.inputIndex || current.value != old.value ||
         current.auxiliaryKey != old.auxiliaryKey) {
@@ -528,7 +787,8 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   ctx.config.incrementalFallbackDetail.clear();
   ctx.incrementalSession.reset();
 
-  if (!ctx.config.incrementalLinkRequested)
+  if (!ctx.config.incrementalLinkRequested ||
+      !ctx.config.incrementalLinkSpecified)
     return;
 
   ensureIncrementalStatePath(ctx.config);
@@ -585,6 +845,13 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
     ctx.incrementalSession = std::move(session);
     setIncrementalFallback(ctx, IncrementalFallbackReason::OutputMismatch,
                            "incremental state was written for a different output");
+    return;
+  }
+  if (stateOrErr->version < 3 ||
+      stateOrErr->layoutMode != IncrementalLayoutMode::Slotted) {
+    ctx.incrementalSession = std::move(session);
+    setIncrementalFallback(ctx, IncrementalFallbackReason::MissingState,
+                           "phase2 slotted baseline state is missing");
     return;
   }
 

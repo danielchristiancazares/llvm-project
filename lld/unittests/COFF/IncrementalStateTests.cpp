@@ -1,10 +1,12 @@
 #include "../../COFF/IncrementalState.h"
+#include "../../COFF/Incremental.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
+#include <climits>
 
 using namespace lld::coff;
 using namespace llvm;
@@ -39,6 +41,7 @@ protected:
 
 TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   IncrementalStateFile state;
+  state.layoutMode = IncrementalLayoutMode::Slotted;
   state.machine = AMD64;
   state.outputHash = 0x1111;
   state.outputSize = 0x2222;
@@ -93,13 +96,51 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   symbol.value = 0;
   state.symbols.push_back(symbol);
 
+  IncrementalSectionEnvelopeState envelope;
+  envelope.name = ".text";
+  envelope.characteristics = 0x60000020;
+  envelope.sectionRVA = 0x1000;
+  envelope.maxSectionEndRVA = 0x2000;
+  envelope.activeEndRVA = 0x1200;
+  envelope.slotClass = IncrementalSlotClass::Text;
+  envelope.slotReuseEnabled = true;
+  state.sectionEnvelopes.push_back(envelope);
+
+  IncrementalSlotRecordState slot;
+  slot.envelopeIndex = 0;
+  slot.startRVA = 0x1000;
+  slot.capacity = 48;
+  slot.committedSize = 32;
+  slot.minAlignment = 16;
+  slot.fillByte = 0xCC;
+  slot.state = IncrementalSlotState::Occupied;
+  slot.occupantKey = "obj:0:comdat:main";
+  state.slotRecords.push_back(slot);
+
+  IncrementalPackedSectionState packedSection;
+  packedSection.envelopeIndex = 0;
+  packedSection.activePrefixSize = 32;
+  packedSection.reserveSize = 16;
+  packedSection.recordKeys.push_back("obj:0:comdat:main");
+  state.packedSections.push_back(packedSection);
+
+  IncrementalPlacementState placement;
+  placement.key = "obj:0:comdat:main";
+  placement.envelopeIndex = 0;
+  placement.kind = IncrementalPlacementKind::ExistingSlot;
+  placement.startRVA = 0x1000;
+  placement.size = 32;
+  placement.alignment = 16;
+  state.placements.push_back(placement);
+
   SmallString<128> path = getPath("state.llilk");
   expectNoError(writeIncrementalState(path, state));
 
   Expected<IncrementalStateFile> loaded = loadIncrementalState(path);
   ASSERT_TRUE(static_cast<bool>(loaded)) << toString(loaded.takeError());
 
-  EXPECT_EQ(loaded->version, 2u);
+  EXPECT_EQ(loaded->version, 3u);
+  EXPECT_EQ(loaded->layoutMode, IncrementalLayoutMode::Slotted);
   EXPECT_EQ(loaded->machine, AMD64);
   EXPECT_EQ(loaded->importTopologyHash, state.importTopologyHash);
   EXPECT_EQ(loaded->exportTopologyHash, state.exportTopologyHash);
@@ -111,6 +152,21 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   EXPECT_EQ(loaded->symbols[0].name, "main");
   EXPECT_EQ(loaded->symbols[0].auxiliaryKey, "obj:0:comdat:main");
   EXPECT_EQ(loaded->symbols[0].kind, IncrementalSymbolKind::Regular);
+  ASSERT_EQ(loaded->sectionEnvelopes.size(), 1u);
+  EXPECT_EQ(loaded->sectionEnvelopes[0].name, ".text");
+  EXPECT_EQ(loaded->sectionEnvelopes[0].slotClass, IncrementalSlotClass::Text);
+  EXPECT_TRUE(loaded->sectionEnvelopes[0].slotReuseEnabled);
+  ASSERT_EQ(loaded->slotRecords.size(), 1u);
+  EXPECT_EQ(loaded->slotRecords[0].occupantKey, "obj:0:comdat:main");
+  EXPECT_EQ(loaded->slotRecords[0].fillByte, 0xCC);
+  EXPECT_EQ(loaded->slotRecords[0].state, IncrementalSlotState::Occupied);
+  ASSERT_EQ(loaded->packedSections.size(), 1u);
+  ASSERT_EQ(loaded->packedSections[0].recordKeys.size(), 1u);
+  EXPECT_EQ(loaded->packedSections[0].recordKeys[0], "obj:0:comdat:main");
+  ASSERT_EQ(loaded->placements.size(), 1u);
+  EXPECT_EQ(loaded->placements[0].key, "obj:0:comdat:main");
+  EXPECT_EQ(loaded->placements[0].kind,
+            IncrementalPlacementKind::ExistingSlot);
 }
 
 TEST_F(IncrementalStateTest, RejectsInvalidMagicAndVersion) {
@@ -154,6 +210,53 @@ TEST_F(IncrementalStateTest, RejectsInvalidMagicAndVersion) {
   Expected<IncrementalStateFile> badVersion = loadIncrementalState(path);
   ASSERT_FALSE(static_cast<bool>(badVersion));
   consumeError(badVersion.takeError());
+}
+
+TEST(IncrementalHelpersTest, BestFitSelectionHonorsCapacityAndAlignment) {
+  std::vector<IncrementalSlotRecordState> slots(3);
+  slots[0].startRVA = 0x1000;
+  slots[0].capacity = 32;
+  slots[1].startRVA = 0x1010;
+  slots[1].capacity = 24;
+  slots[2].startRVA = 0x1024;
+  slots[2].capacity = 24;
+
+  std::optional<size_t> slot = findBestFitIncrementalFreeSlot(slots, 16, 16);
+  ASSERT_TRUE(slot.has_value());
+  EXPECT_EQ(*slot, 1u);
+
+  slot = findBestFitIncrementalFreeSlot(slots, 16, 32);
+  ASSERT_TRUE(slot.has_value());
+  EXPECT_EQ(*slot, 0u);
+
+  EXPECT_FALSE(findBestFitIncrementalFreeSlot(slots, 64, 16).has_value());
+}
+
+TEST(IncrementalHelpersTest, TailReserveAllocationAlignsAndRejectsOverflow) {
+  std::optional<uint64_t> start =
+      allocateIncrementalTailReserve(0x1003, 0x1010, 4, 4);
+  ASSERT_TRUE(start.has_value());
+  EXPECT_EQ(*start, 0x1004u);
+
+  EXPECT_FALSE(
+      allocateIncrementalTailReserve(0x100f, 0x1010, 4, 4).has_value());
+}
+
+TEST(IncrementalHelpersTest, Amd64Rel32RangeHelperChecksBoundaries) {
+  uint64_t source = 0x1000;
+  uint64_t maxInRange = source + 4 + uint64_t(INT32_MAX);
+  EXPECT_TRUE(
+      isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32, source,
+                                     maxInRange));
+  EXPECT_FALSE(isIncrementalAmd64Rel32InRange(
+      llvm::COFF::IMAGE_REL_AMD64_REL32, source, maxInRange + 1));
+
+  uint64_t minInRange = source + 4 - uint64_t(0x80000000ULL);
+  EXPECT_TRUE(
+      isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32, source,
+                                     minInRange));
+  EXPECT_FALSE(isIncrementalAmd64Rel32InRange(
+      llvm::COFF::IMAGE_REL_AMD64_REL32, source, minInRange - 1));
 }
 
 } // namespace

@@ -4,16 +4,17 @@
 # RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc v1.s -o main.obj && \
 # RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj && \
 # RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc v2.s -o main.obj && \
-# RUN:   echo OVERFLOW > %t.out && \
+# RUN:   echo SECOND > %t.out && \
 # RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
-# RUN:   echo REUSE >> %t.out && \
+# RUN:   echo THIRD >> %t.out && \
 # RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
 # RUN:   FileCheck %s < %t.out
 
-# CHECK: OVERFLOW
+# CHECK: SECOND
 # CHECK: incremental: using state
-# CHECK: incremental: fallback: SlotOverflow
-# CHECK: REUSE
+# CHECK: incremental: phase2 active
+# CHECK: incremental: reused free slot .rdata
+# CHECK: THIRD
 # CHECK: incremental: using state
 # CHECK: incremental: exact-layout reuse active
 
@@ -24,24 +25,29 @@ main:
   xorl %eax, %eax
   retq
 
-.section .text,"xr",one_only,helper
-.globl helper
-helper:
-  movl $7, %eax
-  retq
+.section .rdata,"dr",one_only,olddata
+.globl olddata
+olddata:
+  .quad 1
+
+.section .rdata,"dr",one_only,keepdata
+.globl keepdata
+keepdata:
+  .quad 2
 
 #--- v2.s
 .section .text,"xr",one_only,main
 .globl main
 main:
-  movl $1, %eax
-  .rept 6000
-  nop
-  .endr
+  xorl %eax, %eax
   retq
 
-.section .text,"xr",one_only,helper
-.globl helper
-helper:
-  movl $7, %eax
-  retq
+.section .rdata,"dr",one_only,newdata
+.globl newdata
+newdata:
+  .quad 3
+
+.section .rdata,"dr",one_only,keepdata
+.globl keepdata
+keepdata:
+  .quad 2
