@@ -1,6 +1,7 @@
 #include "IncrementalLayout.h"
 #include "COFFLinkerContext.h"
 #include "Incremental.h"
+#include "IncrementalRedirects.h"
 #include "InputFiles.h"
 #include "Symbols.h"
 #include "lld/Common/Memory.h"
@@ -25,11 +26,25 @@ struct PlannedSlot {
   IncrementalSlotRecordState slot;
   bool candidateFree = false;
   bool used = false;
+  bool reservedForRedirect = false;
 };
 
 struct PlannedChunk {
   uint64_t startRVA = 0;
   Chunk *chunk = nullptr;
+};
+
+struct RedirectPlanEntry {
+  std::string targetKey;
+  std::string canonicalSymbol;
+  uint64_t redirectRVA = 0;
+  uint64_t redirectCapacity = 0;
+  uint64_t bodyRVA = 0;
+  uint64_t poolThunkRVA = 0;
+  uint32_t minAlignment = 1;
+  bool active = false;
+  bool usedPool = false;
+  Defined *bodyTarget = nullptr;
 };
 
 static void clearReuseState(COFFLinkerContext &ctx) {
@@ -38,6 +53,13 @@ static void clearReuseState(COFFLinkerContext &ctx) {
   ctx.incrementalSession->reusedChunkData.clear();
   ctx.incrementalSession->placementKinds.clear();
   ctx.incrementalSession->rewrittenChunks.clear();
+  ctx.incrementalSession->currentTextRedirects.clear();
+  ctx.incrementalSession->currentTextThunkPool = {};
+  ctx.incrementalSession->redirectSymbols.clear();
+  ctx.incrementalSession->poolThunkSymbols.clear();
+  ctx.incrementalSession->movedTextTargets.clear();
+  ctx.incrementalSession->activeRedirectTargets.clear();
+  ctx.incrementalSession->currentEdges.clear();
 }
 
 static SmallVector<OutputSection *, 16>
@@ -102,6 +124,12 @@ static uint64_t getMinFragmentSize(IncrementalSlotClass slotClass) {
   llvm_unreachable("unknown incremental slot class");
 }
 
+static uint64_t alignDownTo(uint64_t value, uint64_t align) {
+  if (align == 0)
+    return value;
+  return value & ~(align - 1);
+}
+
 static std::string formatPlacementLog(StringRef action, StringRef sectionName,
                                       uint64_t rva, uint64_t size) {
   std::string message;
@@ -115,7 +143,19 @@ static bool validateAmd64Rel32Layout(COFFLinkerContext &ctx,
                                      const OutputSection &section) {
   for (Chunk *chunk : section.chunks) {
     auto *sectionChunk = dyn_cast<SectionChunk>(chunk);
-    if (!sectionChunk || sectionChunk->getMachine() != AMD64)
+    if (!sectionChunk) {
+      auto *nonSection = dyn_cast<NonSectionChunk>(chunk);
+      if (nonSection && !nonSection->verifyRanges()) {
+        setIncrementalFallback(ctx,
+                               IncrementalFallbackReason::Amd64Rel32OutOfRange,
+                               "incremental redirect target out of range");
+        return false;
+      }
+      continue;
+    }
+    if (sectionChunk->getMachine() != AMD64)
+      continue;
+    if (!ctx.incrementalSession->rewrittenChunks.contains(sectionChunk))
       continue;
 
     for (const coff_relocation &rel : sectionChunk->getRelocs()) {
@@ -137,6 +177,75 @@ static bool validateAmd64Rel32Layout(COFFLinkerContext &ctx,
     }
   }
   return true;
+}
+
+static void rewriteRelocsToRedirectTargets(COFFLinkerContext &ctx,
+                                           IncrementalLinkSession &session) {
+  StringMap<SmallVector<const IncrementalEdgeState *, 4>> edgesBySource;
+  for (const IncrementalEdgeState &edge : session.currentEdges) {
+    if (!edge.redirectEligible ||
+        !session.activeRedirectTargets.contains(edge.targetKey))
+      continue;
+    edgesBySource[edge.sourceKey].push_back(&edge);
+  }
+
+  DenseMap<std::pair<ObjFile *, Defined *>, uint32_t> thunkSymtabIndices;
+  for (OutputSection *section : ctx.outputSections) {
+    for (Chunk *chunk : section->chunks) {
+      auto *source = dyn_cast<SectionChunk>(chunk);
+      if (!source || !session.rewrittenChunks.contains(source))
+        continue;
+
+      std::string sourceKey = getIncrementalChunkKey(session, *source);
+      auto edgesIt = edgesBySource.find(sourceKey);
+      if (edgesIt == edgesBySource.end())
+        continue;
+
+      SmallVector<std::pair<uint32_t, uint32_t>, 4> relocReplacements;
+      ArrayRef<coff_relocation> currentRelocs = source->getRelocs();
+      for (size_t i = 0; i < currentRelocs.size(); ++i) {
+        const coff_relocation &rel = currentRelocs[i];
+        for (const IncrementalEdgeState *edge : edgesIt->second) {
+          if (edge->sourceOffset != rel.VirtualAddress)
+            continue;
+          Defined *redirectSym = session.redirectSymbols.lookup(edge->targetKey);
+          if (!redirectSym)
+            continue;
+          auto insertion =
+              thunkSymtabIndices.insert({{source->file, redirectSym}, ~0U});
+          uint32_t &symbolIndex = insertion.first->second;
+          if (insertion.second)
+            symbolIndex = source->file->addRangeThunkSymbol(redirectSym);
+          relocReplacements.emplace_back(i, symbolIndex);
+          break;
+        }
+      }
+      if (relocReplacements.empty())
+        continue;
+
+      MutableArrayRef<coff_relocation> newRelocs;
+      auto objectRelocs = source->file->getCOFFObj()->getRelocations(source->header);
+      if (objectRelocs.data() == currentRelocs.data()) {
+        newRelocs = MutableArrayRef(
+            bAlloc().Allocate<coff_relocation>(currentRelocs.size()),
+            currentRelocs.size());
+      } else {
+        newRelocs = MutableArrayRef(
+            const_cast<coff_relocation *>(currentRelocs.data()), currentRelocs.size());
+      }
+
+      auto nextReplacement = relocReplacements.begin();
+      auto endReplacement = relocReplacements.end();
+      for (size_t i = 0; i < currentRelocs.size(); ++i) {
+        newRelocs[i] = currentRelocs[i];
+        if (nextReplacement != endReplacement && nextReplacement->first == i) {
+          newRelocs[i].SymbolTableIndex = nextReplacement->second;
+          ++nextReplacement;
+        }
+      }
+      source->setRelocs(newRelocs);
+    }
+  }
 }
 
 static bool applyExactSectionLayout(COFFLinkerContext &ctx,
@@ -249,6 +358,10 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
     placementsByKey[placement.key] = &placement;
   }
 
+  StringMap<const IncrementalTextRedirectState *> redirectsByKey;
+  for (const IncrementalTextRedirectState &redirect : session.state.textRedirects)
+    redirectsByKey[redirect.targetKey] = &redirect;
+
   SmallVector<PlannedSlot, 16> slots;
   for (const IncrementalSlotRecordState &slot : session.state.slotRecords) {
     if (slot.envelopeIndex != envelopeIndex)
@@ -267,6 +380,78 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
   DenseMap<uint64_t, size_t> slotByStart;
   for (size_t i = 0; i < slots.size(); ++i)
     slotByStart[slots[i].slot.startRVA] = i;
+
+  StringMap<RedirectPlanEntry> redirectPlans;
+  if (envelope->slotClass == IncrementalSlotClass::Text) {
+    for (const auto &[key, chunk] : currentEntries) {
+      auto *sectionChunk = dyn_cast<SectionChunk>(chunk);
+      if (!sectionChunk || sectionChunk->getMachine() != AMD64)
+        continue;
+
+      Defined *canonicalSymbol = findIncrementalCanonicalEntrySymbol(*sectionChunk);
+      if (!canonicalSymbol)
+        continue;
+
+      const IncrementalPlacementState *oldPlacement = nullptr;
+      if (auto placementIt = placementsByKey.find(key);
+          placementIt != placementsByKey.end())
+        oldPlacement = placementIt->second;
+
+      const IncrementalTextRedirectState *oldRedirect = nullptr;
+      if (auto redirectIt = redirectsByKey.find(key);
+          redirectIt != redirectsByKey.end())
+        oldRedirect = redirectIt->second;
+
+      uint64_t redirectRVA = 0;
+      uint64_t redirectCapacity = 0;
+      size_t slotIndex = size_t(-1);
+      if (oldRedirect && oldRedirect->active) {
+        auto slotIt = slotByStart.find(oldRedirect->redirectRVA);
+        if (slotIt == slotByStart.end()) {
+          setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                                 "redirect table references a missing legacy slot");
+          return false;
+        }
+        redirectRVA = oldRedirect->redirectRVA;
+        redirectCapacity = oldRedirect->redirectCapacity;
+        slotIndex = slotIt->second;
+      } else if (oldPlacement) {
+        auto slotIt = slotByStart.find(oldPlacement->startRVA);
+        if (slotIt == slotByStart.end()) {
+          setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                                 "placement table references a missing slot");
+          return false;
+        }
+        const PlannedSlot &oldSlot = slots[slotIt->second];
+        if (chunk->getSize() > oldSlot.slot.capacity && oldSlot.slot.capacity >= 5) {
+          redirectRVA = oldPlacement->startRVA;
+          redirectCapacity = oldSlot.slot.capacity;
+          slotIndex = slotIt->second;
+        }
+      }
+
+      if (slotIndex == size_t(-1))
+        continue;
+
+      PlannedSlot &redirectSlot = slots[slotIndex];
+      redirectSlot.reservedForRedirect = true;
+      redirectSlot.candidateFree = false;
+
+      RedirectPlanEntry plan;
+      plan.targetKey = key;
+      plan.canonicalSymbol = canonicalSymbol->getName().str();
+      plan.redirectRVA = redirectRVA;
+      plan.redirectCapacity = redirectCapacity;
+      plan.minAlignment = redirectSlot.slot.minAlignment;
+      plan.bodyTarget = canonicalSymbol;
+      if (oldRedirect && oldRedirect->active) {
+        plan.active = true;
+        plan.poolThunkRVA = oldRedirect->poolThunkRVA;
+        plan.usedPool = oldRedirect->poolThunkRVA != 0;
+      }
+      redirectPlans[key] = std::move(plan);
+    }
+  }
 
   SmallVector<PlannedChunk, 16> plannedChunks;
   SmallVector<FreeRange, 16> splitFreeRanges;
@@ -290,10 +475,13 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       if (!oldSlot.used && size <= oldSlot.slot.capacity) {
         oldSlot.used = true;
         plannedChunks.push_back({placementIt->second->startRVA, chunk});
+        if (auto redirectIt = redirectPlans.find(key); redirectIt != redirectPlans.end())
+          redirectIt->second.bodyRVA = placementIt->second->startRVA;
         continue;
       }
 
-      oldSlot.candidateFree = true;
+      if (!oldSlot.reservedForRedirect)
+        oldSlot.candidateFree = true;
     }
 
     size_t bestSlotIndex = UINT32_MAX;
@@ -317,6 +505,14 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       PlannedSlot &slot = slots[bestSlotIndex];
       slot.used = true;
       plannedChunks.push_back({slot.slot.startRVA, chunk});
+      if (auto redirectIt = redirectPlans.find(key); redirectIt != redirectPlans.end()) {
+        redirectIt->second.bodyRVA = slot.slot.startRVA;
+        redirectIt->second.active = true;
+      }
+      if (auto placementIt = placementsByKey.find(key);
+          placementIt != placementsByKey.end() &&
+          placementIt->second->startRVA != slot.slot.startRVA)
+        session.movedTextTargets.insert(key);
       exactLayoutOnly = false;
       verboseLogs.push_back(formatPlacementLog("reused free slot",
                                                currentSection.name,
@@ -340,11 +536,117 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
     if (startRVA > tailCursor)
       splitFreeRanges.push_back({tailCursor, startRVA - tailCursor, fillByte});
     plannedChunks.push_back({startRVA, chunk});
+    if (auto redirectIt = redirectPlans.find(key); redirectIt != redirectPlans.end()) {
+      redirectIt->second.bodyRVA = startRVA;
+      redirectIt->second.active = true;
+    }
+    if (placementsByKey.count(key))
+      session.movedTextTargets.insert(key);
     tailCursor = startRVA + size;
     exactLayoutOnly = false;
     verboseLogs.push_back(formatPlacementLog("allocated tail reserve",
                                              currentSection.name, startRVA,
                                              size));
+  }
+
+  if (envelope->slotClass == IncrementalSlotClass::Text) {
+    auto makeSyntheticName = [&](StringRef prefix, uint64_t rva) {
+      std::string name;
+      raw_string_ostream os(name);
+      os << prefix << '$' << utohexstr(rva);
+      return saver().save(os.str());
+    };
+
+    uint64_t poolCursor = session.state.textThunkPool.nextFreeRVA != 0
+                              ? session.state.textThunkPool.nextFreeRVA
+                              : envelope->maxSectionEndRVA;
+    uint64_t poolStart = session.state.textThunkPool.poolStartRVA;
+    uint64_t poolEnd = session.state.textThunkPool.poolEndRVA != 0
+                           ? session.state.textThunkPool.poolEndRVA
+                           : envelope->maxSectionEndRVA;
+    SmallVector<RedirectPlanEntry *, 8> activeRedirects;
+    for (auto &entry : redirectPlans) {
+      RedirectPlanEntry &plan = entry.second;
+      if (!plan.active || plan.bodyRVA == 0 || plan.bodyRVA == plan.redirectRVA)
+        continue;
+      if (!plan.usedPool && isIncrementalAmd64Rel32InRange(
+                                llvm::COFF::IMAGE_REL_AMD64_REL32,
+                                plan.redirectRVA + 1, plan.bodyRVA)) {
+        plan.usedPool = false;
+      } else {
+        if (ctx.config.guardCF) {
+          plan.active = false;
+        } else {
+          uint64_t poolThunkRVA = plan.poolThunkRVA;
+          if (poolThunkRVA == 0) {
+            if (poolCursor <= tailCursor || poolCursor - tailCursor < 16) {
+              plan.active = false;
+            } else {
+              poolThunkRVA = alignDownTo(poolCursor - 16, 16);
+              if (poolThunkRVA < tailCursor) {
+                plan.active = false;
+              } else {
+                poolCursor = poolThunkRVA;
+                if (poolStart == 0 || poolThunkRVA < poolStart)
+                  poolStart = poolThunkRVA;
+              }
+            }
+          }
+          if (plan.active) {
+            if (poolStart == 0 || poolThunkRVA < poolStart)
+              poolStart = poolThunkRVA;
+            poolCursor = std::min(poolCursor, poolThunkRVA);
+            auto *poolChunk = make<IncrementalLongThunkChunkX64>(
+                saver().save("phase3-pool:" + plan.targetKey), plan.bodyTarget);
+            poolChunk->setRVA(poolThunkRVA);
+            auto *poolSymbol = make<DefinedSynthetic>(
+                makeSyntheticName("__phase3_pool", poolThunkRVA), poolChunk);
+            plannedChunks.push_back({poolThunkRVA, poolChunk});
+            plan.poolThunkRVA = poolThunkRVA;
+            plan.usedPool = true;
+            session.poolThunkSymbols[plan.targetKey] = poolSymbol;
+            plan.bodyTarget = poolSymbol;
+            verboseLogs.push_back(formatPlacementLog("allocated long thunk pool",
+                                                     currentSection.name,
+                                                     poolThunkRVA, poolChunk->getSize()));
+          }
+        }
+      }
+
+      if (!plan.active)
+        continue;
+
+      auto *redirectChunk = make<IncrementalEntryRedirectChunkX64>(
+          saver().save("phase3-redirect:" + plan.targetKey), plan.bodyTarget,
+          static_cast<uint32_t>(plan.redirectCapacity), plan.minAlignment);
+      plannedChunks.push_back({plan.redirectRVA, redirectChunk});
+      auto *redirectSymbol = make<DefinedSynthetic>(
+          makeSyntheticName("__phase3_redirect", plan.redirectRVA), redirectChunk);
+      session.redirectSymbols[plan.targetKey] = redirectSymbol;
+
+      IncrementalTextRedirectState redirectState;
+      redirectState.targetKey = plan.targetKey;
+      redirectState.canonicalSymbol = plan.canonicalSymbol;
+      redirectState.redirectRVA = plan.redirectRVA;
+      redirectState.redirectCapacity = plan.redirectCapacity;
+      redirectState.bodyRVA = plan.bodyRVA;
+      redirectState.poolThunkRVA = plan.poolThunkRVA;
+      redirectState.active = true;
+      session.currentTextRedirects.push_back(std::move(redirectState));
+      session.activeRedirectTargets.insert(plan.targetKey);
+      activeRedirects.push_back(&plan);
+      verboseLogs.push_back(formatPlacementLog("installed legacy redirect",
+                                               currentSection.name,
+                                               plan.redirectRVA,
+                                               plan.redirectCapacity));
+      exactLayoutOnly = false;
+    }
+
+    if (!session.currentTextRedirects.empty()) {
+      session.currentTextThunkPool.poolStartRVA = poolStart;
+      session.currentTextThunkPool.poolEndRVA = poolEnd;
+      session.currentTextThunkPool.nextFreeRVA = poolCursor;
+    }
   }
 
   auto appendPadding = [&](uint64_t startRVA, uint64_t size, uint8_t fillByte) {
@@ -372,21 +674,6 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
         placementIt != placementsByKey.end())
       startRVA = placementIt->second->startRVA;
     plannedChunks.push_back({startRVA, chunk});
-  }
-
-  if (envelope->slotClass == IncrementalSlotClass::Text) {
-    SmallVector<std::pair<Chunk *, uint64_t>, 16> originalChunkRVAs;
-    originalChunkRVAs.reserve(currentSection.chunks.size());
-    for (Chunk *chunk : currentSection.chunks)
-      originalChunkRVAs.emplace_back(chunk, chunk->getRVA());
-
-    for (const PlannedChunk &planned : plannedChunks)
-      planned.chunk->setRVA(planned.startRVA);
-    if (!validateAmd64Rel32Layout(ctx, currentSection)) {
-      for (const auto &[chunk, rva] : originalChunkRVAs)
-        chunk->setRVA(rva);
-      return false;
-    }
   }
 
   llvm::sort(plannedChunks, [](const PlannedChunk &lhs, const PlannedChunk &rhs) {
@@ -535,6 +822,92 @@ bool applyIncrementalLayout(COFFLinkerContext &ctx,
 
     if (!applyExactSectionLayout(ctx, session, *currentSection, oldSection,
                                  sectionIndex))
+      return false;
+  }
+
+  session.currentEdges = buildIncrementalEdgeStates(ctx, session);
+
+  StringMap<const IncrementalPlacementState *> oldPlacementsByKey;
+  for (const IncrementalPlacementState &placement : session.state.placements)
+    oldPlacementsByKey[placement.key] = &placement;
+
+  StringMap<const IncrementalChunkState *> oldChunksByKey;
+  DenseMap<const IncrementalChunkState *, const IncrementalSectionState *>
+      oldSectionsByChunk;
+  for (const IncrementalSectionState &oldSection : session.state.sections) {
+    if (oldSection.firstChunk > session.state.chunks.size() ||
+        session.state.chunks.size() - oldSection.firstChunk < oldSection.chunkCount)
+      continue;
+    for (size_t i = 0; i < oldSection.chunkCount; ++i) {
+      const IncrementalChunkState &oldChunk =
+          session.state.chunks[oldSection.firstChunk + i];
+      oldChunksByKey[oldChunk.key] = &oldChunk;
+      oldSectionsByChunk[&oldChunk] = &oldSection;
+    }
+  }
+
+  StringSet<> affectedSourceKeys;
+  for (const IncrementalEdgeState &edge : session.currentEdges) {
+    if (!session.movedTextTargets.contains(edge.targetKey) &&
+        !session.activeRedirectTargets.contains(edge.targetKey))
+      continue;
+    if (session.activeRedirectTargets.contains(edge.targetKey) &&
+        edge.redirectEligible && isIncrementalControlFlowRefKind(edge.kind))
+      continue;
+    affectedSourceKeys.insert(edge.sourceKey);
+  }
+
+  StringRef oldImage = session.oldImage->getBuffer();
+  ArrayRef<uint8_t> oldBytes(
+      reinterpret_cast<const uint8_t *>(oldImage.data()), oldImage.size());
+  for (OutputSection *section : activeSections) {
+    for (Chunk *chunk : section->chunks) {
+      auto *sectionChunk = dyn_cast<SectionChunk>(chunk);
+      if (!sectionChunk || !sectionChunk->file)
+        continue;
+
+      std::string key = getIncrementalChunkKey(session, *sectionChunk);
+      auto placementIt = oldPlacementsByKey.find(key);
+      auto oldChunkIt = oldChunksByKey.find(key);
+      if (placementIt == oldPlacementsByKey.end() || oldChunkIt == oldChunksByKey.end()) {
+        session.rewrittenChunks.insert(sectionChunk);
+        continue;
+      }
+
+      auto fileIt = session.inputIndices.find(sectionChunk->file);
+      if (fileIt == session.inputIndices.end() ||
+          session.changedInputs.contains(sectionChunk->file) ||
+          placementIt->second->startRVA != sectionChunk->getRVA() ||
+          affectedSourceKeys.contains(key)) {
+        session.rewrittenChunks.insert(sectionChunk);
+        continue;
+      }
+
+      const IncrementalChunkState *oldChunk = oldChunkIt->second;
+      const IncrementalSectionState *oldSection = oldSectionsByChunk.lookup(oldChunk);
+      if (!oldSection) {
+        session.rewrittenChunks.insert(sectionChunk);
+        continue;
+      }
+
+      uint64_t fileOffset = oldSection->fileOffset + (oldChunk->rva - oldSection->rva);
+      if (fileOffset > oldBytes.size() ||
+          oldBytes.size() - fileOffset < sectionChunk->getSize()) {
+        setIncrementalFallback(ctx, IncrementalFallbackReason::OutputMismatch,
+                               "reused chunk bytes extend past prior image");
+        return false;
+      }
+      session.reusedChunkData[sectionChunk] =
+          oldBytes.slice(fileOffset, sectionChunk->getSize());
+    }
+  }
+
+  rewriteRelocsToRedirectTargets(ctx, session);
+  for (OutputSection *section : activeSections) {
+    if (classifyIncrementalSection(section->name, section->header.Characteristics) !=
+        IncrementalSlotClass::Text)
+      continue;
+    if (!validateAmd64Rel32Layout(ctx, *section))
       return false;
   }
 

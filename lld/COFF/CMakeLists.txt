@@ -13,6 +13,7 @@ add_lld_library(lldCOFF
   ICF.cpp
   Incremental.cpp
   IncrementalLayout.cpp
+  IncrementalRedirects.cpp
   IncrementalState.cpp
   InputFiles.cpp
   LLDMapFile.cpp

@@ -1,0 +1,62 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.pdb %t.out second.txt third.txt && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc caller.s -o caller.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc callee1.s -o callee.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe caller.obj callee.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc callee2.s -o callee.obj && \
+# RUN:   echo SECOND > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose caller.obj callee.obj >> %t.out 2>&1 && \
+# RUN:   %python -c "import pathlib,struct; data=pathlib.Path(r'%t.llilk').read_bytes(); hdr=struct.unpack_from('<8sIHHHH' + 'Q'*36, data, 0); off,count=hdr[36],hdr[37]; soff,ssz=hdr[40],hdr[41]; strings=data[soff:soff+ssz]; s=lambda i: strings[i:strings.find(b'\\0', i)].decode(); fmt='<QQQQQQB7x'; rec=struct.unpack_from(fmt, data, off); pathlib.Path('second.txt').write_text(f'{s(rec[0])} {rec[2]}\\n')" && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc callee3.s -o callee.obj && \
+# RUN:   echo THIRD >> %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose caller.obj callee.obj >> %t.out 2>&1 && \
+# RUN:   %python -c "import pathlib,struct; data=pathlib.Path(r'%t.llilk').read_bytes(); hdr=struct.unpack_from('<8sIHHHH' + 'Q'*36, data, 0); off,count=hdr[36],hdr[37]; soff,ssz=hdr[40],hdr[41]; strings=data[soff:soff+ssz]; s=lambda i: strings[i:strings.find(b'\\0', i)].decode(); fmt='<QQQQQQB7x'; rec=struct.unpack_from(fmt, data, off); pathlib.Path('third.txt').write_text(f'{s(rec[0])} {rec[2]}\\n')" && \
+# RUN:   cmd /c fc second.txt third.txt > nul && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: SECOND
+# CHECK: incremental: installed legacy redirect .text
+# CHECK: THIRD
+# CHECK: incremental: installed legacy redirect .text
+
+#--- caller.s
+.section .text,"xr",one_only,caller
+.globl caller
+caller:
+  callq callee
+  retq
+
+.section .text,"xr",one_only,main
+.globl main
+main:
+  callq caller
+  xorl %eax, %eax
+  retq
+
+#--- callee1.s
+.section .text,"xr",one_only,callee
+.globl callee
+callee:
+  movl $1, %eax
+  retq
+
+#--- callee2.s
+.section .text,"xr",one_only,callee
+.globl callee
+callee:
+  movl $1, %eax
+  .rept 32
+  nop
+  .endr
+  retq
+
+#--- callee3.s
+.section .text,"xr",one_only,callee
+.globl callee
+callee:
+  movl $2, %eax
+  .rept 64
+  nop
+  .endr
+  retq

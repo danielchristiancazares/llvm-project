@@ -1,5 +1,7 @@
 #include "../../COFF/IncrementalState.h"
 #include "../../COFF/Incremental.h"
+#include "../../COFF/Chunks.h"
+#include "../../COFF/Symbols.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -133,13 +135,36 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   placement.alignment = 16;
   state.placements.push_back(placement);
 
+  IncrementalEdgeState edge;
+  edge.sourceKey = "obj:0:comdat:caller";
+  edge.targetKey = "obj:0:comdat:main";
+  edge.kind = IncrementalRefKind::DirectCall;
+  edge.sourceOffset = 4;
+  edge.targetOffset = 0;
+  edge.redirectEligible = true;
+  state.edges.push_back(edge);
+
+  IncrementalTextRedirectState redirect;
+  redirect.targetKey = "obj:0:comdat:main";
+  redirect.canonicalSymbol = "main";
+  redirect.redirectRVA = 0x1000;
+  redirect.redirectCapacity = 16;
+  redirect.bodyRVA = 0x1200;
+  redirect.poolThunkRVA = 0;
+  redirect.active = true;
+  state.textRedirects.push_back(redirect);
+
+  state.textThunkPool.poolStartRVA = 0x1800;
+  state.textThunkPool.poolEndRVA = 0x1A00;
+  state.textThunkPool.nextFreeRVA = 0x1A00;
+
   SmallString<128> path = getPath("state.llilk");
   expectNoError(writeIncrementalState(path, state));
 
   Expected<IncrementalStateFile> loaded = loadIncrementalState(path);
   ASSERT_TRUE(static_cast<bool>(loaded)) << toString(loaded.takeError());
 
-  EXPECT_EQ(loaded->version, 3u);
+  EXPECT_EQ(loaded->version, 4u);
   EXPECT_EQ(loaded->layoutMode, IncrementalLayoutMode::Slotted);
   EXPECT_EQ(loaded->machine, AMD64);
   EXPECT_EQ(loaded->importTopologyHash, state.importTopologyHash);
@@ -167,6 +192,18 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   EXPECT_EQ(loaded->placements[0].key, "obj:0:comdat:main");
   EXPECT_EQ(loaded->placements[0].kind,
             IncrementalPlacementKind::ExistingSlot);
+  ASSERT_EQ(loaded->edges.size(), 1u);
+  EXPECT_EQ(loaded->edges[0].sourceKey, "obj:0:comdat:caller");
+  EXPECT_EQ(loaded->edges[0].targetKey, "obj:0:comdat:main");
+  EXPECT_EQ(loaded->edges[0].kind, IncrementalRefKind::DirectCall);
+  EXPECT_TRUE(loaded->edges[0].redirectEligible);
+  ASSERT_EQ(loaded->textRedirects.size(), 1u);
+  EXPECT_EQ(loaded->textRedirects[0].canonicalSymbol, "main");
+  EXPECT_EQ(loaded->textRedirects[0].redirectCapacity, 16u);
+  EXPECT_TRUE(loaded->textRedirects[0].active);
+  EXPECT_EQ(loaded->textThunkPool.poolStartRVA, 0x1800u);
+  EXPECT_EQ(loaded->textThunkPool.poolEndRVA, 0x1A00u);
+  EXPECT_EQ(loaded->textThunkPool.nextFreeRVA, 0x1A00u);
 }
 
 TEST_F(IncrementalStateTest, RejectsInvalidMagicAndVersion) {
@@ -257,6 +294,67 @@ TEST(IncrementalHelpersTest, Amd64Rel32RangeHelperChecksBoundaries) {
                                      minInRange));
   EXPECT_FALSE(isIncrementalAmd64Rel32InRange(
       llvm::COFF::IMAGE_REL_AMD64_REL32, source, minInRange - 1));
+}
+
+TEST(IncrementalHelpersTest, EntryRedirectChunkRangeChecks) {
+  EmptyChunk bodyChunk;
+  bodyChunk.setRVA(0x2000);
+  DefinedSynthetic body("body", &bodyChunk);
+
+  IncrementalEntryRedirectChunkX64 redirect("redir", &body, 16, 16);
+  redirect.setRVA(0x1000);
+  EXPECT_TRUE(redirect.verifyRanges());
+
+  bodyChunk.setRVA(0x90000000ULL);
+  EXPECT_FALSE(redirect.verifyRanges());
+}
+
+TEST(IncrementalHelpersTest, LongThunkChunkAddsDir64BaseReloc) {
+  EmptyChunk bodyChunk;
+  bodyChunk.setRVA(0x3000);
+  DefinedSynthetic body("body", &bodyChunk);
+
+  IncrementalLongThunkChunkX64 thunk("pool", &body);
+  thunk.setRVA(0x1800);
+
+  std::vector<Baserel> relocs;
+  thunk.getBaserels(&relocs);
+  ASSERT_EQ(relocs.size(), 1u);
+  EXPECT_EQ(relocs[0].rva, 0x1802u);
+  EXPECT_EQ(relocs[0].type, llvm::COFF::IMAGE_REL_BASED_DIR64);
+}
+
+TEST(IncrementalHelpersTest, RedirectStateRoundTripPreservesPoolState) {
+  IncrementalStateFile state;
+  state.layoutMode = IncrementalLayoutMode::Slotted;
+  state.outputPath = "out.exe";
+  state.textThunkPool.poolStartRVA = 0x4000;
+  state.textThunkPool.poolEndRVA = 0x5000;
+  state.textThunkPool.nextFreeRVA = 0x4FF0;
+
+  IncrementalTextRedirectState redirect;
+  redirect.targetKey = "obj:0:comdat:target";
+  redirect.canonicalSymbol = "target";
+  redirect.redirectRVA = 0x1200;
+  redirect.redirectCapacity = 16;
+  redirect.bodyRVA = 0x2400;
+  redirect.poolThunkRVA = 0x4FF0;
+  redirect.active = true;
+  state.textRedirects.push_back(redirect);
+
+  SmallString<128> path;
+  ASSERT_FALSE(sys::fs::createTemporaryFile("phase3-pool", "llilk", path));
+  Error err = writeIncrementalState(path, state);
+  ASSERT_FALSE(static_cast<bool>(err)) << toString(std::move(err));
+  Expected<IncrementalStateFile> loaded = loadIncrementalState(path);
+  ASSERT_TRUE(static_cast<bool>(loaded)) << toString(loaded.takeError());
+  ASSERT_EQ(loaded->textRedirects.size(), 1u);
+  EXPECT_EQ(loaded->textRedirects[0].poolThunkRVA, 0x4FF0u);
+  EXPECT_EQ(loaded->textThunkPool.poolStartRVA, 0x4000u);
+  EXPECT_EQ(loaded->textThunkPool.poolEndRVA, 0x5000u);
+  EXPECT_EQ(loaded->textThunkPool.nextFreeRVA, 0x4FF0u);
+  std::error_code ec = sys::fs::remove(path);
+  EXPECT_FALSE(ec);
 }
 
 } // namespace

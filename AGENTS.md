@@ -8,22 +8,49 @@ This checkout is a focused LLVM tree where COFF linker work lives under `lld/COF
 Source is in `lld/COFF/*.cpp` and `lld/COFF/*.h`, with shared interfaces in `lld/include` and tool wiring in `lld/tools/lld/CMakeLists.txt`. Tests are in `lld/test/COFF` with fixtures under `lld/test/COFF/Inputs`. Primary build/test integration is in `lld/CMakeLists.txt`, `lld/test/CMakeLists.txt`, and `lld/test/lit.cfg.py`. COFF docs are under `lld/docs`.
 
 ## Build, Test, and Development Commands
-Use a dedicated build directory outside source:
+Use Ninja for all local builds and tests (mandatory). Use a dedicated build directory outside source and a fresh environment.
+
+Prerequisites:
+
+`CMake` (with `cmake --version`), `Ninja`, and a supported C++ compiler toolchain (GCC/Clang/MSVC).
+
+1. Configure once at the repository root:
+
+`cmake -S llvm -B build -G Ninja -DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM" -DCMAKE_BUILD_TYPE=RelWithDebInfo`
+
+Optional debug/asserts build:
+
+`cmake -S llvm -B build -G Ninja -DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLLVM_ENABLE_ASSERTIONS=ON`
+
+2. Build binaries:
+
+`cmake --build build`
+
+`cmake --build build --target lld`
+
+`cmake --build build --target lld-link`
+
+3. Run full COFF + linker checks:
+
+`cmake --build build --target check-lld`
+
+For COFF-focused local validation, use direct lit runs from `build`:
+
+`cd build`
+
+`bin/llvm-lit -sv ../lld/test/COFF`
+
+`bin/llvm-lit -sv ../lld/test/COFF/align.s`
+
+4. Rebuild after source or CMake option changes:
+
+`cmake --build build -j`
+
+When CMake options change, re-run configure with Ninja (same `build` directory):
 
 `cmake -S llvm -B build -G Ninja -DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM" -DCMAKE_BUILD_TYPE=RelWithDebInfo`
 
 `cmake --build build -j`
-
-`cmake --build build --target lld`
-
-`cmake --build build --target check-lld`
-
-For COFF-only manual runs, prefer direct lit execution:
-
-`cd build`  
-`bin/llvm-lit -sv ../lld/test/COFF`
-
-`bin/llvm-lit -sv ../lld/test/COFF/align.s`
 
 Built binaries are in `build/bin` (for example `lld`, `lld-link`, and `ld.lld`).
 
