@@ -1,5 +1,6 @@
 #include "Incremental.h"
 #include "COFFLinkerContext.h"
+#include "IncrementalRedirects.h"
 #include "InputFiles.h"
 #include "Symbols.h"
 #include "Writer.h"
@@ -168,10 +169,19 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
         sectionIndex + 1 < activeSections.size()
             ? activeSections[sectionIndex + 1]->getRVA()
             : state.sizeOfImage;
-    envelope.activeEndRVA = section->getRVA() + section->getVirtualSize();
     envelope.slotClass = slotClass;
     envelope.packedActivePrefix = isIncrementalPackedClass(slotClass);
     envelope.slotReuseEnabled = isIncrementalSlotReuseClass(slotClass);
+    uint64_t activeEndRVA = section->getRVA() + section->getVirtualSize();
+    if (slotClass == IncrementalSlotClass::Text) {
+      activeEndRVA = section->getRVA();
+      for (Chunk *chunk : section->chunks) {
+        if (isa<IncrementalLongThunkChunkX64>(chunk))
+          continue;
+        activeEndRVA = std::max(activeEndRVA, chunk->getRVA() + chunk->getSize());
+      }
+    }
+    envelope.activeEndRVA = activeEndRVA;
     envelopeIndices[section] = state.sectionEnvelopes.size();
     state.sectionEnvelopes.push_back(std::move(envelope));
   }
@@ -427,6 +437,9 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
   }
 
   buildIncrementalLayoutTables(ctx, session, state);
+  state.edges = buildIncrementalEdgeStates(ctx, session);
+  state.textRedirects = session.currentTextRedirects;
+  state.textThunkPool = session.currentTextThunkPool;
   state.symbols = buildIncrementalSymbolStates(ctx, session);
 
   return state;
@@ -668,6 +681,10 @@ bool prepareCurrentIncrementalInputs(COFFLinkerContext &ctx,
 IncrementalChunkKind classifyIncrementalChunk(const Chunk &chunk) {
   if (isa<IncrementalPaddingChunk>(&chunk))
     return IncrementalChunkKind::Padding;
+  if (isa<IncrementalEntryRedirectChunkX64>(&chunk))
+    return IncrementalChunkKind::EntryRedirect;
+  if (isa<IncrementalLongThunkChunkX64>(&chunk))
+    return IncrementalChunkKind::LongThunk;
   if (auto *section = dyn_cast<SectionChunk>(&chunk))
     if (section->file)
       return IncrementalChunkKind::ObjSection;
@@ -682,6 +699,14 @@ std::string getIncrementalChunkKey(const IncrementalLinkSession &session,
     os << "pad:" << padding->getSectionName() << ':' << chunk.getOutputCharacteristics()
        << ':' << chunk.getRVA() << ':' << chunk.getSize() << ':'
        << unsigned(padding->getFillByte());
+    return os.str();
+  }
+  if (auto *redirect = dyn_cast<IncrementalEntryRedirectChunkX64>(&chunk)) {
+    os << "redirect:" << redirect->getDebugName() << ':' << chunk.getSize();
+    return os.str();
+  }
+  if (auto *thunk = dyn_cast<IncrementalLongThunkChunkX64>(&chunk)) {
+    os << "longthunk:" << thunk->getDebugName();
     return os.str();
   }
   if (auto *section = dyn_cast<SectionChunk>(&chunk)) {
@@ -873,6 +898,8 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   session->oldImage = std::move(*oldImage);
   session->stateLoaded = true;
   session->softConfigChanged = session->state.softConfigHash != softHash;
+  for (size_t i = 0; i < session->state.textRedirects.size(); ++i)
+    session->oldRedirectIndices[session->state.textRedirects[i].targetKey] = i;
   for (ArchiveFile *file : ctx.archiveFileInstances)
     session->replayableArchives.insert(file->getName());
 

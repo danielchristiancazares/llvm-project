@@ -19,6 +19,8 @@ enum class IncrementalChunkKind : uint16_t {
   ObjSection = 1,
   Synthetic = 2,
   Padding = 3,
+  EntryRedirect = 4,
+  LongThunk = 5,
 };
 
 enum class IncrementalSymbolKind : uint16_t {
@@ -50,6 +52,16 @@ enum class IncrementalPlacementKind : uint16_t {
   ReusedFreeSlot = 2,
   TailReserve = 3,
   PackedPrefix = 4,
+};
+
+enum class IncrementalRefKind : uint16_t {
+  Unknown = 0,
+  DirectCall = 1,
+  DirectJump = 2,
+  DirectCondJump = 3,
+  DataAddress = 4,
+  RipRelativeData = 5,
+  NonEntryCodeRef = 6,
 };
 
 struct IncrementalInputState {
@@ -132,8 +144,33 @@ struct IncrementalPlacementState {
   uint32_t alignment = 1;
 };
 
+struct IncrementalEdgeState {
+  std::string sourceKey;
+  std::string targetKey;
+  IncrementalRefKind kind = IncrementalRefKind::Unknown;
+  uint32_t sourceOffset = 0;
+  uint32_t targetOffset = 0;
+  bool redirectEligible = false;
+};
+
+struct IncrementalTextRedirectState {
+  std::string targetKey;
+  std::string canonicalSymbol;
+  uint64_t redirectRVA = 0;
+  uint64_t redirectCapacity = 0;
+  uint64_t bodyRVA = 0;
+  uint64_t poolThunkRVA = 0;
+  bool active = false;
+};
+
+struct IncrementalTextThunkPoolState {
+  uint64_t poolStartRVA = 0;
+  uint64_t poolEndRVA = 0;
+  uint64_t nextFreeRVA = 0;
+};
+
 struct IncrementalStateFile {
-  uint32_t version = 3;
+  uint32_t version = 4;
   IncrementalLayoutMode layoutMode = IncrementalLayoutMode::Slotted;
   llvm::COFF::MachineTypes machine = IMAGE_FILE_MACHINE_UNKNOWN;
   uint64_t outputHash = 0;
@@ -154,6 +191,9 @@ struct IncrementalStateFile {
   std::vector<IncrementalSlotRecordState> slotRecords;
   std::vector<IncrementalPackedSectionState> packedSections;
   std::vector<IncrementalPlacementState> placements;
+  std::vector<IncrementalEdgeState> edges;
+  std::vector<IncrementalTextRedirectState> textRedirects;
+  IncrementalTextThunkPoolState textThunkPool;
 };
 
 llvm::Expected<IncrementalStateFile> loadIncrementalState(llvm::StringRef path);

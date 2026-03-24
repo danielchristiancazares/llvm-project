@@ -12,6 +12,7 @@
 #include "Config.h"
 #include "DebugTypes.h"
 #include "Driver.h"
+#include "Incremental.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "TypeMerger.h"
@@ -154,6 +155,9 @@ public:
 
   /// Link info for each import file in the symbol table into the PDB.
   void addImportFilesToPDB();
+
+  /// Link info for each incremental redirect and pool thunk into the PDB.
+  void addIncrementalRedirectsToPDB();
 
   void createModuleDBI(ObjFile *file);
 
@@ -1780,6 +1784,84 @@ void PDBLinker::addImportFilesToPDB() {
   }
 }
 
+void PDBLinker::addIncrementalRedirectsToPDB() {
+  if (!ctx.incrementalSession ||
+      ctx.incrementalSession->currentTextRedirects.empty())
+    return;
+
+  ExitOnError exitOnErr;
+  pdb::DbiStreamBuilder &dbiBuilder = builder.getDbiBuilder();
+  llvm::pdb::DbiModuleDescriptorBuilder &mod =
+      exitOnErr(dbiBuilder.addModuleInfo("Incremental Redirects"));
+
+  SmallString<128> objPath(ctx.config.outputFile);
+  pdbMakeAbsolute(objPath);
+  sys::path::native(objPath);
+  mod.setObjFileName(objPath);
+
+  llvm::BumpPtrAllocator &bAlloc = lld::bAlloc();
+  ObjNameSym ons(SymbolRecordKind::ObjNameSym);
+  ons.Name = "Incremental Redirects";
+  ons.Signature = 0;
+  mod.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
+      ons, bAlloc, CodeViewContainer::Pdb));
+
+  Compile3Sym cs(SymbolRecordKind::Compile3Sym);
+  fillLinkerVerRecord(cs, ctx.config.machine);
+  mod.addSymbol(codeview::SymbolSerializer::writeOneSymbol(
+      cs, bAlloc, CodeViewContainer::Pdb));
+
+  bool setFirstContrib = false;
+  auto addThunkRecord = [&](StringRef name, Defined *sym) {
+    if (!sym || !sym->getChunk())
+      return;
+    OutputSection *os = ctx.getOutputSection(sym->getChunk());
+    if (!os)
+      return;
+
+    Thunk32Sym ts(SymbolRecordKind::Thunk32Sym);
+    ScopeEndSym es(SymbolRecordKind::ScopeEndSym);
+    ts.Name = name;
+    ts.Parent = 0;
+    ts.End = 0;
+    ts.Next = 0;
+    ts.Thunk = ThunkOrdinal::Standard;
+    ts.Length = sym->getChunk()->getSize();
+    ts.Segment = os->sectionIndex;
+    ts.Offset = sym->getRVA() - os->getRVA();
+
+    CVSymbol newSym = codeview::SymbolSerializer::writeOneSymbol(
+        ts, bAlloc, CodeViewContainer::Pdb);
+    ScopeRecord *scope =
+        getSymbolScopeFields(const_cast<uint8_t *>(newSym.data().data()));
+    mod.addSymbol(newSym);
+    newSym = codeview::SymbolSerializer::writeOneSymbol(
+        es, bAlloc, CodeViewContainer::Pdb);
+    scope->ptrEnd = mod.getNextSymbolOffset();
+    mod.addSymbol(newSym);
+
+    if (!setFirstContrib) {
+      pdb::SectionContrib sc =
+          createSectionContrib(ctx, sym->getChunk(), mod.getModuleIndex());
+      mod.setFirstSectionContrib(sc);
+      setFirstContrib = true;
+    }
+  };
+
+  for (const IncrementalTextRedirectState &redirect :
+       ctx.incrementalSession->currentTextRedirects) {
+    if (Defined *redirectSym =
+            ctx.incrementalSession->redirectSymbols.lookup(redirect.targetKey))
+      addThunkRecord(saver().save(redirect.canonicalSymbol + "$redirect"),
+                     redirectSym);
+    if (redirect.poolThunkRVA != 0)
+      if (Defined *poolSym =
+              ctx.incrementalSession->poolThunkSymbols.lookup(redirect.targetKey))
+        addThunkRecord(saver().save(redirect.canonicalSymbol + "$pool"),
+                       poolSym);
+  }
+}
+
 // Creates a PDB file.
 void lld::coff::createPDB(COFFLinkerContext &ctx,
                           ArrayRef<uint8_t> sectionTable,
@@ -1795,6 +1877,7 @@ void lld::coff::createPDB(COFFLinkerContext &ctx,
     pdb.initialize(buildId);
     pdb.addObjectsToPDB();
     pdb.addImportFilesToPDB();
+    pdb.addIncrementalRedirectsToPDB();
     pdb.addSections(sectionTable);
     pdb.addNatvisFiles();
     pdb.addNamedStreams();

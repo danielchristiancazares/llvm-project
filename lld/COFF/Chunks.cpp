@@ -91,6 +91,48 @@ void IncrementalPaddingChunk::writeTo(uint8_t *buf) const {
   memset(buf, fillByte, size);
 }
 
+IncrementalEntryRedirectChunkX64::IncrementalEntryRedirectChunkX64(
+    StringRef debugName, Defined *target, uint32_t slotSize, uint32_t align)
+    : NonSectionCodeChunk(IncrementalEntryRedirectKind),
+      debugName(debugName.str()), target(target), slotSize(slotSize) {
+  setAlignment(align);
+}
+
+void IncrementalEntryRedirectChunkX64::writeTo(uint8_t *buf) const {
+  memset(buf, 0xCC, slotSize);
+  if (slotSize < 5)
+    return;
+  buf[0] = 0xE9;
+  write32le(buf + 1, target->getRVA() - rva - 5);
+}
+
+bool IncrementalEntryRedirectChunkX64::verifyRanges() {
+  if (slotSize < 5)
+    return false;
+  return isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32,
+                                        rva + 1, target->getRVA());
+}
+
+IncrementalLongThunkChunkX64::IncrementalLongThunkChunkX64(StringRef debugName,
+                                                           Defined *target)
+    : NonSectionCodeChunk(IncrementalLongThunkKind),
+      debugName(debugName.str()), target(target) {
+  setAlignment(16);
+}
+
+void IncrementalLongThunkChunkX64::writeTo(uint8_t *buf) const {
+  memset(buf, 0xCC, getSize());
+  buf[0] = 0x48;
+  buf[1] = 0xB8;
+  write64le(buf + 2, target->getRVA());
+  buf[10] = 0xFF;
+  buf[11] = 0xE0;
+}
+
+void IncrementalLongThunkChunkX64::getBaserels(std::vector<Baserel> *res) {
+  res->emplace_back(getRVA() + 2, AMD64);
+}
+
 static void add16(uint8_t *p, int16_t v) { write16le(p, read16le(p) + v); }
 static void add32(uint8_t *p, int32_t v) { write32le(p, read32le(p) + v); }
 static void add64(uint8_t *p, int64_t v) { write64le(p, read64le(p) + v); }

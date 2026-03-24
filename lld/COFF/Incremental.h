@@ -22,6 +22,7 @@ namespace lld::coff {
 
 class Chunk;
 class COFFLinkerContext;
+class Defined;
 class ObjFile;
 class SectionChunk;
 
@@ -41,8 +42,16 @@ public:
   llvm::DenseMap<const SectionChunk *, llvm::ArrayRef<uint8_t>> reusedChunkData;
   llvm::StringMap<uint32_t> oldPlacementIndices;
   llvm::StringMap<uint32_t> oldEnvelopeIndices;
+  llvm::StringMap<uint32_t> oldRedirectIndices;
   llvm::DenseMap<const Chunk *, IncrementalPlacementKind> placementKinds;
   llvm::DenseSet<const Chunk *> rewrittenChunks;
+  std::vector<IncrementalEdgeState> currentEdges;
+  std::vector<IncrementalTextRedirectState> currentTextRedirects;
+  IncrementalTextThunkPoolState currentTextThunkPool;
+  llvm::StringMap<Defined *> redirectSymbols;
+  llvm::StringMap<Defined *> poolThunkSymbols;
+  llvm::StringSet<> movedTextTargets;
+  llvm::StringSet<> activeRedirectTargets;
   llvm::StringSet<> replayableArchives;
   llvm::StringSet<> expectedArchiveMembers;
   llvm::StringSet<> loadedArchiveMembers;

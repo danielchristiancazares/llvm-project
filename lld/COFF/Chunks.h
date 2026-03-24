@@ -60,6 +60,8 @@ public:
     SectionECKind,
     OtherKind,
     IncrementalPaddingKind,
+    IncrementalEntryRedirectKind,
+    IncrementalLongThunkKind,
     ImportThunkKind,
     ECExportThunkKind
   };
@@ -233,6 +235,48 @@ private:
   uint32_t chars;
   uint32_t size;
   uint8_t fillByte;
+};
+
+class IncrementalEntryRedirectChunkX64 : public NonSectionCodeChunk {
+public:
+  IncrementalEntryRedirectChunkX64(StringRef debugName, Defined *target,
+                                   uint32_t slotSize, uint32_t align);
+  static bool classof(const Chunk *c) {
+    return c->kind() == IncrementalEntryRedirectKind;
+  }
+
+  size_t getSize() const override { return slotSize; }
+  void writeTo(uint8_t *buf) const override;
+  bool verifyRanges() override;
+  MachineTypes getMachine() const override { return AMD64; }
+  StringRef getDebugName() const override { return debugName; }
+
+  Defined *getTarget() const { return target; }
+
+private:
+  std::string debugName;
+  Defined *target;
+  uint32_t slotSize;
+};
+
+class IncrementalLongThunkChunkX64 : public NonSectionCodeChunk {
+public:
+  IncrementalLongThunkChunkX64(StringRef debugName, Defined *target);
+  static bool classof(const Chunk *c) {
+    return c->kind() == IncrementalLongThunkKind;
+  }
+
+  size_t getSize() const override { return 16; }
+  void writeTo(uint8_t *buf) const override;
+  void getBaserels(std::vector<Baserel> *res) override;
+  MachineTypes getMachine() const override { return AMD64; }
+  StringRef getDebugName() const override { return debugName; }
+
+  Defined *getTarget() const { return target; }
+
+private:
+  std::string debugName;
+  Defined *target;
 };
 
 // MinGW specific; information about one individual location in the image

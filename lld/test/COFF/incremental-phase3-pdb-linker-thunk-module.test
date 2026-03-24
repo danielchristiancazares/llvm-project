@@ -1,0 +1,46 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe out.pdb %t.out && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc caller.s -o caller.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc callee1.s -o callee.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -pdb:out.pdb -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe caller.obj callee.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc callee2.s -o callee.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -pdb:out.pdb -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose caller.obj callee.obj 2>&1 | FileCheck %s --check-prefix=REUSE && \
+# RUN:   llvm-pdbutil dump out.pdb -all | FileCheck %s --check-prefix=PDB
+
+# REUSE: incremental: installed legacy redirect .text
+
+# PDB: Mod {{[0-9]+}} | `Incremental Redirects`
+# PDB: S_THUNK32
+# PDB: `callee$redirect`
+
+#--- caller.s
+.section .text,"xr",one_only,caller
+.globl caller
+caller:
+  callq callee
+  retq
+
+.section .text,"xr",one_only,main
+.globl main
+main:
+  callq caller
+  xorl %eax, %eax
+  retq
+
+#--- callee1.s
+.section .text,"xr",one_only,callee
+.globl callee
+callee:
+  movl $1, %eax
+  retq
+
+#--- callee2.s
+.section .text,"xr",one_only,callee
+.globl callee
+callee:
+  movl $2, %eax
+  .rept 32
+  nop
+  .endr
+  retq
