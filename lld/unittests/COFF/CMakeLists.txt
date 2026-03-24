@@ -1,4 +1,5 @@
 add_lld_unittests(LLDCOFFTests
+  IncrementalPDBCacheTests.cpp
   IncrementalStateTests.cpp
 )
 

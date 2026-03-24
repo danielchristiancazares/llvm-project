@@ -11,6 +11,7 @@
 
 #include "COFFLinkerContext.h"
 #include "Incremental.h"
+#include "IncrementalPDBCache.h"
 #include "Symbols.h"
 #include "llvm/BinaryFormat/COFF.h"
 
@@ -47,8 +48,13 @@ COFFLinkerContext::COFFLinkerContext()
       typeMergingTimer("Type Merging", addObjectsTimer),
       loadGHashTimer("Global Type Hashing", addObjectsTimer),
       mergeGHashTimer("GHash Type Merging", addObjectsTimer),
+      pdbCacheLoadTimer("Load Incremental PDB Cache", addObjectsTimer),
+      pdbCacheValidateTimer("Validate Incremental PDB Cache", addObjectsTimer),
+      pdbTypeCacheReplayTimer("Replay Incremental Type Cache", addObjectsTimer),
       symbolMergingTimer("Symbol Merging", addObjectsTimer),
       handleDebugSTimer("Handle .debug$S", symbolMergingTimer),
+      pdbModulePlanReplayTimer("Replay Incremental Module Plans",
+                               symbolMergingTimer),
       globalSymbolRecordWriteTimer("Rewrite Global Symbols",
                                    handleDebugSTimer),
       globalSymbolRelocateTimer("Relocate Global Symbols",
@@ -60,6 +66,7 @@ COFFLinkerContext::COFFLinkerContext()
       publicsLayoutTimer("Publics Stream Layout", totalPdbLinkTimer),
       tpiStreamLayoutTimer("TPI Stream Layout", totalPdbLinkTimer),
       diskCommitTimer("Commit to Disk", totalPdbLinkTimer),
+      pdbCacheStoreTimer("Store Incremental PDB Cache", totalPdbLinkTimer),
       commitModuleSymbolsTimer("Commit Module Symbols", diskCommitTimer),
       moduleSymbolRecordWriteTimer("Rewrite Module Symbols",
                                    commitModuleSymbolsTimer),

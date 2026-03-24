@@ -1,0 +1,19 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.llpdbcache %t.exe %t.pdb %t.out && \
+# RUN:   llvm-as main.ll -o main.bc && \
+# RUN:   lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.bc > %t.out 2>&1 && \
+# RUN:   %python -c "import pathlib; print(pathlib.Path(r'%t.llpdbcache').is_file())" >> %t.out && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: incremental: fallback: LtoInput
+# CHECK: False
+
+#--- main.ll
+target triple = "x86_64-pc-windows-msvc"
+target datalayout = "e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n8:16:32:64-S128"
+
+define i32 @main() {
+entry:
+  ret i32 0
+}

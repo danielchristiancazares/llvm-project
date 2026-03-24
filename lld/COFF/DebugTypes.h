@@ -9,6 +9,7 @@
 #ifndef LLD_COFF_DEBUGTYPES_H
 #define LLD_COFF_DEBUGTYPES_H
 
+#include "IncrementalPDBCache.h"
 #include "lld/Common/LLVM.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
@@ -95,6 +96,9 @@ protected:
 
 public:
   bool remapTypesInSymbolRecord(MutableArrayRef<uint8_t> rec);
+  bool remapTypesInSymbolRecord(
+      MutableArrayRef<uint8_t> rec,
+      ArrayRef<llvm::codeview::TiReference> typeRefs);
 
   void remapTypesInTypeRecord(MutableArrayRef<uint8_t> rec);
 
@@ -171,6 +175,14 @@ TpiSource *makeUseTypeServerSource(COFFLinkerContext &ctx, ObjFile *file,
 TpiSource *makePrecompSource(COFFLinkerContext &ctx, ObjFile *file);
 TpiSource *makeUsePrecompSource(COFFLinkerContext &ctx, ObjFile *file,
                                 llvm::codeview::PrecompRecord ts);
+
+std::string getIncrementalPDBTypeCacheKey(const TpiSource &source);
+bool matchesIncrementalPDBTypeCacheEntry(
+    const TpiSource &source, const IncrementalPDBTypeCacheEntry &entry);
+bool buildIncrementalPDBTypeCacheEntry(const TpiSource &source,
+                                       IncrementalPDBTypeCacheEntry &entry);
+bool restoreIncrementalPDBTypeCacheEntry(
+    const IncrementalPDBTypeCacheEntry &entry, TpiSource &source);
 
 } // namespace lld::coff
 

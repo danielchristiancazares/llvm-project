@@ -13,6 +13,7 @@
 #include "DebugTypes.h"
 #include "Driver.h"
 #include "Incremental.h"
+#include "IncrementalPDBCache.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
 #include "TypeMerger.h"
@@ -175,7 +176,10 @@ public:
                                uint32_t &moduleSymOffset,
                                uint32_t &nextRelocIndex,
                                std::vector<StringTableFixup> &stringTableFixups,
-                               BinaryStreamRef symData);
+                               BinaryStreamRef symData,
+                               IncrementalPDBModuleCacheEntry *modulePlan,
+                               IncrementalPDBSubsectionPlan *subsectionPlan,
+                               bool *cachePlanValid);
 
   // Write all module symbols from all live debug symbol subsections of the
   // given object file into the given stream writer.
@@ -198,10 +202,15 @@ public:
   void addSections(ArrayRef<uint8_t> sectionTable);
 
   /// Write the PDB to disk and store the Guid generated for it in *Guid.
-  void commit(codeview::GUID *guid);
+  bool commit(codeview::GUID *guid);
 
   // Collect some statistics regarding the final PDB
   void collectStats();
+
+  const DenseMap<const ObjFile *, IncrementalPDBModuleCacheEntry> &
+  getModulePlans() const {
+    return modulePlans;
+  }
 
 private:
   void pdbMakeAbsolute(SmallVectorImpl<char> &fileName);
@@ -210,6 +219,22 @@ private:
                                  TiRefKind refKind);
   void translateIdSymbols(MutableArrayRef<uint8_t> &recordData,
                           TpiSource *source, TypeIndex *procIdType = nullptr);
+  ArrayRef<IncrementalPDBTypeRef>
+  getCachedTypeRefs(const IncrementalPDBModuleCacheEntry &modulePlan,
+                    const IncrementalPDBSymbolPlan &symbolPlan) const;
+  void writeSymbolRecordFromPlan(
+      SectionChunk *debugChunk, ArrayRef<uint8_t> sectionContents,
+      ArrayRef<uint8_t> rawRecord, const IncrementalPDBSymbolPlan &symbolPlan,
+      ArrayRef<IncrementalPDBTypeRef> typeRefs,
+      const SymbolRecordRewriteTimers &timers,
+      SmallVectorImpl<uint8_t> &storage);
+  bool validateCachedModulePlan(
+      ObjFile &file, const IncrementalPDBModuleCacheEntry &modulePlan) const;
+  void replayCachedSymbolSubsection(
+      ObjFile &file, SectionChunk *debugChunk,
+      const IncrementalPDBModuleCacheEntry &modulePlan,
+      const IncrementalPDBSubsectionPlan &subsectionPlan,
+      uint32_t &moduleSymOffset);
   void addCommonLinkerModuleSymbols(StringRef path,
                                     pdb::DbiModuleDescriptorBuilder &mod);
 
@@ -222,6 +247,7 @@ private:
   /// PDBs use a single global string table for filenames in the file checksum
   /// table.
   DebugStringTableSubsection pdbStrTab;
+  DenseMap<const ObjFile *, IncrementalPDBModuleCacheEntry> modulePlans;
 
   llvm::SmallString<128> nativePath;
 };
@@ -274,22 +300,29 @@ class DebugSHandler {
   /// Next relocation index in the current .debug$S section. Resets every
   /// handleDebugS call.
   uint32_t nextRelocIndex = 0;
+  const IncrementalPDBModuleCacheEntry *cachedPlan = nullptr;
+  IncrementalPDBModuleCacheEntry *recordedPlan = nullptr;
+  bool cachePlanValid = true;
 
   void advanceRelocIndex(SectionChunk *debugChunk, ArrayRef<uint8_t> subsec);
 
-  void addUnrelocatedSubsection(SectionChunk *debugChunk,
-                                const DebugSubsectionRecord &ss);
-
-  void addFrameDataSubsection(SectionChunk *debugChunk,
-                              const DebugSubsectionRecord &ss);
-
 public:
-  DebugSHandler(COFFLinkerContext &ctx, PDBLinker &linker, ObjFile &file)
-      : ctx(ctx), linker(linker), file(file) {}
+  DebugSHandler(COFFLinkerContext &ctx, PDBLinker &linker, ObjFile &file,
+                const IncrementalPDBModuleCacheEntry *cachedPlan,
+                IncrementalPDBModuleCacheEntry *recordedPlan)
+      : ctx(ctx), linker(linker), file(file), cachedPlan(cachedPlan),
+        recordedPlan(recordedPlan) {
+    if (cachedPlan) {
+      stringTableFixups.reserve(cachedPlan->stringFixups.size());
+      for (const IncrementalPDBStringFixup &fixup : cachedPlan->stringFixups)
+        stringTableFixups.push_back({fixup.strTabOffset, fixup.symOffsetOfReference});
+    }
+  }
 
-  void handleDebugS(SectionChunk *debugChunk);
+  void handleDebugS(SectionChunk *debugChunk, uint32_t chunkOrdinal);
 
   void finish();
+  bool shouldCachePlan() const { return cachePlanValid; }
 };
 }
 
@@ -680,6 +713,73 @@ static void replaceWithSkipRecord(MutableArrayRef<uint8_t> recordBytes) {
   prefix->RecordLen = recordBytes.size() - 2;
 }
 
+ArrayRef<IncrementalPDBTypeRef> PDBLinker::getCachedTypeRefs(
+    const IncrementalPDBModuleCacheEntry &modulePlan,
+    const IncrementalPDBSymbolPlan &symbolPlan) const {
+  if (symbolPlan.typeRefCount == 0)
+    return {};
+  return ArrayRef(modulePlan.typeRefs)
+      .slice(symbolPlan.typeRefStart, symbolPlan.typeRefCount);
+}
+
+void PDBLinker::writeSymbolRecordFromPlan(
+    SectionChunk *debugChunk, ArrayRef<uint8_t> sectionContents,
+    ArrayRef<uint8_t> rawRecord, const IncrementalPDBSymbolPlan &symbolPlan,
+    ArrayRef<IncrementalPDBTypeRef> typeRefs,
+    const SymbolRecordRewriteTimers &timers, SmallVectorImpl<uint8_t> &storage) {
+  ScopedTimer totalTimer(timers.total);
+
+  storage.resize_for_overwrite(storage.size() + symbolPlan.alignedLength);
+  MutableArrayRef<uint8_t> recordBytes =
+      MutableArrayRef<uint8_t>(storage).take_back(symbolPlan.alignedLength);
+
+  {
+    ScopedTimer t(timers.relocate);
+    uint32_t relocIndex = symbolPlan.relocIndex;
+    debugChunk->writeAndRelocateSubsection(sectionContents, rawRecord, relocIndex,
+                                           recordBytes.data());
+    fixRecordAlignment(recordBytes, rawRecord.size());
+  }
+
+  TpiSource *source = debugChunk->file->debugTypesObj;
+  switch (static_cast<SymbolRewriteKind>(symbolPlan.rewriteKind)) {
+  case SymbolRewriteKind::NoTypeRefs:
+    break;
+  case SymbolRewriteKind::ProcIdEndOnly: {
+    ScopedTimer t(timers.idTranslation);
+    translateIdSymbols(recordBytes, source);
+    break;
+  }
+  case SymbolRewriteKind::ProcIdFixedIndex: {
+    TypeIndex *procIdType = nullptr;
+    {
+      ScopedTimer t(timers.typeRemap);
+      procIdType = &remapFixedTypeIndex(recordBytes, source, procIdTypeRefOffset,
+                                        TiRefKind::IndexRef);
+    }
+    {
+      ScopedTimer t(timers.idTranslation);
+      translateIdSymbols(recordBytes, source, procIdType);
+    }
+    break;
+  }
+  case SymbolRewriteKind::Generic: {
+    SmallVector<TiReference, 8> refs;
+    refs.reserve(typeRefs.size());
+    for (const IncrementalPDBTypeRef &ref : typeRefs)
+      refs.push_back({ref.kind, ref.offset, ref.count});
+
+    ScopedTimer t(timers.typeRemap);
+    if (!source->remapTypesInSymbolRecord(recordBytes, refs)) {
+      Log(ctx) << "ignoring unknown symbol record with kind 0x"
+               << utohexstr(symbolKind(rawRecord));
+      replaceWithSkipRecord(recordBytes);
+    }
+    break;
+  }
+  }
+}
+
 // Copy the symbol record, relocate it, and fix the alignment if necessary.
 // Rewrite type indices in the record. Replace unrecognized symbol records with
 // S_SKIP records.
@@ -746,9 +846,14 @@ void PDBLinker::writeSymbolRecord(SectionChunk *debugChunk,
 void PDBLinker::analyzeSymbolSubsection(
     SectionChunk *debugChunk, uint32_t &moduleSymOffset,
     uint32_t &nextRelocIndex, std::vector<StringTableFixup> &stringTableFixups,
-    BinaryStreamRef symData) {
+    BinaryStreamRef symData, IncrementalPDBModuleCacheEntry *modulePlan,
+    IncrementalPDBSubsectionPlan *subsectionPlan, bool *cachePlanValid) {
   ObjFile *file = debugChunk->file;
   uint32_t moduleSymStart = moduleSymOffset;
+  size_t modulePlanSymbolStart = modulePlan ? modulePlan->symbolPlans.size() : 0;
+  size_t modulePlanTypeRefStart = modulePlan ? modulePlan->typeRefs.size() : 0;
+  size_t modulePlanFixupStart =
+      modulePlan ? modulePlan->stringFixups.size() : 0;
   const auto rewriteTimers =
       getSymbolRecordRewriteTimers(ctx, SymbolRecordWritePhase::Global);
 
@@ -765,13 +870,57 @@ void PDBLinker::analyzeSymbolSubsection(
   Error ec = forEachCodeViewRecord<CVSymbol>(
       symsBuffer, [&](CVSymbol sym) -> llvm::Error {
         // Track the current scope.
+        IncrementalPDBScopeAction scopeAction = IncrementalPDBScopeAction::None;
         if (symbolOpensScope(sym.kind()))
-          ++scopeLevel;
+          scopeAction = IncrementalPDBScopeAction::Open;
         else if (symbolEndsScope(sym.kind()))
+          scopeAction = IncrementalPDBScopeAction::Close;
+
+        if (scopeAction == IncrementalPDBScopeAction::Open)
+          ++scopeLevel;
+        else if (scopeAction == IncrementalPDBScopeAction::Close)
           --scopeLevel;
 
         uint32_t alignedSize =
             alignTo(sym.length(), alignOf(CodeViewContainer::Pdb));
+        uint32_t recordRelocIndex = nextRelocIndex;
+        uint8_t destMask = 0;
+        if (symbolGoesInGlobalsStream(sym, scopeLevel))
+          destMask |= IncrementalPDBGoesToGlobals;
+        if (symbolGoesInModuleStream(sym, scopeLevel))
+          destMask |= IncrementalPDBGoesToModule;
+
+        if (modulePlan) {
+          IncrementalPDBSymbolPlan symbolPlan;
+          symbolPlan.recordOffset =
+              sym.data().data() - sectionContents.data();
+          symbolPlan.recordLength = sym.length();
+          symbolPlan.alignedLength = alignedSize;
+          symbolPlan.relocIndex = recordRelocIndex;
+          symbolPlan.destMask = destMask;
+          symbolPlan.flags = symbolUsesGlobalProcRef(sym)
+                                 ? IncrementalPDBUsesGlobalProcRef
+                                 : 0;
+          symbolPlan.rewriteKind = uint8_t(classifySymbolRewrite(sym.kind()));
+          symbolPlan.scopeAction = scopeAction;
+          symbolPlan.typeRefStart = modulePlan->typeRefs.size();
+
+          if (static_cast<SymbolRewriteKind>(symbolPlan.rewriteKind) ==
+              SymbolRewriteKind::Generic) {
+            SmallVector<TiReference, 8> refs;
+            if (!discoverTypeIndicesInSymbol(sym, refs))
+              *cachePlanValid = false;
+            else
+              for (const TiReference &ref : refs)
+                modulePlan->typeRefs.push_back({ref.Kind, ref.Offset, ref.Count});
+          }
+
+          symbolPlan.typeRefCount =
+              modulePlan->typeRefs.size() - symbolPlan.typeRefStart;
+          modulePlan->symbolPlans.push_back(symbolPlan);
+          if (subsectionPlan)
+            ++subsectionPlan->symbolPlanCount;
+        }
 
         // Copy global records. Some global records (mainly procedures)
         // reference the current offset into the module stream.
@@ -799,7 +948,15 @@ void PDBLinker::analyzeSymbolSubsection(
         // references. There are very few of these and they will be rewritten
         // later during PDB writing.
         if (symbolGoesInModuleStream(sym, scopeLevel)) {
+          size_t fixupStart = stringTableFixups.size();
           recordStringTableReferences(sym, moduleSymOffset, stringTableFixups);
+          if (modulePlan) {
+            for (size_t i = fixupStart; i < stringTableFixups.size(); ++i) {
+              const StringTableFixup &fixup = stringTableFixups[i];
+              modulePlan->stringFixups.push_back({fixup.StrTabOffset,
+                                                  fixup.SymOffsetOfReference});
+            }
+          }
           moduleSymOffset += alignedSize;
 
           if (ctx.pdbStats.has_value())
@@ -815,25 +972,209 @@ void PDBLinker::analyzeSymbolSubsection(
   if (ec) {
     Warn(ctx) << "corrupt symbol records in " << file->getName();
     moduleSymOffset = moduleSymStart;
+    if (modulePlan && subsectionPlan) {
+      modulePlan->symbolPlans.resize(modulePlanSymbolStart);
+      modulePlan->typeRefs.resize(modulePlanTypeRefStart);
+      modulePlan->stringFixups.resize(modulePlanFixupStart);
+      subsectionPlan->symbolPlanCount = 0;
+    }
     consumeError(std::move(ec));
+  }
+}
+
+bool PDBLinker::validateCachedModulePlan(
+    ObjFile &file, const IncrementalPDBModuleCacheEntry &modulePlan) const {
+  ArrayRef<SectionChunk *> debugChunks = file.getDebugChunks();
+  SmallVector<bool, 8> seenDebugS(debugChunks.size(), false);
+  size_t liveDebugSCount = 0;
+  for (SectionChunk *debugChunk : debugChunks) {
+    if (debugChunk->live && debugChunk->getSize() != 0 &&
+        debugChunk->getSectionName() == ".debug$S")
+      ++liveDebugSCount;
+  }
+
+  size_t cachedDebugSCount = 0;
+  for (const IncrementalPDBChunkPlan &chunkPlan : modulePlan.chunkPlans) {
+    if (chunkPlan.kind != IncrementalPDBDebugChunkKind::DebugS)
+      return false;
+    if (chunkPlan.chunkOrdinal >= debugChunks.size())
+      return false;
+
+    SectionChunk *debugChunk = debugChunks[chunkPlan.chunkOrdinal];
+    if (!debugChunk->live || debugChunk->getSize() == 0 ||
+        debugChunk->getSectionName() != ".debug$S")
+      return false;
+    if (seenDebugS[chunkPlan.chunkOrdinal])
+      return false;
+    seenDebugS[chunkPlan.chunkOrdinal] = true;
+    ++cachedDebugSCount;
+
+    if (chunkPlan.subsectionStart > modulePlan.subsectionPlans.size() ||
+        modulePlan.subsectionPlans.size() - chunkPlan.subsectionStart <
+            chunkPlan.subsectionCount)
+      return false;
+
+    ArrayRef<uint8_t> contents = debugChunk->getContents();
+    for (const IncrementalPDBSubsectionPlan &subsectionPlan :
+         ArrayRef(modulePlan.subsectionPlans)
+             .slice(chunkPlan.subsectionStart, chunkPlan.subsectionCount)) {
+      if (subsectionPlan.recordOffset > contents.size() ||
+          contents.size() - subsectionPlan.recordOffset <
+              subsectionPlan.recordLength)
+        return false;
+
+      if (subsectionPlan.kind != DebugSubsectionKind::Symbols) {
+        if (subsectionPlan.symbolPlanCount != 0)
+          return false;
+        continue;
+      }
+
+      if (subsectionPlan.symbolPlanStart > modulePlan.symbolPlans.size() ||
+          modulePlan.symbolPlans.size() - subsectionPlan.symbolPlanStart <
+              subsectionPlan.symbolPlanCount)
+        return false;
+
+      for (const IncrementalPDBSymbolPlan &symbolPlan :
+           ArrayRef(modulePlan.symbolPlans)
+               .slice(subsectionPlan.symbolPlanStart,
+                      subsectionPlan.symbolPlanCount)) {
+        if (symbolPlan.recordOffset > contents.size() ||
+            contents.size() - symbolPlan.recordOffset < symbolPlan.recordLength)
+          return false;
+        if (symbolPlan.recordLength < sizeof(RecordPrefix) ||
+            symbolPlan.alignedLength !=
+                alignTo(symbolPlan.recordLength,
+                        alignOf(CodeViewContainer::Pdb)))
+          return false;
+        if (symbolPlan.typeRefStart > modulePlan.typeRefs.size() ||
+            modulePlan.typeRefs.size() - symbolPlan.typeRefStart <
+                symbolPlan.typeRefCount)
+          return false;
+
+        uint32_t maxContentOffset =
+            symbolPlan.recordLength - sizeof(RecordPrefix);
+        for (const IncrementalPDBTypeRef &typeRef :
+             getCachedTypeRefs(modulePlan, symbolPlan)) {
+          if (typeRef.count > UINT32_MAX / sizeof(TypeIndex))
+            return false;
+          if (typeRef.offset > maxContentOffset ||
+              maxContentOffset - typeRef.offset <
+                  typeRef.count * sizeof(TypeIndex))
+            return false;
+        }
+      }
+    }
+  }
+
+  return cachedDebugSCount == liveDebugSCount;
+}
+
+void PDBLinker::replayCachedSymbolSubsection(
+    ObjFile &file, SectionChunk *debugChunk,
+    const IncrementalPDBModuleCacheEntry &modulePlan,
+    const IncrementalPDBSubsectionPlan &subsectionPlan,
+    uint32_t &moduleSymOffset) {
+  const auto rewriteTimers =
+      getSymbolRecordRewriteTimers(ctx, SymbolRecordWritePhase::Global);
+  SmallVector<uint8_t, 0> storage;
+  ArrayRef<uint8_t> sectionContents = debugChunk->getContents();
+
+  for (const IncrementalPDBSymbolPlan &symbolPlan :
+       ArrayRef(modulePlan.symbolPlans)
+           .slice(subsectionPlan.symbolPlanStart, subsectionPlan.symbolPlanCount)) {
+    ArrayRef<uint8_t> rawRecord =
+        sectionContents.slice(symbolPlan.recordOffset, symbolPlan.recordLength);
+    CVSymbol sym(rawRecord);
+
+    if (symbolPlan.destMask & IncrementalPDBGoesToGlobals) {
+      if (symbolPlan.flags & IncrementalPDBUsesGlobalProcRef) {
+        addGlobalProcRefSymbol(builder.getGsiBuilder(),
+                               file.moduleDBI->getModuleIndex(),
+                               moduleSymOffset, sym);
+      } else {
+        storage.clear();
+        writeSymbolRecordFromPlan(debugChunk, sectionContents, rawRecord,
+                                  symbolPlan, getCachedTypeRefs(modulePlan, symbolPlan),
+                                  rewriteTimers, storage);
+        addGlobalSymbol(builder.getGsiBuilder(), file.moduleDBI->getModuleIndex(),
+                        moduleSymOffset, storage);
+      }
+
+      if (ctx.pdbStats.has_value())
+        ++ctx.pdbStats->globalSymbols;
+    }
+
+    if (symbolPlan.destMask & IncrementalPDBGoesToModule) {
+      moduleSymOffset += symbolPlan.alignedLength;
+
+      if (ctx.pdbStats.has_value())
+        ++ctx.pdbStats->moduleSymbols;
+    }
   }
 }
 
 Error PDBLinker::writeAllModuleSymbolRecords(ObjFile *file,
                                              BinaryStreamWriter &writer) {
   ScopedTimer t(ctx.commitModuleSymbolsTimer);
-  ExitOnError exitOnErr;
   SmallVector<uint8_t, 0> storage;
   SmallVector<uint32_t, 4> scopes;
   const auto rewriteTimers =
       getSymbolRecordRewriteTimers(ctx, SymbolRecordWritePhase::Module);
+  auto modulePlanIt = modulePlans.find(file);
+  const IncrementalPDBModuleCacheEntry *modulePlan =
+      modulePlanIt == modulePlans.end() ? nullptr : &modulePlanIt->second;
 
   // Visit all live .debug$S sections a second time, and write them to the PDB.
-  for (SectionChunk *debugChunk : file->getDebugChunks()) {
+  for (size_t chunkOrdinal = 0; chunkOrdinal < file->getDebugChunks().size();
+       ++chunkOrdinal) {
+    SectionChunk *debugChunk = file->getDebugChunks()[chunkOrdinal];
     if (!debugChunk->live || debugChunk->getSize() == 0 ||
         debugChunk->getSectionName() != ".debug$S")
       continue;
 
+    if (modulePlan) {
+      for (const IncrementalPDBChunkPlan &chunkPlan : modulePlan->chunkPlans) {
+        if (chunkPlan.kind != IncrementalPDBDebugChunkKind::DebugS ||
+            chunkPlan.chunkOrdinal != chunkOrdinal)
+          continue;
+
+        for (const IncrementalPDBSubsectionPlan &subsectionPlan :
+             ArrayRef(modulePlan->subsectionPlans)
+                 .slice(chunkPlan.subsectionStart, chunkPlan.subsectionCount)) {
+          if (subsectionPlan.kind != DebugSubsectionKind::Symbols)
+            continue;
+
+          uint32_t moduleSymStart = writer.getOffset();
+          scopes.clear();
+          storage.clear();
+          for (const IncrementalPDBSymbolPlan &symbolPlan :
+               ArrayRef(modulePlan->symbolPlans)
+                   .slice(subsectionPlan.symbolPlanStart,
+                          subsectionPlan.symbolPlanCount)) {
+            if (symbolPlan.scopeAction == IncrementalPDBScopeAction::Open)
+              scopeStackOpen(scopes, storage);
+            else if (symbolPlan.scopeAction == IncrementalPDBScopeAction::Close)
+              scopeStackClose(ctx, scopes, storage, moduleSymStart, file);
+
+            if (!(symbolPlan.destMask & IncrementalPDBGoesToModule))
+              continue;
+
+            ArrayRef<uint8_t> rawRecord = debugChunk->getContents().slice(
+                symbolPlan.recordOffset, symbolPlan.recordLength);
+            writeSymbolRecordFromPlan(debugChunk, debugChunk->getContents(),
+                                      rawRecord, symbolPlan,
+                                      getCachedTypeRefs(*modulePlan, symbolPlan),
+                                      rewriteTimers, storage);
+          }
+
+          if (Error e = writer.writeBytes(storage))
+            return e;
+        }
+      }
+      continue;
+    }
+
+    ExitOnError exitOnErr;
     ArrayRef<uint8_t> sectionContents = debugChunk->getContents();
     auto contents =
         SectionChunk::consumeDebugMagic(sectionContents, ".debug$S");
@@ -854,14 +1195,11 @@ Error PDBLinker::writeAllModuleSymbolRecords(ObjFile *file,
       cantFail(sr.readBytes(0, sr.getLength(), symsBuffer));
       auto ec = forEachCodeViewRecord<CVSymbol>(
           symsBuffer, [&](CVSymbol sym) -> llvm::Error {
-            // Track the current scope. Only update records in the postmerge
-            // pass.
             if (symbolOpensScope(sym.kind()))
               scopeStackOpen(scopes, storage);
             else if (symbolEndsScope(sym.kind()))
               scopeStackClose(ctx, scopes, storage, moduleSymStart, file);
 
-            // Copy, relocate, and rewrite each module symbol.
             if (symbolGoesInModuleStream(sym, scopes.size())) {
               uint32_t alignedSize =
                   alignTo(sym.length(), alignOf(CodeViewContainer::Pdb));
@@ -871,17 +1209,11 @@ Error PDBLinker::writeAllModuleSymbolRecords(ObjFile *file,
             return Error::success();
           });
 
-      // If we encounter corrupt records in the second pass, ignore them. We
-      // already warned about them in the first analysis pass.
       if (ec) {
         consumeError(std::move(ec));
         storage.clear();
       }
 
-      // Writing bytes has a very high overhead, so write the entire subsection
-      // at once.
-      // TODO: Consider buffering symbols for the entire object file to reduce
-      // overhead even further.
       if (Error e = writer.writeBytes(storage))
         return e;
     }
@@ -934,92 +1266,6 @@ translateStringTableIndex(COFFLinkerContext &ctx, uint32_t objIndex,
   return pdbStrTable.insert(*expectedString);
 }
 
-void DebugSHandler::handleDebugS(SectionChunk *debugChunk) {
-  // Note that we are processing the *unrelocated* section contents. They will
-  // be relocated later during PDB writing.
-  ArrayRef<uint8_t> contents = debugChunk->getContents();
-  contents = SectionChunk::consumeDebugMagic(contents, ".debug$S");
-  DebugSubsectionArray subsections;
-  BinaryStreamReader reader(contents, llvm::endianness::little);
-  ExitOnError exitOnErr;
-  exitOnErr(reader.readArray(subsections, contents.size()));
-  debugChunk->sortRelocations();
-
-  // Reset the relocation index, since this is a new section.
-  nextRelocIndex = 0;
-
-  for (const DebugSubsectionRecord &ss : subsections) {
-    // Ignore subsections with the 'ignore' bit. Some versions of the Visual C++
-    // runtime have subsections with this bit set.
-    if (uint32_t(ss.kind()) & codeview::SubsectionIgnoreFlag)
-      continue;
-
-    switch (ss.kind()) {
-    case DebugSubsectionKind::StringTable: {
-      assert(!cvStrTab.valid() &&
-             "Encountered multiple string table subsections!");
-      exitOnErr(cvStrTab.initialize(ss.getRecordData()));
-      break;
-    }
-    case DebugSubsectionKind::FileChecksums:
-      assert(!checksums.valid() &&
-             "Encountered multiple checksum subsections!");
-      exitOnErr(checksums.initialize(ss.getRecordData()));
-      break;
-    case DebugSubsectionKind::Lines:
-    case DebugSubsectionKind::InlineeLines:
-      addUnrelocatedSubsection(debugChunk, ss);
-      break;
-    case DebugSubsectionKind::FrameData:
-      addFrameDataSubsection(debugChunk, ss);
-      break;
-    case DebugSubsectionKind::Symbols:
-      linker.analyzeSymbolSubsection(debugChunk, moduleStreamSize,
-                                     nextRelocIndex, stringTableFixups,
-                                     ss.getRecordData());
-      break;
-
-    case DebugSubsectionKind::CrossScopeImports:
-    case DebugSubsectionKind::CrossScopeExports:
-      // These appear to relate to cross-module optimization, so we might use
-      // these for ThinLTO.
-      break;
-
-    case DebugSubsectionKind::ILLines:
-    case DebugSubsectionKind::FuncMDTokenMap:
-    case DebugSubsectionKind::TypeMDTokenMap:
-    case DebugSubsectionKind::MergedAssemblyInput:
-      // These appear to relate to .Net assembly info.
-      break;
-
-    case DebugSubsectionKind::CoffSymbolRVA:
-      // Unclear what this is for.
-      break;
-
-    case DebugSubsectionKind::XfgHashType:
-    case DebugSubsectionKind::XfgHashVirtual:
-      break;
-
-    default:
-      Warn(ctx) << "ignoring unknown debug$S subsection kind 0x"
-                << utohexstr(uint32_t(ss.kind())) << " in file "
-                << toString(&file);
-      break;
-    }
-  }
-}
-
-void DebugSHandler::advanceRelocIndex(SectionChunk *sc,
-                                      ArrayRef<uint8_t> subsec) {
-  ptrdiff_t vaBegin = subsec.data() - sc->getContents().data();
-  assert(vaBegin > 0);
-  auto relocs = sc->getRelocs();
-  for (; nextRelocIndex < relocs.size(); ++nextRelocIndex) {
-    if (relocs[nextRelocIndex].VirtualAddress >= (uint32_t)vaBegin)
-      break;
-  }
-}
-
 namespace {
 /// Wrapper class for unrelocated line and inlinee line subsections, which
 /// require only relocation and type index remapping to add to the PDB.
@@ -1038,6 +1284,164 @@ public:
   uint32_t relocIndex;
 };
 } // namespace
+
+void DebugSHandler::handleDebugS(SectionChunk *debugChunk, uint32_t chunkOrdinal) {
+  if (cachedPlan) {
+    ScopedTimer replayTimer(ctx.pdbModulePlanReplayTimer);
+    for (const IncrementalPDBChunkPlan &chunkPlan : cachedPlan->chunkPlans) {
+      if (chunkPlan.kind != IncrementalPDBDebugChunkKind::DebugS ||
+          chunkPlan.chunkOrdinal != chunkOrdinal)
+        continue;
+
+      for (const IncrementalPDBSubsectionPlan &subsectionPlan :
+           ArrayRef(cachedPlan->subsectionPlans)
+               .slice(chunkPlan.subsectionStart, chunkPlan.subsectionCount)) {
+        ArrayRef<uint8_t> subsec =
+            debugChunk->getContents().slice(subsectionPlan.recordOffset,
+                                            subsectionPlan.recordLength);
+        BinaryStreamRef subsecStream(subsec, llvm::endianness::little);
+        ExitOnError exitOnErr;
+
+        switch (subsectionPlan.kind) {
+        case DebugSubsectionKind::StringTable:
+          assert(!cvStrTab.valid() &&
+                 "Encountered multiple string table subsections!");
+          exitOnErr(cvStrTab.initialize(subsecStream));
+          break;
+        case DebugSubsectionKind::FileChecksums:
+          assert(!checksums.valid() &&
+                 "Encountered multiple checksum subsections!");
+          exitOnErr(checksums.initialize(subsecStream));
+          break;
+        case DebugSubsectionKind::Lines:
+        case DebugSubsectionKind::InlineeLines:
+          file.moduleDBI->addDebugSubsection(
+              std::make_shared<UnrelocatedDebugSubsection>(
+                  subsectionPlan.kind, debugChunk, subsec,
+                  subsectionPlan.relocIndex));
+          break;
+        case DebugSubsectionKind::FrameData:
+          frameDataSubsecs.push_back(
+              {debugChunk, subsec, subsectionPlan.relocIndex});
+          break;
+        case DebugSubsectionKind::Symbols:
+          linker.replayCachedSymbolSubsection(file, debugChunk, *cachedPlan,
+                                              subsectionPlan, moduleStreamSize);
+          break;
+        default:
+          break;
+        }
+      }
+      return;
+    }
+
+    cachePlanValid = false;
+    stringTableFixups.clear();
+  }
+
+  // Note that we are processing the *unrelocated* section contents. They will
+  // be relocated later during PDB writing.
+  ArrayRef<uint8_t> contents = debugChunk->getContents();
+  ArrayRef<uint8_t> debugSContents =
+      SectionChunk::consumeDebugMagic(contents, ".debug$S");
+  DebugSubsectionArray subsections;
+  BinaryStreamReader reader(debugSContents, llvm::endianness::little);
+  ExitOnError exitOnErr;
+  exitOnErr(reader.readArray(subsections, debugSContents.size()));
+  debugChunk->sortRelocations();
+
+  IncrementalPDBChunkPlan *chunkPlan = nullptr;
+  if (recordedPlan) {
+    chunkPlan = &recordedPlan->chunkPlans.emplace_back();
+    chunkPlan->chunkOrdinal = chunkOrdinal;
+    chunkPlan->kind = IncrementalPDBDebugChunkKind::DebugS;
+    chunkPlan->subsectionStart = recordedPlan->subsectionPlans.size();
+  }
+
+  nextRelocIndex = 0;
+  for (const DebugSubsectionRecord &ss : subsections) {
+    if (uint32_t(ss.kind()) & codeview::SubsectionIgnoreFlag)
+      continue;
+
+    ArrayRef<uint8_t> subsec;
+    BinaryStreamRef sr = ss.getRecordData();
+    cantFail(sr.readBytes(0, sr.getLength(), subsec));
+    advanceRelocIndex(debugChunk, subsec);
+
+    IncrementalPDBSubsectionPlan *subsectionPlan = nullptr;
+    if (recordedPlan) {
+      subsectionPlan = &recordedPlan->subsectionPlans.emplace_back();
+      subsectionPlan->kind = ss.kind();
+      subsectionPlan->recordOffset = subsec.data() - contents.data();
+      subsectionPlan->recordLength = subsec.size();
+      subsectionPlan->relocIndex = nextRelocIndex;
+      subsectionPlan->symbolPlanStart = recordedPlan->symbolPlans.size();
+    }
+
+    switch (ss.kind()) {
+    case DebugSubsectionKind::StringTable:
+      assert(!cvStrTab.valid() &&
+             "Encountered multiple string table subsections!");
+      exitOnErr(cvStrTab.initialize(sr));
+      break;
+    case DebugSubsectionKind::FileChecksums:
+      assert(!checksums.valid() &&
+             "Encountered multiple checksum subsections!");
+      exitOnErr(checksums.initialize(sr));
+      break;
+    case DebugSubsectionKind::Lines:
+    case DebugSubsectionKind::InlineeLines:
+      file.moduleDBI->addDebugSubsection(
+          std::make_shared<UnrelocatedDebugSubsection>(ss.kind(), debugChunk,
+                                                       subsec, nextRelocIndex));
+      break;
+    case DebugSubsectionKind::FrameData:
+      frameDataSubsecs.push_back({debugChunk, subsec, nextRelocIndex});
+      break;
+    case DebugSubsectionKind::Symbols:
+      linker.analyzeSymbolSubsection(debugChunk, moduleStreamSize,
+                                     nextRelocIndex, stringTableFixups, sr,
+                                     recordedPlan, subsectionPlan,
+                                     &cachePlanValid);
+      break;
+    case DebugSubsectionKind::CrossScopeImports:
+    case DebugSubsectionKind::CrossScopeExports:
+    case DebugSubsectionKind::ILLines:
+    case DebugSubsectionKind::FuncMDTokenMap:
+    case DebugSubsectionKind::TypeMDTokenMap:
+    case DebugSubsectionKind::MergedAssemblyInput:
+    case DebugSubsectionKind::CoffSymbolRVA:
+    case DebugSubsectionKind::XfgHashType:
+    case DebugSubsectionKind::XfgHashVirtual:
+      break;
+    default:
+      Warn(ctx) << "ignoring unknown debug$S subsection kind 0x"
+                << utohexstr(uint32_t(ss.kind())) << " in file "
+                << toString(&file);
+      break;
+    }
+
+    if (subsectionPlan && subsectionPlan->kind != DebugSubsectionKind::Symbols)
+      subsectionPlan->symbolPlanCount = 0;
+  }
+
+  if (chunkPlan)
+    chunkPlan->subsectionCount =
+        recordedPlan->subsectionPlans.size() - chunkPlan->subsectionStart;
+  if (recordedPlan)
+    recordedPlan->moduleStreamSize = moduleStreamSize;
+}
+
+void DebugSHandler::advanceRelocIndex(SectionChunk *sc,
+                                      ArrayRef<uint8_t> subsec) {
+  ptrdiff_t vaBegin = subsec.data() - sc->getContents().data();
+  assert(vaBegin > 0);
+  auto relocs = sc->getRelocs();
+  for (; nextRelocIndex < relocs.size(); ++nextRelocIndex) {
+    if (relocs[nextRelocIndex].VirtualAddress >= (uint32_t)vaBegin)
+      break;
+  }
+}
 
 Error UnrelocatedDebugSubsection::commit(BinaryStreamWriter &writer) const {
   std::vector<uint8_t> relocatedBytes(subsec.size());
@@ -1066,29 +1470,6 @@ Error UnrelocatedDebugSubsection::commit(BinaryStreamWriter &writer) const {
   return writer.writeBytes(relocatedBytes);
 }
 
-void DebugSHandler::addUnrelocatedSubsection(SectionChunk *debugChunk,
-                                             const DebugSubsectionRecord &ss) {
-  ArrayRef<uint8_t> subsec;
-  BinaryStreamRef sr = ss.getRecordData();
-  cantFail(sr.readBytes(0, sr.getLength(), subsec));
-  advanceRelocIndex(debugChunk, subsec);
-  file.moduleDBI->addDebugSubsection(
-      std::make_shared<UnrelocatedDebugSubsection>(ss.kind(), debugChunk,
-                                                   subsec, nextRelocIndex));
-}
-
-void DebugSHandler::addFrameDataSubsection(SectionChunk *debugChunk,
-                                           const DebugSubsectionRecord &ss) {
-  // We need to re-write string table indices here, so save off all
-  // frame data subsections until we've processed the entire list of
-  // subsections so that we can be sure we have the string table.
-  ArrayRef<uint8_t> subsec;
-  BinaryStreamRef sr = ss.getRecordData();
-  cantFail(sr.readBytes(0, sr.getLength(), subsec));
-  advanceRelocIndex(debugChunk, subsec);
-  frameDataSubsecs.push_back({debugChunk, subsec, nextRelocIndex});
-}
-
 static Expected<StringRef>
 getFileName(const DebugStringTableSubsectionRef &strings,
             const DebugChecksumsSubsectionRef &checksums, uint32_t fileID) {
@@ -1101,6 +1482,11 @@ getFileName(const DebugStringTableSubsectionRef &strings,
 
 void DebugSHandler::finish() {
   pdb::DbiStreamBuilder &dbiBuilder = linker.builder.getDbiBuilder();
+
+  if (recordedPlan)
+    recordedPlan->moduleStreamSize = moduleStreamSize;
+  if (cachedPlan && moduleStreamSize != cachedPlan->moduleStreamSize)
+    cachePlanValid = false;
 
   // If we found any symbol records for the module symbol stream, defer them.
   if (moduleStreamSize > kSymbolStreamMagicSize)
@@ -1215,9 +1601,36 @@ void PDBLinker::addDebugSymbols(TpiSource *source) {
   ScopedTimer t(ctx.symbolMergingTimer);
   ExitOnError exitOnErr;
   pdb::DbiStreamBuilder &dbiBuilder = builder.getDbiBuilder();
-  DebugSHandler dsh(ctx, *this, *source->file);
+  const IncrementalPDBModuleCacheEntry *cachedPlan = nullptr;
+  if (ctx.pdbCacheSession)
+    cachedPlan = ctx.pdbCacheSession->findModuleEntry(*source->file);
+  if (cachedPlan && !validateCachedModulePlan(*source->file, *cachedPlan)) {
+    if (ctx.config.verbose)
+      Log(ctx) << "pdbcache: invalid cached module plan for "
+               << source->file->getName() << "; reparsing";
+    cachedPlan = nullptr;
+  }
+
+  IncrementalPDBModuleCacheEntry *recordedPlan = nullptr;
+  if (ctx.pdbCacheSession && ctx.pdbCacheSession->writeEnabled()) {
+    IncrementalPDBModuleCacheEntry &entry = modulePlans[source->file];
+    entry = cachedPlan ? *cachedPlan : IncrementalPDBModuleCacheEntry();
+    entry.path = source->file->getName().str();
+    entry.parentPath = source->file->archiveName.str();
+    entry.archiveOffset = source->file->archiveOffset;
+    entry.debugSHash = computeIncrementalPDBModuleDebugSHash(*source->file);
+    entry.debugFHash = computeIncrementalPDBModuleDebugFHash(*source->file);
+    entry.relocHash = computeIncrementalPDBModuleRelocHash(*source->file);
+    recordedPlan = &entry;
+  } else if (cachedPlan) {
+    modulePlans[source->file] = *cachedPlan;
+  }
+
+  DebugSHandler dsh(ctx, *this, *source->file, cachedPlan, recordedPlan);
   // Now do all live .debug$S and .debug$F sections.
-  for (SectionChunk *debugChunk : source->file->getDebugChunks()) {
+  for (size_t chunkOrdinal = 0; chunkOrdinal < source->file->getDebugChunks().size();
+       ++chunkOrdinal) {
+    SectionChunk *debugChunk = source->file->getDebugChunks()[chunkOrdinal];
     if (!debugChunk->live || debugChunk->getSize() == 0)
       continue;
 
@@ -1228,7 +1641,7 @@ void PDBLinker::addDebugSymbols(TpiSource *source) {
 
     if (isDebugS) {
       ScopedTimer t(ctx.handleDebugSTimer);
-      dsh.handleDebugS(debugChunk);
+      dsh.handleDebugS(debugChunk, chunkOrdinal);
     } else if (isDebugF) {
       // Handle old FPO data .debug$F sections. These are relatively rare.
       ArrayRef<uint8_t> relocatedDebugContents =
@@ -1248,6 +1661,10 @@ void PDBLinker::addDebugSymbols(TpiSource *source) {
 
   // Do any post-processing now that all .debug$S sections have been processed.
   dsh.finish();
+  if (!recordedPlan && cachedPlan && !dsh.shouldCachePlan())
+    modulePlans.erase(source->file);
+  if (recordedPlan && !dsh.shouldCachePlan())
+    modulePlans.erase(source->file);
 }
 
 // Add a module descriptor for every object file. We need to put an absolute
@@ -1868,6 +2285,7 @@ void lld::coff::createPDB(COFFLinkerContext &ctx,
                           llvm::codeview::DebugInfo *buildId) {
   llvm::TimeTraceScope timeScope("PDB file");
   ScopedTimer t1(ctx.totalPdbLinkTimer);
+  ctx.pdbCacheSession = IncrementalPDBCacheSession::create(ctx);
   {
     PDBLinker pdb(ctx);
 
@@ -1887,8 +2305,19 @@ void lld::coff::createPDB(COFFLinkerContext &ctx,
       llvm::TimeTraceScope timeScope("Commit PDB file to disk");
       ScopedTimer t2(ctx.diskCommitTimer);
       codeview::GUID guid;
-      pdb.commit(&guid);
-      memcpy(&buildId->PDB70.Signature, &guid, 16);
+      if (pdb.commit(&guid)) {
+        memcpy(&buildId->PDB70.Signature, &guid, 16);
+        if (ctx.pdbCacheSession) {
+          if (Error e = ctx.pdbCacheSession->writeCache(pdb.getModulePlans())) {
+            if (ctx.config.verbose)
+              Log(ctx) << "pdbcache: failed to update cache '"
+                       << getIncrementalPDBCachePath(ctx.config)
+                       << "': " << toString(std::move(e));
+            else
+              consumeError(std::move(e));
+          }
+        }
+      }
     }
 
     pdb.collectStats();
@@ -1988,7 +2417,7 @@ void PDBLinker::addSections(ArrayRef<uint8_t> sectionTable) {
       dbiBuilder.addDbgStream(pdb::DbgHeaderType::SectionHdr, sectionTable));
 }
 
-void PDBLinker::commit(codeview::GUID *guid) {
+bool PDBLinker::commit(codeview::GUID *guid) {
   // Print an error and continue if PDB writing fails. This is done mainly so
   // the user can see the output of /time and /summary, which is very helpful
   // when trying to figure out why a PDB file is too large.
@@ -2000,7 +2429,9 @@ void PDBLinker::commit(codeview::GUID *guid) {
     });
     checkError(std::move(e));
     Err(ctx) << "failed to write PDB file " << Twine(ctx.config.pdbPath);
+    return false;
   }
+  return true;
 }
 
 static uint32_t getSecrelReloc(Triple::ArchType arch) {

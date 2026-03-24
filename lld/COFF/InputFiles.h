@@ -155,6 +155,7 @@ public:
   MachineTypes getMachineType() const override;
   ArrayRef<Chunk *> getChunks() { return chunks; }
   ArrayRef<SectionChunk *> getDebugChunks() { return debugChunks; }
+  ArrayRef<SectionChunk *> getDebugChunks() const { return debugChunks; }
   ArrayRef<SectionChunk *> getSXDataChunks() { return sxDataChunks; }
   ArrayRef<SectionChunk *> getGuardFidChunks() { return guardFidChunks; }
   ArrayRef<SectionChunk *> getGuardIATChunks() { return guardIATChunks; }
