@@ -12,6 +12,7 @@ add_lld_library(lldCOFF
   DriverUtils.cpp
   ICF.cpp
   Incremental.cpp
+  IncrementalPDBCache.cpp
   IncrementalLayout.cpp
   IncrementalRedirects.cpp
   IncrementalState.cpp

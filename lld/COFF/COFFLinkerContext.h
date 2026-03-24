@@ -23,6 +23,7 @@
 namespace lld::coff {
 
 class IncrementalLinkSession;
+class IncrementalPDBCacheSession;
 
 class COFFLinkerContext : public CommonLinkerContext {
 public:
@@ -121,8 +122,12 @@ public:
   Timer typeMergingTimer;
   Timer loadGHashTimer;
   Timer mergeGHashTimer;
+  Timer pdbCacheLoadTimer;
+  Timer pdbCacheValidateTimer;
+  Timer pdbTypeCacheReplayTimer;
   Timer symbolMergingTimer;
   Timer handleDebugSTimer;
+  Timer pdbModulePlanReplayTimer;
   Timer globalSymbolRecordWriteTimer;
   Timer globalSymbolRelocateTimer;
   Timer globalSymbolTypeRemapTimer;
@@ -130,6 +135,7 @@ public:
   Timer publicsLayoutTimer;
   Timer tpiStreamLayoutTimer;
   Timer diskCommitTimer;
+  Timer pdbCacheStoreTimer;
   Timer commitModuleSymbolsTimer;
   Timer moduleSymbolRecordWriteTimer;
   Timer moduleSymbolRelocateTimer;
@@ -140,6 +146,7 @@ public:
 
   Configuration config;
   std::unique_ptr<IncrementalLinkSession> incrementalSession;
+  std::unique_ptr<IncrementalPDBCacheSession> pdbCacheSession;
 
   DynamicRelocsChunk *dynamicRelocs = nullptr;
 };

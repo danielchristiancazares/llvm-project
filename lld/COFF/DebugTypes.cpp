@@ -29,6 +29,8 @@
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/TimeProfiler.h"
+#include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/xxhash.h"
 
 using namespace llvm;
 using namespace llvm::codeview;
@@ -269,6 +271,12 @@ bool TpiSource::remapTypesInSymbolRecord(MutableArrayRef<uint8_t> rec) {
   return true;
 }
 
+bool TpiSource::remapTypesInSymbolRecord(MutableArrayRef<uint8_t> rec,
+                                         ArrayRef<TiReference> typeRefs) {
+  remapRecord(rec, typeRefs);
+  return true;
+}
+
 // A COFF .debug$H section is currently a clang extension.  This function checks
 // if a .debug$H section is in a format that we expect / understand, so that we
 // can ignore any sections which are coincidentally also named .debug$H but do
@@ -302,6 +310,249 @@ getHashesFromDebugH(ArrayRef<uint8_t> debugH) {
   debugH = debugH.drop_front(sizeof(object::debug_h_header));
   uint32_t count = debugH.size() / sizeof(GloballyHashedType);
   return {reinterpret_cast<const GloballyHashedType *>(debugH.data()), count};
+}
+
+static std::optional<IncrementalPDBTypeSourceKind>
+getIncrementalPDBTypeSourceKind(const TpiSource &source) {
+  switch (source.kind) {
+  case TpiSource::Regular:
+    return IncrementalPDBTypeSourceKind::Regular;
+  case TpiSource::PCH:
+    return IncrementalPDBTypeSourceKind::PCH;
+  case TpiSource::UsingPCH:
+    return IncrementalPDBTypeSourceKind::UsingPCH;
+  case TpiSource::PDB:
+    return IncrementalPDBTypeSourceKind::PDB;
+  case TpiSource::PDBIpi:
+  case TpiSource::UsingPDB:
+    return std::nullopt;
+  }
+  llvm_unreachable("unhandled type source kind");
+}
+
+static void appendHashBytes(raw_ostream &os, ArrayRef<uint8_t> bytes) {
+  os << bytes.size() << '\n';
+  os.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+  os << '\n';
+}
+
+static uint64_t hashObjectTypeSource(const ObjFile &file) {
+  SmallString<256> buffer;
+  raw_svector_ostream os(buffer);
+  appendHashBytes(os, file.debugTypes);
+  if (std::optional<ArrayRef<uint8_t>> debugH = getDebugH(const_cast<ObjFile *>(&file)))
+    appendHashBytes(os, *debugH);
+  else
+    os << "no-debug-h\n";
+  return xxh3_64bits(ArrayRef(
+      reinterpret_cast<const uint8_t *>(buffer.data()), buffer.size()));
+}
+
+static uint64_t hashPDBTypeSource(const PDBInputFile &file) {
+  return xxh3_64bits(file.mb.getBuffer());
+}
+
+static uint64_t hashPrecompDependency(const PrecompRecord &dependency) {
+  SmallString<128> buffer;
+  raw_svector_ostream os(buffer);
+  os << dependency.getStartTypeIndex() << '\n' << dependency.getTypesCount()
+     << '\n' << dependency.getSignature() << '\n'
+     << dependency.getPrecompFilePath();
+  return xxh3_64bits(ArrayRef(
+      reinterpret_cast<const uint8_t *>(buffer.data()), buffer.size()));
+}
+
+static std::vector<uint8_t> serializeBitVector(const BitVector &bits) {
+  std::vector<uint8_t> bytes(alignTo(bits.size(), size_t(8)) / 8, 0);
+  for (int bit = bits.find_first(); bit >= 0; bit = bits.find_next(bit)) {
+    size_t byteIndex = size_t(bit) / 8;
+    uint8_t bitMask = uint8_t(1u << (size_t(bit) % 8));
+    bytes[byteIndex] |= bitMask;
+  }
+  return bytes;
+}
+
+static void deserializeBitVector(ArrayRef<uint8_t> bytes, size_t bitCount,
+                                 BitVector &bits) {
+  bits.clear();
+  bits.resize(bitCount);
+  for (size_t bit = 0; bit < bitCount; ++bit) {
+    size_t byteIndex = bit / 8;
+    if (byteIndex < bytes.size() && (bytes[byteIndex] & (1u << (bit % 8))))
+      bits.set(bit);
+  }
+}
+
+static void clearRestoredGHashes(TpiSource &source) {
+  if (source.ownedGHashes && !source.ghashes.empty())
+    delete[] source.ghashes.data();
+  source.ghashes = {};
+  source.isItemIndex.clear();
+  source.ownedGHashes = true;
+}
+
+static void restoreCachedGHashes(TpiSource &source,
+                                 ArrayRef<GloballyHashedType> hashes,
+                                 ArrayRef<uint8_t> isItemIndexBits) {
+  clearRestoredGHashes(source);
+  if (!hashes.empty()) {
+    auto *storage = new GloballyHashedType[hashes.size()];
+    memcpy(storage, hashes.data(), hashes.size() * sizeof(GloballyHashedType));
+    source.ghashes = ArrayRef(storage, hashes.size());
+  }
+  deserializeBitVector(isItemIndexBits, hashes.size(), source.isItemIndex);
+  source.ownedGHashes = true;
+}
+
+std::string lld::coff::getIncrementalPDBTypeCacheKey(const TpiSource &source) {
+  std::optional<IncrementalPDBTypeSourceKind> kind =
+      getIncrementalPDBTypeSourceKind(source);
+  if (!kind)
+    return {};
+
+  SmallString<256> buffer;
+  raw_svector_ostream os(buffer);
+  switch (source.kind) {
+  case TpiSource::Regular:
+  case TpiSource::PCH:
+  case TpiSource::UsingPCH:
+    assert(source.file != nullptr);
+    os << source.file->getName() << '\n' << source.file->archiveName << '\n'
+       << source.file->archiveOffset << '\n' << unsigned(*kind);
+    break;
+  case TpiSource::PDB: {
+    auto &ts = static_cast<const TypeServerSource &>(source);
+    os << ts.pdbInputFile->getName() << '\n' << '\n' << 0 << '\n'
+       << unsigned(*kind);
+    break;
+  }
+  case TpiSource::PDBIpi:
+  case TpiSource::UsingPDB:
+    return {};
+  }
+  return std::string(buffer);
+}
+
+bool lld::coff::matchesIncrementalPDBTypeCacheEntry(
+    const TpiSource &source, const IncrementalPDBTypeCacheEntry &entry) {
+  std::optional<IncrementalPDBTypeSourceKind> kind =
+      getIncrementalPDBTypeSourceKind(source);
+  if (!kind || *kind != entry.kind)
+    return false;
+
+  switch (source.kind) {
+  case TpiSource::Regular:
+    return entry.contentHash == hashObjectTypeSource(*source.file) &&
+           entry.dependencyHash == 0;
+  case TpiSource::PCH:
+    return entry.contentHash == hashObjectTypeSource(*source.file) &&
+           entry.dependencyHash ==
+               uint64_t(source.file->pchSignature.value_or(0));
+  case TpiSource::UsingPCH: {
+    auto &usePCH = static_cast<const UsePrecompSource &>(source);
+    return entry.contentHash == hashObjectTypeSource(*source.file) &&
+           entry.dependencyHash == hashPrecompDependency(usePCH.precompDependency);
+  }
+  case TpiSource::PDB: {
+    auto &ts = static_cast<const TypeServerSource &>(source);
+    bool hasIpi = ts.ipiSrc != nullptr;
+    return entry.contentHash == hashPDBTypeSource(*ts.pdbInputFile) &&
+           entry.dependencyHash == 0 &&
+           hasIpi == !entry.auxGHashes.empty();
+  }
+  case TpiSource::PDBIpi:
+  case TpiSource::UsingPDB:
+    return false;
+  }
+
+  llvm_unreachable("unhandled type source kind");
+}
+
+bool lld::coff::buildIncrementalPDBTypeCacheEntry(
+    const TpiSource &source, IncrementalPDBTypeCacheEntry &entry) {
+  std::optional<IncrementalPDBTypeSourceKind> kind =
+      getIncrementalPDBTypeSourceKind(source);
+  if (!kind || source.ghashes.empty())
+    return false;
+
+  entry = {};
+  entry.kind = *kind;
+  entry.endPrecompIdx = source.endPrecompIdx;
+  entry.ghashes.assign(source.ghashes.begin(), source.ghashes.end());
+  entry.isItemIndexBits = serializeBitVector(source.isItemIndex);
+
+  switch (source.kind) {
+  case TpiSource::Regular:
+    entry.path = source.file->getName().str();
+    entry.parentPath = source.file->archiveName.str();
+    entry.archiveOffset = source.file->archiveOffset;
+    entry.contentHash = hashObjectTypeSource(*source.file);
+    break;
+  case TpiSource::PCH:
+    entry.path = source.file->getName().str();
+    entry.parentPath = source.file->archiveName.str();
+    entry.archiveOffset = source.file->archiveOffset;
+    entry.contentHash = hashObjectTypeSource(*source.file);
+    entry.dependencyHash = uint64_t(source.file->pchSignature.value_or(0));
+    break;
+  case TpiSource::UsingPCH: {
+    auto &usePCH = static_cast<const UsePrecompSource &>(source);
+    entry.path = source.file->getName().str();
+    entry.parentPath = source.file->archiveName.str();
+    entry.archiveOffset = source.file->archiveOffset;
+    entry.contentHash = hashObjectTypeSource(*source.file);
+    entry.dependencyHash = hashPrecompDependency(usePCH.precompDependency);
+    break;
+  }
+  case TpiSource::PDB: {
+    auto &ts = static_cast<const TypeServerSource &>(source);
+    entry.path = ts.pdbInputFile->getName().str();
+    entry.contentHash = hashPDBTypeSource(*ts.pdbInputFile);
+    if (ts.ipiSrc && !ts.ipiSrc->ghashes.empty()) {
+      entry.auxGHashes.assign(ts.ipiSrc->ghashes.begin(), ts.ipiSrc->ghashes.end());
+      entry.auxIsItemIndexBits = serializeBitVector(ts.ipiSrc->isItemIndex);
+    }
+    break;
+  }
+  case TpiSource::PDBIpi:
+  case TpiSource::UsingPDB:
+    return false;
+  }
+
+  return true;
+}
+
+bool lld::coff::restoreIncrementalPDBTypeCacheEntry(
+    const IncrementalPDBTypeCacheEntry &entry, TpiSource &source) {
+  std::optional<IncrementalPDBTypeSourceKind> kind =
+      getIncrementalPDBTypeSourceKind(source);
+  if (!kind || *kind != entry.kind)
+    return false;
+
+  source.endPrecompIdx = entry.endPrecompIdx;
+  restoreCachedGHashes(source, entry.ghashes, entry.isItemIndexBits);
+
+  switch (source.kind) {
+  case TpiSource::Regular:
+  case TpiSource::UsingPCH:
+    return true;
+  case TpiSource::PCH:
+    if (source.file && entry.dependencyHash <= UINT32_MAX)
+      source.file->pchSignature = static_cast<uint32_t>(entry.dependencyHash);
+    return true;
+  case TpiSource::PDB: {
+    auto &ts = static_cast<TypeServerSource &>(source);
+    if (ts.ipiSrc)
+      restoreCachedGHashes(*ts.ipiSrc, entry.auxGHashes,
+                           entry.auxIsItemIndexBits);
+    return true;
+  }
+  case TpiSource::PDBIpi:
+  case TpiSource::UsingPDB:
+    return false;
+  }
+
+  llvm_unreachable("unhandled type source kind");
 }
 
 // Merge .debug$T for a generic object file.
@@ -1072,14 +1323,30 @@ TypeMerger::TypeMerger(COFFLinkerContext &c, llvm::BumpPtrAllocator &alloc)
 TypeMerger::~TypeMerger() = default;
 
 void TypeMerger::mergeTypesWithGHash() {
+  if (ctx.pdbCacheSession) {
+    ScopedTimer t(ctx.pdbTypeCacheReplayTimer);
+    for (TpiSource *source : dependencySources) {
+      if (const auto *entry = ctx.pdbCacheSession->findTypeEntry(*source))
+        restoreIncrementalPDBTypeCacheEntry(*entry, *source);
+    }
+    for (TpiSource *source : objectSources) {
+      if (const auto *entry = ctx.pdbCacheSession->findTypeEntry(*source))
+        restoreIncrementalPDBTypeCacheEntry(*entry, *source);
+    }
+  }
+
   // Load ghashes. Do type servers and PCH objects first.
   {
     llvm::TimeTraceScope timeScope("Load GHASHes");
     ScopedTimer t1(ctx.loadGHashTimer);
-    parallelForEach(dependencySources,
-                    [&](TpiSource *source) { source->loadGHashes(); });
-    parallelForEach(objectSources,
-                    [&](TpiSource *source) { source->loadGHashes(); });
+    parallelForEach(dependencySources, [&](TpiSource *source) {
+      if (source->ghashes.empty())
+        source->loadGHashes();
+    });
+    parallelForEach(objectSources, [&](TpiSource *source) {
+      if (source->ghashes.empty())
+        source->loadGHashes();
+    });
   }
 
   llvm::TimeTraceScope timeScope("Merge types (GHASH)");
@@ -1188,6 +1455,9 @@ void TypeMerger::mergeTypesWithGHash() {
     funcIdToType.insert_range(source->funcIdToType);
     source->funcIdToType.clear();
   }
+
+  if (ctx.pdbCacheSession)
+    ctx.pdbCacheSession->recordTypeEntries(ctx.tpiSourceList);
 
   clearGHashes();
 }
