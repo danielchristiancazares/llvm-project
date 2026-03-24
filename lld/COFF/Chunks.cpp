@@ -114,9 +114,10 @@ bool IncrementalEntryRedirectChunkX64::verifyRanges() {
 }
 
 IncrementalLongThunkChunkX64::IncrementalLongThunkChunkX64(StringRef debugName,
-                                                           Defined *target)
+                                                           Defined *target,
+                                                           uint64_t imageBase)
     : NonSectionCodeChunk(IncrementalLongThunkKind),
-      debugName(debugName.str()), target(target) {
+      debugName(debugName.str()), target(target), imageBase(imageBase) {
   setAlignment(16);
 }
 
@@ -124,7 +125,7 @@ void IncrementalLongThunkChunkX64::writeTo(uint8_t *buf) const {
   memset(buf, 0xCC, getSize());
   buf[0] = 0x48;
   buf[1] = 0xB8;
-  write64le(buf + 2, target->getRVA());
+  write64le(buf + 2, imageBase + target->getRVA());
   buf[10] = 0xFF;
   buf[11] = 0xE0;
 }

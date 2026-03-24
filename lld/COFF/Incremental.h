@@ -42,7 +42,6 @@ public:
   llvm::DenseMap<const SectionChunk *, llvm::ArrayRef<uint8_t>> reusedChunkData;
   llvm::StringMap<uint32_t> oldPlacementIndices;
   llvm::StringMap<uint32_t> oldEnvelopeIndices;
-  llvm::StringMap<uint32_t> oldRedirectIndices;
   llvm::DenseMap<const Chunk *, IncrementalPlacementKind> placementKinds;
   llvm::DenseSet<const Chunk *> rewrittenChunks;
   std::vector<IncrementalEdgeState> currentEdges;
@@ -55,6 +54,15 @@ public:
   llvm::StringSet<> replayableArchives;
   llvm::StringSet<> expectedArchiveMembers;
   llvm::StringSet<> loadedArchiveMembers;
+};
+
+struct IncrementalTextThunkPlanState {
+  uint64_t redirectRVA = 0;
+  uint64_t bodyRVA = 0;
+  uint64_t poolThunkRVA = 0;
+  bool active = false;
+  bool hadActiveRedirect = false;
+  bool usedPool = false;
 };
 
 void prepareIncrementalLink(COFFLinkerContext &ctx);
@@ -81,6 +89,8 @@ IncrementalSlotClass classifyIncrementalSection(llvm::StringRef name,
 bool isIncrementalSlotReuseClass(IncrementalSlotClass slotClass);
 bool isIncrementalPackedClass(IncrementalSlotClass slotClass);
 uint8_t getIncrementalFillByte(IncrementalSlotClass slotClass);
+bool isIncrementalPersistedSlotChunk(IncrementalSlotClass slotClass,
+                                     const Chunk &chunk);
 std::optional<size_t> findBestFitIncrementalFreeSlot(
     llvm::ArrayRef<IncrementalSlotRecordState> slots, uint64_t size,
     uint32_t alignment);
@@ -88,6 +98,15 @@ std::optional<uint64_t> allocateIncrementalTailReserve(uint64_t tailCursor,
                                                        uint64_t maxSectionEndRVA,
                                                        uint64_t size,
                                                        uint32_t alignment);
+std::optional<uint64_t>
+chooseIncrementalTextThunkRVA(uint64_t oldPoolThunkRVA, uint64_t tailCursor,
+                              uint64_t poolCursor, uint64_t poolEndRVA,
+                              llvm::ArrayRef<uint64_t> claimedThunkRVAs,
+                              llvm::ArrayRef<uint64_t> freedThunkRVAs = {});
+void planIncrementalTextThunkAssignments(
+    llvm::MutableArrayRef<IncrementalTextThunkPlanState> plans,
+    uint64_t tailCursor, uint64_t &poolCursor, uint64_t &poolStart,
+    uint64_t poolEndRVA, bool allowPoolThunks);
 bool isIncrementalAmd64Rel32InRange(uint16_t type, uint64_t sourceRVA,
                                     uint64_t targetRVA);
 IncrementalChunkKind classifyIncrementalChunk(const Chunk &chunk);
