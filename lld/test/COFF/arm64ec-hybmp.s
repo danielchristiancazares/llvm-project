@@ -48,6 +48,24 @@ thunk:
 // RUN: llvm-mc -filetype=obj -triple=arm64ec-windows offset-func.s -o offset-func.obj
 // RUN: not lld-link -machine:arm64ec -dll -noentry -out:test.dll offset-func.obj 2>&1 | FileCheck -check-prefix=FUNC-NON-COMDAT %s
 
+#--- absolute-func.s
+    .globl func
+    .set func, 1
+
+    .section .wowthk$aa,"xr",discard,thunk
+    .globl thunk
+    .p2align 2
+thunk:
+    ret
+
+    .section .hybmp$x,"yi"
+    .symidx func
+    .symidx thunk
+    .word 1  // entry thunk
+
+// RUN: llvm-mc -filetype=obj -triple=arm64ec-windows absolute-func.s -o absolute-func.obj
+// RUN: not lld-link -machine:arm64ec -dll -noentry -out:test.dll absolute-func.obj 2>&1 | FileCheck -check-prefix=FUNC-NON-COMDAT %s
+
 #--- undef-func.s
     .section .wowthk$aa,"xr",discard,thunk
     .globl thunk

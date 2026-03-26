@@ -13,7 +13,7 @@
 
 # CHECK: SECOND
 # CHECK: incremental: using state
-# CHECK: incremental: phase2 active
+# CHECK: incremental: byte-reuse layout active
 # CHECK: incremental: installed legacy redirect .text
 # CHECK: THIRD
 # CHECK: incremental: using state

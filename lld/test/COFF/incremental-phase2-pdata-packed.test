@@ -11,10 +11,11 @@
 # RUN:   FileCheck %s < %t.out
 
 # CHECK: SECOND
-# CHECK: incremental: using state
-# CHECK: incremental: phase2 active
+# CHECK: incremental: fallback: LayoutChanged
+# CHECK: incremental: detail: resolved symbol count changed
 # CHECK: THIRD
 # CHECK: incremental: using state
+# CHECK: incremental: byte-reuse layout active
 # CHECK: incremental: exact-layout reuse active
 
 #--- v1.s

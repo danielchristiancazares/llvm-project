@@ -1,0 +1,49 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   yaml2obj %S/pdb-invalid-func-type.yaml -o short-func-id.obj && \
+# RUN:   %python patch_short_func_id.py short-func-id.obj && \
+# RUN:   not lld-link short-func-id.obj -out:%t.exe -debug -pdb:%t.pdb -nodefaultlib -entry:main 2>&1 | FileCheck %s --check-prefix=WARNING && \
+# RUN:   llvm-pdbutil dump -symbols %t.pdb | FileCheck %s --check-prefix=SYMS && \
+# RUN:   not lld-link short-func-id.obj -out:%t-ghash.exe -debug -debug:ghash -pdb:%t-ghash.pdb -nodefaultlib -entry:main 2>&1 | FileCheck %s --check-prefix=WARNING && \
+# RUN:   llvm-pdbutil dump -symbols %t-ghash.pdb | FileCheck %s --check-prefix=SYMS
+
+# WARNING: error: The CodeView record is corrupted.
+# WARNING: warning: corrupt LF_[M]FUNC_ID record 0x1002 in {{.*}}short-func-id.obj
+
+# SYMS: Mod 0000 | `{{.*}}short-func-id.obj`:
+# SYMS:      4 | S_GPROC32 [size = 44] `main`
+# SYMS:          type = `0x0007 (<not translated>)`
+
+#--- patch_short_func_id.py
+import struct
+import sys
+
+path = sys.argv[1]
+data = bytearray(open(path, "rb").read())
+
+num_sections = struct.unpack_from("<H", data, 2)[0]
+section_table = 20
+debug_t = None
+for i in range(num_sections):
+    off = section_table + i * 40
+    name = data[off:off + 8].rstrip(b"\0")
+    if name == b".debug$T":
+        debug_t = off
+        break
+
+if debug_t is None:
+    raise SystemExit("missing .debug$T section")
+
+raw_size_off = debug_t + 16
+raw_data_ptr_off = debug_t + 20
+raw_data_ptr = struct.unpack_from("<I", data, raw_data_ptr_off)[0]
+
+# Keep the stream aligned, but truncate the final LF_FUNC_ID payload so it no
+# longer contains a full FunctionType field.
+struct.pack_into("<I", data, raw_size_off, 44)
+struct.pack_into("<H", data, raw_data_ptr + 0x20, 8)
+data[raw_data_ptr + 0x2A] = 0xF2
+data[raw_data_ptr + 0x2B] = 0xF1
+
+with open(path, "wb") as f:
+    f.write(data)
