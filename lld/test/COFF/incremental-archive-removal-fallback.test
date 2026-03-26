@@ -1,0 +1,41 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.out test.lib && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc foo.s -o foo.obj && \
+# RUN:   llvm-lib -machine:amd64 -out:test.lib foo.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main1.s -o main.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj test.lib && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main2.s -o main.obj && \
+# RUN:   echo REMOVED > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj test.lib >> %t.out 2>&1 && \
+# RUN:   echo REUSE >> %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj test.lib >> %t.out 2>&1 && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: REMOVED
+# CHECK: incremental: fallback: LayoutChanged
+# CHECK: incremental: detail: input count changed
+# CHECK: REUSE
+# CHECK: incremental: using state
+# CHECK: incremental: exact-layout reuse active
+
+#--- main1.s
+.text
+.globl main
+main:
+  callq foo
+  xorl %eax, %eax
+  retq
+
+#--- main2.s
+.text
+.globl main
+main:
+  xorl %eax, %eax
+  retq
+
+#--- foo.s
+.text
+.globl foo
+foo:
+  retq

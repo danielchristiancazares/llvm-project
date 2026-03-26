@@ -228,6 +228,19 @@ private:
   StringMap<uint64_t> offsets;
 };
 
+static bool isValidIncrementalSectionLayoutKind(uint16_t rawKind) {
+  switch (static_cast<IncrementalSectionLayoutKind>(rawKind)) {
+  case IncrementalSectionLayoutKind::ExactSectionLayout:
+  case IncrementalSectionLayoutKind::TextFreeSlots:
+  case IncrementalSectionLayoutKind::ReadOnlyDataFreeSlots:
+  case IncrementalSectionLayoutKind::WritableDataFreeSlots:
+  case IncrementalSectionLayoutKind::PackedPDataPrefix:
+  case IncrementalSectionLayoutKind::PackedXDataPrefix:
+    return true;
+  }
+  return false;
+}
+
 template <typename T> void appendObject(std::vector<char> &out, const T &obj) {
   size_t oldSize = out.size();
   out.resize(oldSize + sizeof(T));
@@ -385,6 +398,11 @@ Expected<IncrementalStateFile> loadIncrementalStateCurrent(
       return envelopesOrErr.takeError();
     state.sectionEnvelopes.reserve(envelopesOrErr->size());
     for (const EnvelopeRecord &record : *envelopesOrErr) {
+      if (!isValidIncrementalSectionLayoutKind(uint16_t(record.layoutKind)))
+        return createStringError(
+            inconvertibleErrorCode(),
+            "incremental state file has an invalid section layout kind");
+
       IncrementalSectionEnvelopeState envelope;
       Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
       if (!nameOrErr)
