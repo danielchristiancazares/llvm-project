@@ -806,11 +806,18 @@ void Writer::run() {
     removeUnusedSections();
     layoutSections();
     finalizeAddresses();
+    bool hadIncrementalLayoutCandidate =
+        findActiveIncrementalBaseline(ctx) != nullptr;
     IncrementalLayoutResult incrementalLayout;
     if (applyIncrementalLayout(ctx, incrementalLayout)) {
       fileSize = incrementalLayout.fileSize;
       sizeOfImage = incrementalLayout.sizeOfImage;
       sizeOfHeaders = incrementalLayout.sizeOfHeaders;
+    } else if (hadIncrementalLayoutCandidate) {
+      // applyIncrementalLayout() may have mutated section membership, RVAs, and
+      // relocations before deciding to fall back. Recompute the clean full-link
+      // layout before continuing to write the image.
+      finalizeAddresses();
     }
     removeEmptySections();
     if (findActiveByteReuseLink(ctx))

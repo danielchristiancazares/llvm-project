@@ -1,0 +1,41 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.fresh.llilk %t.fresh.exe %t.out && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main1.s -o main.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc helper.s -o helper.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -timestamp:0 -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj helper.obj && \
+# RUN:   %python -c "import pathlib,struct; path=pathlib.Path(r'%t.llilk'); data=bytearray(path.read_bytes()); hdr=struct.unpack_from('<8sIHHHH' + 'Q'*36, data, 0); off,count=hdr[18],hdr[19]; fmt='<QIIQQQQII'; size=struct.calcsize(fmt); assert count >= 1; [struct.pack_into('<Q', data, off + i * size + 24, 0xffffffffffffffff) for i in range(count)]; path.write_bytes(data)" && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main2.s -o main.obj && \
+# RUN:   echo FALLBACK > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -timestamp:0 -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj helper.obj >> %t.out 2>&1 && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -timestamp:0 -incremental -opt:noref,noicf -ilk:%t.fresh.llilk -out:%t.fresh.exe main.obj helper.obj && \
+# RUN:   %python -c "import pathlib; a=pathlib.Path(r'%t.exe').read_bytes(); b=pathlib.Path(r'%t.fresh.exe').read_bytes(); assert a == b, 'fallback output differed from fresh incremental build'" && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: FALLBACK
+# CHECK: incremental: fallback: OutputMismatch
+# CHECK: incremental: detail: reused chunk bytes extend past prior image
+
+#--- main1.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  xorl %eax, %eax
+  retq
+
+#--- main2.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  movl $1, %eax
+  .rept 32
+  nop
+  .endr
+  retq
+
+#--- helper.s
+.section .text,"xr",one_only,helper
+.globl helper
+helper:
+  movl $7, %eax
+  retq

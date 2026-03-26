@@ -56,6 +56,16 @@ struct RedirectPlanEntry {
   Defined *bodyTarget = nullptr;
 };
 
+struct SectionRestoreSnapshot {
+  OutputSection *section = nullptr;
+  SmallVector<Chunk *, 16> chunks;
+};
+
+struct RelocRestoreSnapshot {
+  SectionChunk *chunk = nullptr;
+  ArrayRef<coff_relocation> relocs;
+};
+
 static bool hasInstalledRedirect(const RedirectPlanEntry &plan) {
   return plan.engagement == IncrementalRedirectEngagement::Installed;
 }
@@ -944,7 +954,21 @@ bool applyIncrementalLayout(COFFLinkerContext &ctx,
 
   IncrementalReuseData reuse;
   clearReuseState(reuse);
+  SmallVector<SectionRestoreSnapshot, 16> sectionSnapshots;
+  SmallVector<RelocRestoreSnapshot, 32> relocSnapshots;
+  bool restoredFullLayout = false;
+  auto restoreFullLayout = [&]() {
+    if (restoredFullLayout)
+      return;
+    for (const RelocRestoreSnapshot &snapshot : relocSnapshots)
+      snapshot.chunk->setRelocs(snapshot.relocs);
+    for (const SectionRestoreSnapshot &snapshot : sectionSnapshots)
+      snapshot.section->chunks.assign(snapshot.chunks.begin(),
+                                      snapshot.chunks.end());
+    restoredFullLayout = true;
+  };
   auto installLayoutFallback = [&]() {
+    restoreFullLayout();
     std::unique_ptr<FullImageBuild> fullImageBuild =
         consumePendingIncrementalFallback(ctx,
                                           std::move(validated->baselineEmission));
@@ -958,6 +982,20 @@ bool applyIncrementalLayout(COFFLinkerContext &ctx,
 
   SmallVector<OutputSection *, 16> activeSections =
       getActiveSections(ctx, &baseline.state);
+  sectionSnapshots.reserve(activeSections.size());
+  for (OutputSection *section : activeSections) {
+    SectionRestoreSnapshot sectionSnapshot;
+    sectionSnapshot.section = section;
+    sectionSnapshot.chunks.append(section->chunks.begin(), section->chunks.end());
+    sectionSnapshots.push_back(std::move(sectionSnapshot));
+
+    for (Chunk *chunk : section->chunks) {
+      auto *sectionChunk = dyn_cast<SectionChunk>(chunk);
+      if (!sectionChunk)
+        continue;
+      relocSnapshots.push_back({sectionChunk, sectionChunk->getRelocs()});
+    }
+  }
   if (activeSections.size() != baseline.state.sections.size()) {
     setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                            "output section count changed");
@@ -1093,7 +1131,18 @@ bool applyIncrementalLayout(COFFLinkerContext &ctx,
         continue;
       }
 
-      uint64_t fileOffset = oldSection->fileOffset + (oldChunk->rva - oldSection->rva);
+      if (oldChunk->rva < oldSection->rva) {
+        setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState,
+                               "reused chunk lies before its recorded section");
+        return installLayoutFallback();
+      }
+      uint64_t chunkOffsetInSection = oldChunk->rva - oldSection->rva;
+      if (oldSection->fileOffset > UINT64_MAX - chunkOffsetInSection) {
+        setIncrementalFallback(ctx, IncrementalFallbackReason::OutputMismatch,
+                               "reused chunk bytes extend past prior image");
+        return installLayoutFallback();
+      }
+      uint64_t fileOffset = oldSection->fileOffset + chunkOffsetInSection;
       if (fileOffset > oldBytes.size() ||
           oldBytes.size() - fileOffset < sectionChunk->getSize()) {
         setIncrementalFallback(ctx, IncrementalFallbackReason::OutputMismatch,

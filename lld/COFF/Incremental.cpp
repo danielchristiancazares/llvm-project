@@ -1304,23 +1304,15 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   for (ArchiveFile *file : ctx.archiveFileInstances)
     baseline.replayableArchives.insert(file->getName());
 
-  StringMap<ArchiveFile *> archives;
-  for (ArchiveFile *file : ctx.archiveFileInstances)
-    archives[file->getName()] = file;
-
   for (const IncrementalInputState &input : baseline.state.inputs) {
     if (input.parentName.empty())
       continue;
-    auto archiveIt = archives.find(input.parentName);
-    if (archiveIt == archives.end())
-      continue;
 
+    // Let the current link drive archive extraction. Replaying baseline members
+    // here pollutes the graph before we know reuse is valid and makes later
+    // extraction validation observe the replay instead of current demand.
     baseline.expectedArchiveMembers.insert(getIncrementalArchiveMemberKey(
         input.parentName, input.archiveOffset, input.name));
-    if (input.archiveOffset != 0)
-      archiveIt->second->addMemberByOffset(input.archiveOffset, input.name);
-    else
-      archiveIt->second->addMemberByName(input.name, input.name);
   }
 
   IncrementalPdbReusePolicy pdbReuse =
