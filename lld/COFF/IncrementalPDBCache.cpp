@@ -163,17 +163,21 @@ SmallString<128> getIncrementalPDBCachePath(const Configuration &config) {
   return path;
 }
 
-bool shouldReadIncrementalPDBCache(const COFFLinkerContext &ctx) {
-  return ctx.config.machine == AMD64 && ctx.config.debug &&
-         !ctx.config.pdbPath.empty() && ctx.incrementalSession &&
-         ctx.incrementalSession->stateLoaded && ctx.config.incrementalLinkActive &&
-         !hasBitcodeInputs(ctx);
-}
+IncrementalPDBCacheRuntimeMode
+classifyIncrementalPDBCacheRuntimeMode(const COFFLinkerContext &ctx) {
+  if (ctx.config.machine != AMD64 || !ctx.config.debug ||
+      ctx.config.pdbPath.empty() || hasBitcodeInputs(ctx))
+    return IncrementalPDBCacheRuntimeMode::BypassCache;
 
-bool shouldWriteIncrementalPDBCache(const COFFLinkerContext &ctx) {
-  return ctx.config.machine == AMD64 && ctx.config.debug &&
-         !ctx.config.pdbPath.empty() && ctx.incrementalSession &&
-         ctx.incrementalSession->canWriteState && !hasBitcodeInputs(ctx);
+  bool mayReplay = findActiveByteReuseLink(ctx) != nullptr;
+  bool mayRecord = shouldEmitIncrementalBaseline(ctx);
+  if (mayReplay && mayRecord)
+    return IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache;
+  if (mayReplay)
+    return IncrementalPDBCacheRuntimeMode::ReplayOnlyCache;
+  if (mayRecord)
+    return IncrementalPDBCacheRuntimeMode::RecordOnlyCache;
+  return IncrementalPDBCacheRuntimeMode::BypassCache;
 }
 
 uint64_t computeIncrementalPDBCacheBuildId() {
@@ -634,15 +638,20 @@ Error writeIncrementalPDBCache(StringRef path,
 
 IncrementalPDBCacheSession::IncrementalPDBCacheSession(COFFLinkerContext &ctx)
     : ctx(ctx), cachePath(getIncrementalPDBCachePath(ctx.config)),
-      canReadCache(shouldReadIncrementalPDBCache(ctx)),
-      canWriteCache(shouldWriteIncrementalPDBCache(ctx)) {}
+      mode(classifyIncrementalPDBCacheRuntimeMode(ctx)) {}
 
 std::unique_ptr<IncrementalPDBCacheSession>
 IncrementalPDBCacheSession::create(COFFLinkerContext &ctx) {
   auto session = std::unique_ptr<IncrementalPDBCacheSession>(
       new IncrementalPDBCacheSession(ctx));
-  if (!session->canReadCache)
+  switch (session->mode) {
+  case IncrementalPDBCacheRuntimeMode::BypassCache:
+  case IncrementalPDBCacheRuntimeMode::RecordOnlyCache:
     return session;
+  case IncrementalPDBCacheRuntimeMode::ReplayOnlyCache:
+  case IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache:
+    break;
+  }
 
   ScopedTimer loadTimer(ctx.pdbCacheLoadTimer);
   Expected<IncrementalPDBCacheFile> cacheOrErr =
@@ -651,6 +660,10 @@ IncrementalPDBCacheSession::create(COFFLinkerContext &ctx) {
     if (ctx.config.verbose)
       Log(ctx) << "pdbcache: ignoring cache '" << session->cachePath
                << "': " << toString(cacheOrErr.takeError());
+    if (session->mode == IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache)
+      session->mode = IncrementalPDBCacheRuntimeMode::RecordOnlyCache;
+    else
+      session->mode = IncrementalPDBCacheRuntimeMode::BypassCache;
     return session;
   }
 
@@ -662,12 +675,15 @@ IncrementalPDBCacheSession::create(COFFLinkerContext &ctx) {
       if (ctx.config.verbose)
         Log(ctx) << "pdbcache: cache compatibility mismatch; ignoring '"
                  << session->cachePath << "'";
+      if (session->mode == IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache)
+        session->mode = IncrementalPDBCacheRuntimeMode::RecordOnlyCache;
+      else
+        session->mode = IncrementalPDBCacheRuntimeMode::BypassCache;
       return session;
     }
   }
 
   session->loadedCache = std::move(*cacheOrErr);
-  session->loadedCacheValid = true;
   for (const IncrementalPDBTypeCacheEntry &entry : session->loadedCache.typeEntries)
     session->loadedTypesByKey[getTypeCompositeKey(entry)] = &entry;
   for (const IncrementalPDBModuleCacheEntry &entry :
@@ -702,8 +718,14 @@ IncrementalPDBCacheSession::findLoadedModuleEntry(StringRef key,
 
 const IncrementalPDBTypeCacheEntry *
 IncrementalPDBCacheSession::findTypeEntry(const TpiSource &source) {
-  if (!canReadCache || !loadedCacheValid)
+  switch (mode) {
+  case IncrementalPDBCacheRuntimeMode::ReplayOnlyCache:
+  case IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache:
+    break;
+  case IncrementalPDBCacheRuntimeMode::BypassCache:
+  case IncrementalPDBCacheRuntimeMode::RecordOnlyCache:
     return nullptr;
+  }
   ScopedTimer validateTimer(ctx.pdbCacheValidateTimer);
   std::string key = getIncrementalPDBTypeCacheKey(source);
   if (key.empty())
@@ -723,8 +745,14 @@ IncrementalPDBCacheSession::findTypeEntry(const TpiSource &source) {
 
 const IncrementalPDBModuleCacheEntry *
 IncrementalPDBCacheSession::findModuleEntry(const ObjFile &file) {
-  if (!canReadCache || !loadedCacheValid)
+  switch (mode) {
+  case IncrementalPDBCacheRuntimeMode::ReplayOnlyCache:
+  case IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache:
+    break;
+  case IncrementalPDBCacheRuntimeMode::BypassCache:
+  case IncrementalPDBCacheRuntimeMode::RecordOnlyCache:
     return nullptr;
+  }
   ScopedTimer validateTimer(ctx.pdbCacheValidateTimer);
   const IncrementalPDBModuleCacheEntry *entry =
       findLoadedModuleEntry(getIncrementalPDBCacheObjectKey(file), file);
@@ -741,8 +769,14 @@ IncrementalPDBCacheSession::findModuleEntry(const ObjFile &file) {
 }
 
 void IncrementalPDBCacheSession::recordTypeEntries(ArrayRef<TpiSource *> sources) {
-  if (!canWriteCache)
+  switch (mode) {
+  case IncrementalPDBCacheRuntimeMode::RecordOnlyCache:
+  case IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache:
+    break;
+  case IncrementalPDBCacheRuntimeMode::BypassCache:
+  case IncrementalPDBCacheRuntimeMode::ReplayOnlyCache:
     return;
+  }
   recordedTypeEntries.clear();
   for (TpiSource *source : sources) {
     IncrementalPDBTypeCacheEntry entry;
@@ -753,8 +787,14 @@ void IncrementalPDBCacheSession::recordTypeEntries(ArrayRef<TpiSource *> sources
 
 Error IncrementalPDBCacheSession::writeCache(
     const DenseMap<const ObjFile *, IncrementalPDBModuleCacheEntry> &modulePlans) const {
-  if (!canWriteCache)
+  switch (mode) {
+  case IncrementalPDBCacheRuntimeMode::RecordOnlyCache:
+  case IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache:
+    break;
+  case IncrementalPDBCacheRuntimeMode::BypassCache:
+  case IncrementalPDBCacheRuntimeMode::ReplayOnlyCache:
     return Error::success();
+  }
 
   ScopedTimer storeTimer(ctx.pdbCacheStoreTimer);
   IncrementalPDBCacheFile cache;

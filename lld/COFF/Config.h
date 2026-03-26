@@ -128,6 +128,11 @@ enum class IncrementalFallbackReason {
   Amd64Rel32OutOfRange,
 };
 
+enum class IncrementalRequestPolicy {
+  FullRelinkOnly,
+  AttemptIncrementalReuse,
+};
+
 // Global configuration.
 struct Configuration {
   enum ManifestKind { Default, SideBySide, Embed, No };
@@ -359,10 +364,8 @@ struct Configuration {
   bool warnStdcallFixup = true;
   bool warnImportedDllMain = true;
   bool keepUnchangedImplib = true;
-  bool incrementalLinkSpecified = false;
-  bool incrementalLinkRequested = true;
-  bool incrementalLinkEligible = false;
-  bool incrementalLinkActive = false;
+  IncrementalRequestPolicy incrementalRequestPolicy =
+      IncrementalRequestPolicy::FullRelinkOnly;
   bool integrityCheck = false;
   bool killAt = false;
   bool repro = false;
@@ -385,9 +388,6 @@ struct Configuration {
   bool optRemarksWithHotness = false;
   std::optional<uint64_t> optRemarksHotnessThreshold = 0;
   llvm::SmallString<128> incrementalStatePath;
-  IncrementalFallbackReason incrementalFallbackReason =
-      IncrementalFallbackReason::None;
-  std::string incrementalFallbackDetail;
 };
 
 struct COFFSyncStream : SyncStream {

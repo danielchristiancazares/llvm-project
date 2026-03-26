@@ -341,7 +341,7 @@ bool SymbolTable::handleMinGWAutomaticImport(Symbol *sym, StringRef name) {
     impSize = sizeof(DefinedRegular);
   } else {
     Warn(ctx) << "unable to automatically import " << name << " from "
-              << imp->getName() << " from " << cast<DefinedRegular>(imp)->file
+              << imp->getName() << " from " << toString(imp->getFile())
               << "; unexpected symbol type";
     return false;
   }
@@ -622,9 +622,9 @@ void SymbolTable::initializeECThunks() {
     // We need to be able to add padding to the function and fill it with an
     // offset to its entry thunks. To ensure that padding the function is
     // feasible, functions are required to be COMDAT symbols with no offset.
-    if (!from || !from->getChunk()->isCOMDAT() ||
-        cast<DefinedRegular>(from)->getValue()) {
-      Err(ctx) << "non COMDAT symbol '" << from->getName() << "' in hybrid map";
+    if (!from || !from->getChunk()->isCOMDAT() || from->getValue()) {
+      Err(ctx) << "non COMDAT symbol '" << it.first->getName()
+               << "' in hybrid map";
       continue;
     }
     from->getChunk()->setEntryThunk(to);

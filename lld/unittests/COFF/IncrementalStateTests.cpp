@@ -10,6 +10,7 @@
 #include "gtest/gtest.h"
 #include <climits>
 #include <cstring>
+#include <optional>
 
 using namespace lld::coff;
 using namespace llvm;
@@ -41,6 +42,36 @@ protected:
 
   SmallString<128> testDir;
 };
+
+static std::optional<size_t>
+getSelectedFreeSlotIndex(const IncrementalFreeSlotSelection &selection) {
+  return selection.match(
+      [](const NoFreeSlotFit &) -> std::optional<size_t> { return std::nullopt; },
+      [](const SelectedFreeSlot &selected) -> std::optional<size_t> {
+        return selected.index;
+      });
+}
+
+static std::optional<uint64_t>
+getTailReserveStartRVA(const IncrementalTailReserveSelection &selection) {
+  return selection.match(
+      [](const TailReserveUnavailable &) -> std::optional<uint64_t> {
+        return std::nullopt;
+      },
+      [](const TailReserveStart &start) -> std::optional<uint64_t> {
+        return start.rva;
+      });
+}
+
+static std::optional<uint64_t>
+getSelectedPoolThunkRVA(const IncrementalTextThunkSelection &selection) {
+  return selection.match(
+      [](const PoolThunkUnavailable &) -> std::optional<uint64_t> {
+        return std::nullopt;
+      },
+      [](const SelectedPoolThunkRVA &selected)
+          -> std::optional<uint64_t> { return selected.rva; });
+}
 
 TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   IncrementalStateFile state;
@@ -105,8 +136,7 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   envelope.sectionRVA = 0x1000;
   envelope.maxSectionEndRVA = 0x2000;
   envelope.activeEndRVA = 0x1200;
-  envelope.slotClass = IncrementalSlotClass::Text;
-  envelope.slotReuseEnabled = true;
+  envelope.layoutKind = IncrementalSectionLayoutKind::TextFreeSlots;
   state.sectionEnvelopes.push_back(envelope);
 
   IncrementalSlotRecordState slot;
@@ -143,7 +173,6 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   redirect.redirectCapacity = 16;
   redirect.bodyRVA = 0x1200;
   redirect.poolThunkRVA = 0;
-  redirect.active = true;
   state.textRedirects.push_back(redirect);
 
   state.textThunkPool.poolStartRVA = 0x1800;
@@ -156,7 +185,7 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   Expected<IncrementalStateFile> loaded = loadIncrementalState(path);
   ASSERT_TRUE(static_cast<bool>(loaded)) << toString(loaded.takeError());
 
-  EXPECT_EQ(loaded->version, 5u);
+  EXPECT_EQ(loaded->version, 6u);
   EXPECT_EQ(loaded->layoutMode, IncrementalLayoutMode::Slotted);
   EXPECT_EQ(loaded->machine, AMD64);
   EXPECT_EQ(loaded->importTopologyHash, state.importTopologyHash);
@@ -171,8 +200,8 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   EXPECT_EQ(loaded->symbols[0].kind, IncrementalSymbolKind::Regular);
   ASSERT_EQ(loaded->sectionEnvelopes.size(), 1u);
   EXPECT_EQ(loaded->sectionEnvelopes[0].name, ".text");
-  EXPECT_EQ(loaded->sectionEnvelopes[0].slotClass, IncrementalSlotClass::Text);
-  EXPECT_TRUE(loaded->sectionEnvelopes[0].slotReuseEnabled);
+  EXPECT_EQ(loaded->sectionEnvelopes[0].layoutKind,
+            IncrementalSectionLayoutKind::TextFreeSlots);
   ASSERT_EQ(loaded->slotRecords.size(), 1u);
   EXPECT_EQ(loaded->slotRecords[0].occupantKey, "obj:0:comdat:main");
   EXPECT_EQ(loaded->slotRecords[0].fillByte, 0xCC);
@@ -187,7 +216,6 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   ASSERT_EQ(loaded->textRedirects.size(), 1u);
   EXPECT_EQ(loaded->textRedirects[0].canonicalSymbol, "main");
   EXPECT_EQ(loaded->textRedirects[0].redirectCapacity, 16u);
-  EXPECT_TRUE(loaded->textRedirects[0].active);
   EXPECT_EQ(loaded->textThunkPool.poolStartRVA, 0x1800u);
   EXPECT_EQ(loaded->textThunkPool.poolEndRVA, 0x1A00u);
   EXPECT_EQ(loaded->textThunkPool.nextFreeRVA, 0x1A00u);
@@ -245,25 +273,29 @@ TEST(IncrementalHelpersTest, BestFitSelectionHonorsCapacityAndAlignment) {
   slots[2].startRVA = 0x1024;
   slots[2].capacity = 24;
 
-  std::optional<size_t> slot = findBestFitIncrementalFreeSlot(slots, 16, 16);
+  std::optional<size_t> slot =
+      getSelectedFreeSlotIndex(findBestFitIncrementalFreeSlot(slots, 16, 16));
   ASSERT_TRUE(slot.has_value());
   EXPECT_EQ(*slot, 1u);
 
-  slot = findBestFitIncrementalFreeSlot(slots, 16, 32);
+  slot = getSelectedFreeSlotIndex(findBestFitIncrementalFreeSlot(slots, 16, 32));
   ASSERT_TRUE(slot.has_value());
   EXPECT_EQ(*slot, 0u);
 
-  EXPECT_FALSE(findBestFitIncrementalFreeSlot(slots, 64, 16).has_value());
+  EXPECT_FALSE(
+      getSelectedFreeSlotIndex(findBestFitIncrementalFreeSlot(slots, 64, 16))
+          .has_value());
 }
 
 TEST(IncrementalHelpersTest, TailReserveAllocationAlignsAndRejectsOverflow) {
-  std::optional<uint64_t> start =
-      allocateIncrementalTailReserve(0x1003, 0x1010, 4, 4);
+  std::optional<uint64_t> start = getTailReserveStartRVA(
+      allocateIncrementalTailReserve(0x1003, 0x1010, 4, 4));
   ASSERT_TRUE(start.has_value());
   EXPECT_EQ(*start, 0x1004u);
 
-  EXPECT_FALSE(
-      allocateIncrementalTailReserve(0x100f, 0x1010, 4, 4).has_value());
+  EXPECT_FALSE(getTailReserveStartRVA(
+                   allocateIncrementalTailReserve(0x100f, 0x1010, 4, 4))
+                   .has_value());
 }
 
 TEST(IncrementalHelpersTest, Amd64Rel32RangeHelperChecksBoundaries) {
@@ -335,23 +367,26 @@ TEST(IncrementalHelpersTest, PersistedSlotChunkFilterDropsTextLongThunks) {
   IncrementalLongThunkChunkX64 thunk("pool", &body, 0x140000000ULL);
   IncrementalPaddingChunk padding(".text", 0x60000020, 16, 0xCC);
 
-  EXPECT_FALSE(isIncrementalPersistedSlotChunk(IncrementalSlotClass::Text, thunk));
-  EXPECT_TRUE(isIncrementalPersistedSlotChunk(IncrementalSlotClass::Text, padding));
+  EXPECT_FALSE(isIncrementalPersistedSlotChunk(
+      IncrementalSectionLayoutKind::TextFreeSlots, thunk));
+  EXPECT_TRUE(isIncrementalPersistedSlotChunk(
+      IncrementalSectionLayoutKind::TextFreeSlots, padding));
   EXPECT_FALSE(
-      isIncrementalPersistedSlotChunk(IncrementalSlotClass::Text, bodyChunk));
+      isIncrementalPersistedSlotChunk(
+          IncrementalSectionLayoutKind::TextFreeSlots, bodyChunk));
 }
 
 TEST(IncrementalHelpersTest, ChooseTextThunkRVAReusesValidExistingSlot) {
-  std::optional<uint64_t> thunkRVA =
-      chooseIncrementalTextThunkRVA(0x2ff0, 0x2400, 0x2fe0, 0x3000, {});
+  std::optional<uint64_t> thunkRVA = getSelectedPoolThunkRVA(
+      chooseIncrementalTextThunkRVA(0x2ff0, 0x2400, 0x2fe0, 0x3000, {}));
   ASSERT_TRUE(thunkRVA.has_value());
   EXPECT_EQ(*thunkRVA, 0x2ff0u);
 }
 
 TEST(IncrementalHelpersTest,
      ChooseTextThunkRVAAllocatesFreshSlotWhenExistingOneIsInvalid) {
-  std::optional<uint64_t> thunkRVA =
-      chooseIncrementalTextThunkRVA(0x2fe0, 0x2ff8, 0x3010, 0x3020, {});
+  std::optional<uint64_t> thunkRVA = getSelectedPoolThunkRVA(
+      chooseIncrementalTextThunkRVA(0x2fe0, 0x2ff8, 0x3010, 0x3020, {}));
   ASSERT_TRUE(thunkRVA.has_value());
   EXPECT_EQ(*thunkRVA, 0x3000u);
 }
@@ -359,8 +394,9 @@ TEST(IncrementalHelpersTest,
 TEST(IncrementalHelpersTest,
      ChooseTextThunkRVAReusesFreedSlotBeforeScanningBelowPoolCursor) {
   uint64_t freedThunkRVAs[] = {0x2fd0, 0x2ff0};
-  std::optional<uint64_t> thunkRVA = chooseIncrementalTextThunkRVA(
-      0, 0x2fc0, 0x2fd0, 0x3000, {}, freedThunkRVAs);
+  std::optional<uint64_t> thunkRVA = getSelectedPoolThunkRVA(
+      chooseIncrementalTextThunkRVA(0, 0x2fc0, 0x2fd0, 0x3000, {},
+                                    freedThunkRVAs));
   ASSERT_TRUE(thunkRVA.has_value());
   EXPECT_EQ(*thunkRVA, 0x2ff0u);
 }
@@ -369,9 +405,9 @@ TEST(IncrementalHelpersTest,
      ChooseTextThunkRVAIgnoresClaimedOrInvalidFreedSlots) {
   uint64_t claimedThunkRVAs[] = {0x2ff0};
   uint64_t freedThunkRVAs[] = {0x2fb0, 0x2ff0, 0x2fd0};
-  std::optional<uint64_t> thunkRVA =
+  std::optional<uint64_t> thunkRVA = getSelectedPoolThunkRVA(
       chooseIncrementalTextThunkRVA(0, 0x2fc0, 0x2fd0, 0x3000,
-                                    claimedThunkRVAs, freedThunkRVAs);
+                                    claimedThunkRVAs, freedThunkRVAs));
   ASSERT_TRUE(thunkRVA.has_value());
   EXPECT_EQ(*thunkRVA, 0x2fd0u);
 }
@@ -382,32 +418,36 @@ TEST(IncrementalHelpersTest,
   plans[0].redirectRVA = 0x1200;
   plans[0].bodyRVA = 0x1210;
   plans[0].poolThunkRVA = 0x2ff0;
-  plans[0].active = true;
-  plans[0].hadActiveRedirect = true;
-  plans[0].usedPool = true;
+  plans[0].engagement = IncrementalRedirectEngagement::Installed;
+  plans[0].provenance = IncrementalRedirectProvenance::LegacyRedirect;
+  plans[0].targeting = IncrementalRedirectTargeting::PoolThunkTarget;
 
   plans[1].redirectRVA = 0x1300;
   plans[1].bodyRVA = 0x90000000ULL;
-  plans[1].active = true;
+  plans[1].engagement = IncrementalRedirectEngagement::Installed;
 
   uint64_t poolCursor = 0x2fd0;
   uint64_t poolStart = 0;
   planIncrementalTextThunkAssignments(plans, 0x2fc0, poolCursor, poolStart,
                                       0x3000, true);
 
-  EXPECT_TRUE(plans[0].active);
-  EXPECT_FALSE(plans[0].usedPool);
+  EXPECT_EQ(plans[0].engagement, IncrementalRedirectEngagement::Installed);
+  EXPECT_EQ(plans[0].targeting,
+            IncrementalRedirectTargeting::DirectBodyTarget);
   EXPECT_EQ(plans[0].poolThunkRVA, 0u);
 
-  EXPECT_TRUE(plans[1].active);
-  EXPECT_TRUE(plans[1].usedPool);
+  EXPECT_EQ(plans[1].engagement, IncrementalRedirectEngagement::Installed);
+  EXPECT_EQ(plans[1].targeting,
+            IncrementalRedirectTargeting::PoolThunkTarget);
   EXPECT_EQ(plans[1].poolThunkRVA, 0x2ff0u);
   EXPECT_EQ(poolCursor, 0x2fd0u);
   EXPECT_EQ(poolStart, 0x2ff0u);
 }
 
 TEST(IncrementalHelpersTest, ChooseTextThunkRVAFailsWhenPoolIsExhausted) {
-  EXPECT_FALSE(chooseIncrementalTextThunkRVA(0x2ff0, 0x2ff8, 0x3000, 0x3000, {})
+  EXPECT_FALSE(getSelectedPoolThunkRVA(
+                   chooseIncrementalTextThunkRVA(0x2ff0, 0x2ff8, 0x3000, 0x3000,
+                                                 {}))
                    .has_value());
 }
 
@@ -426,11 +466,10 @@ TEST(IncrementalHelpersTest, RedirectStateRoundTripPreservesPoolState) {
   redirect.redirectCapacity = 16;
   redirect.bodyRVA = 0x2400;
   redirect.poolThunkRVA = 0x4FF0;
-  redirect.active = true;
   state.textRedirects.push_back(redirect);
 
   SmallString<128> path;
-  ASSERT_FALSE(sys::fs::createTemporaryFile("phase3-pool", "llilk", path));
+  ASSERT_FALSE(sys::fs::createTemporaryFile("redirect-pool", "llilk", path));
   Error err = writeIncrementalState(path, state);
   ASSERT_FALSE(static_cast<bool>(err)) << toString(std::move(err));
   Expected<IncrementalStateFile> loaded = loadIncrementalState(path);
