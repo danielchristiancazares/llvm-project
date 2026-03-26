@@ -113,6 +113,50 @@ getPreservedSlotOccupant(const IncrementalPreservedSlot &slot) {
   return occupant;
 }
 
+static std::string
+describeResolvedSymbolForTest(const IncrementalResolvedSymbolSnapshot &symbol) {
+  SmallString<128> buffer;
+  raw_svector_ostream os(buffer);
+  symbol.match(
+      [&](const ObjFileRegularResolvedSymbol &regular) {
+        os << "objreg:" << regular.name << ':' << regular.inputIndex << ':'
+           << regular.value << ':' << regular.chunkKey;
+      },
+      [&](const BitcodeRegularResolvedSymbol &regular) {
+        os << "bcreg:" << regular.name << ':' << regular.value;
+      },
+      [&](const ObjFileCommonResolvedSymbol &common) {
+        os << "objcommon:" << common.name << ':' << common.inputIndex << ':'
+           << common.size << ':' << common.alignment;
+      },
+      [&](const BitcodeCommonResolvedSymbol &common) {
+        os << "bccommon:" << common.name << ':' << common.size << ':'
+           << common.alignment;
+      },
+      [&](const ImportDataResolvedSymbol &importData) {
+        os << "importdata:" << importData.name << ':' << importData.ordinal
+           << ':' << importData.dllName << ':' << importData.externalName
+           << ':' << importData.typeInfo;
+      },
+      [&](const ImportThunkResolvedSymbol &importThunk) {
+        os << "importthunk:" << importThunk.name << ':'
+           << importThunk.wrappedSymbolName;
+      },
+      [&](const LocalImportResolvedSymbol &localImport) {
+        os << "localimport:" << localImport.name << ':' << localImport.chunkKey;
+      },
+      [&](const AbsoluteResolvedSymbol &absolute) {
+        os << "absolute:" << absolute.name << ':' << absolute.value;
+      },
+      [&](const ChunkBackedSyntheticResolvedSymbol &synthetic) {
+        os << "chunksynth:" << synthetic.name << ':' << synthetic.chunkKey;
+      },
+      [&](const ImageBaseSyntheticResolvedSymbol &synthetic) {
+        os << "imagebase:" << synthetic.name;
+      });
+  return std::string(buffer);
+}
+
 TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   IncrementalBaselineSnapshot state;
   state.machine = AMD64;
@@ -152,6 +196,10 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
       IncrementalPreservedSlot::make<OccupiedSlotRecord>(OccupiedSlotRecord{
           IncrementalPreservedSlotState{0x1000, 48, 32, 16, 0xCC},
           "obj:0:comdat:main"}));
+  textSection.slotSection.slots.push_back(
+      IncrementalPreservedSlot::make<FreeSlotRecord>(
+          FreeSlotRecord{IncrementalPreservedSlotState{0x1030, 16, 0, 16,
+                                                       0xCC}}));
   textSection.slotSection.preservedChunks.push_back(
       ExistingSlotChunkPlacement{"obj:0:comdat:main", 0x1000, 32, 16});
 
@@ -275,7 +323,7 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   EXPECT_EQ(loadedText->slotSection.section.name, ".text");
   EXPECT_EQ(loadedText->slotSection.maxSectionEndRVA, 0x2000u);
   EXPECT_EQ(loadedText->slotSection.activeEndRVA, 0x1200u);
-  ASSERT_EQ(loadedText->slotSection.slots.size(), 1u);
+  ASSERT_EQ(loadedText->slotSection.slots.size(), 2u);
   std::optional<std::string> occupant =
       getPreservedSlotOccupant(loadedText->slotSection.slots[0]);
   ASSERT_TRUE(occupant.has_value());
@@ -283,6 +331,11 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   EXPECT_EQ(getIncrementalPreservedSlotState(loadedText->slotSection.slots[0])
                 .fillByte,
             0xCC);
+  EXPECT_FALSE(
+      getPreservedSlotOccupant(loadedText->slotSection.slots[1]).has_value());
+  EXPECT_EQ(getIncrementalPreservedSlotState(loadedText->slotSection.slots[1])
+                .committedSize,
+            0u);
   ASSERT_EQ(loadedText->slotSection.preservedChunks.size(), 1u);
   EXPECT_EQ(loadedText->slotSection.preservedChunks[0].key,
             "obj:0:comdat:main");
@@ -301,6 +354,72 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   EXPECT_EQ(loadedPacked->reserveSize, 16u);
   ASSERT_EQ(loadedPacked->members.size(), 1u);
   EXPECT_EQ(loadedPacked->members[0].key, "obj:0:comdat:main");
+}
+
+TEST_F(IncrementalStateTest, RoundTripPreservesResolvedSymbolWireVariants) {
+  IncrementalBaselineSnapshot state;
+  state.machine = AMD64;
+  state.outputPath = "out.exe";
+
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<ObjFileRegularResolvedSymbol>(
+          ObjFileRegularResolvedSymbol{"objReg", 7, 11, "obj:7:reg"}));
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<BitcodeRegularResolvedSymbol>(
+          BitcodeRegularResolvedSymbol{"bcReg", 22}));
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<ObjFileCommonResolvedSymbol>(
+          ObjFileCommonResolvedSymbol{"objCommon", 3, 33, 16}));
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<BitcodeCommonResolvedSymbol>(
+          BitcodeCommonResolvedSymbol{"bcCommon", 44, 32}));
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<ImportDataResolvedSymbol>(
+          ImportDataResolvedSymbol{"impData", 55, "KERNEL32.dll",
+                                   "ExitProcess", 66}));
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<ImportThunkResolvedSymbol>(
+          ImportThunkResolvedSymbol{"impThunk", "ExitProcess"}));
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<LocalImportResolvedSymbol>(
+          LocalImportResolvedSymbol{"localImp", "local:chunk"}));
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<AbsoluteResolvedSymbol>(
+          AbsoluteResolvedSymbol{"abs", 77}));
+  state.symbols.push_back(IncrementalResolvedSymbolSnapshot::make<
+                          ChunkBackedSyntheticResolvedSymbol>(
+      ChunkBackedSyntheticResolvedSymbol{"synthetic", "syn:chunk"}));
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<ImageBaseSyntheticResolvedSymbol>(
+          ImageBaseSyntheticResolvedSymbol{"__ImageBase"}));
+
+  SmallString<128> path = getPath("symbol-variants.llilk");
+  expectNoError(writeIncrementalState(path, state));
+
+  Expected<IncrementalBaselineSnapshot> loaded = loadIncrementalState(path);
+  ASSERT_TRUE(static_cast<bool>(loaded)) << toString(loaded.takeError());
+
+  ASSERT_EQ(loaded->sections.size(), 0u);
+  ASSERT_EQ(loaded->symbols.size(), 10u);
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[0]),
+            "objreg:objReg:7:11:obj:7:reg");
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[1]), "bcreg:bcReg:22");
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[2]),
+            "objcommon:objCommon:3:33:16");
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[3]),
+            "bccommon:bcCommon:44:32");
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[4]),
+            "importdata:impData:55:KERNEL32.dll:ExitProcess:66");
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[5]),
+            "importthunk:impThunk:ExitProcess");
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[6]),
+            "localimport:localImp:local:chunk");
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[7]),
+            "absolute:abs:77");
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[8]),
+            "chunksynth:synthetic:syn:chunk");
+  EXPECT_EQ(describeResolvedSymbolForTest(loaded->symbols[9]),
+            "imagebase:__ImageBase");
 }
 
 TEST_F(IncrementalStateTest, RejectsInvalidMagicAndVersion) {

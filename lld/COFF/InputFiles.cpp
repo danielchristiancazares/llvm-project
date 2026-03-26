@@ -90,7 +90,8 @@ static void checkAndSetWeakAlias(SymbolTable &symtab, InputFile *f,
         // of another symbol emitted near the weak symbol.
         // Just use the definition from the first object file that defined
         // this weak symbol.
-        if (symtab.ctx.config.allowDuplicateWeak)
+        if (symtab.ctx.config.duplicateWeakPolicy ==
+            DuplicateWeakPolicy::KeepFirstDuplicateWeak)
           return;
         symtab.reportDuplicate(source, f);
       }
@@ -506,7 +507,9 @@ SectionChunk *ObjFile::readSection(uint32_t sectionNumber,
     sxDataChunks.push_back(c);
   else if (isArm64EC(getMachineType()) && name == ".hybmp$x")
     hybmpChunks.push_back(c);
-  else if (symtab.ctx.config.tailMerge && sec->NumberOfRelocations == 0 &&
+  else if (symtab.ctx.config.tailMergeMode ==
+               TailMergeMode::TailMergeStringLiterals &&
+           sec->NumberOfRelocations == 0 &&
            name == ".rdata" && leaderName.starts_with("??_C@"))
     // COFF sections that look like string literal sections (i.e. no
     // relocations, in .rdata, leader symbol name matches the MSVC name mangling
@@ -1455,7 +1458,8 @@ BitcodeFile *BitcodeFile::create(COFFLinkerContext &ctx, MemoryBufferRef mb,
                                  StringRef archiveName,
                                  uint64_t offsetInArchive, bool lazy) {
   std::string path = mb.getBufferIdentifier().str();
-  if (ctx.config.thinLTOIndexOnly)
+  if (ctx.config.thinLTOIndexingMode ==
+      ThinLTOIndexingMode::WriteThinLTOIndexes)
     path = replaceThinLTOSuffix(mb.getBufferIdentifier(),
                                 ctx.config.thinLTOObjectSuffixReplace.first,
                                 ctx.config.thinLTOObjectSuffixReplace.second);

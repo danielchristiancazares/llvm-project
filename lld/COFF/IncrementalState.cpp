@@ -983,6 +983,41 @@ decodeThunkPool(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header) {
   return pool;
 }
 
+static void encodeSlotRecord(const IncrementalPreservedSlot &slot,
+                             uint32_t envelopeIndex, SlotRecord &record,
+                             StringTableBuilder &strings) {
+  const IncrementalPreservedSlotState &slotState =
+      getIncrementalPreservedSlotState(slot);
+  record.occupantKeyOffset = 0;
+  matchIncrementalPreservedSlotOccupancy(
+      slot,
+      [&](const FreeSlotRecord &) {
+        record.state = static_cast<uint16_t>(WireIncrementalSlotState::Free);
+      },
+      [&](const OccupiedSlotRecord &occupied) {
+        record.occupantKeyOffset = strings.add(occupied.occupantKey);
+        record.state =
+            static_cast<uint16_t>(WireIncrementalSlotState::Occupied);
+      });
+  record.envelopeIndex = envelopeIndex;
+  record.minAlignment = slotState.minAlignment;
+  record.fillByte = slotState.fillByte;
+  record.startRVA = slotState.startRVA;
+  record.capacity = slotState.capacity;
+  record.committedSize = slotState.committedSize;
+}
+
+static void appendSlotRecords(ArrayRef<IncrementalPreservedSlot> slots,
+                              uint32_t envelopeIndex,
+                              std::vector<SlotRecord> &records,
+                              StringTableBuilder &strings) {
+  for (const IncrementalPreservedSlot &slot : slots) {
+    SlotRecord record = {};
+    encodeSlotRecord(slot, envelopeIndex, record, strings);
+    records.push_back(record);
+  }
+}
+
 static Expected<IncrementalBaselineSnapshot>
 loadIncrementalStateCurrent(ArrayRef<uint8_t> bytes,
                             const FileHeaderV5 &header) {
@@ -1296,32 +1331,8 @@ Error writeIncrementalState(StringRef path,
           envelope.activeEndRVA = text.slotSection.activeEndRVA;
           uint32_t envelopeIndex = envelopeRecords.size();
           envelopeRecords.push_back(envelope);
-
-          for (const IncrementalPreservedSlot &slot : text.slotSection.slots) {
-            SlotRecord slotRecord = {};
-            const IncrementalPreservedSlotState &slotState =
-                getIncrementalPreservedSlotState(slot);
-            slotRecord.occupantKeyOffset = strings.add(
-                slot.match([](const FreeSlotRecord &) { return std::string(); },
-                           [](const OccupiedSlotRecord &occupied) {
-                             return occupied.occupantKey;
-                           }));
-            slotRecord.envelopeIndex = envelopeIndex;
-            slotRecord.minAlignment = slotState.minAlignment;
-            slotRecord.state = slot.match(
-                [](const FreeSlotRecord &) {
-                  return static_cast<uint16_t>(WireIncrementalSlotState::Free);
-                },
-                [](const OccupiedSlotRecord &) {
-                  return static_cast<uint16_t>(
-                      WireIncrementalSlotState::Occupied);
-                });
-            slotRecord.fillByte = slotState.fillByte;
-            slotRecord.startRVA = slotState.startRVA;
-            slotRecord.capacity = slotState.capacity;
-            slotRecord.committedSize = slotState.committedSize;
-            slotRecords.push_back(slotRecord);
-          }
+          appendSlotRecords(text.slotSection.slots, envelopeIndex, slotRecords,
+                            strings);
 
           for (const ExistingSlotChunkPlacement &placement :
                text.slotSection.preservedChunks) {
@@ -1373,32 +1384,8 @@ Error writeIncrementalState(StringRef path,
           envelope.activeEndRVA = rdata.slotSection.activeEndRVA;
           uint32_t envelopeIndex = envelopeRecords.size();
           envelopeRecords.push_back(envelope);
-
-          for (const IncrementalPreservedSlot &slot : rdata.slotSection.slots) {
-            SlotRecord slotRecord = {};
-            const IncrementalPreservedSlotState &slotState =
-                getIncrementalPreservedSlotState(slot);
-            slotRecord.occupantKeyOffset = strings.add(
-                slot.match([](const FreeSlotRecord &) { return std::string(); },
-                           [](const OccupiedSlotRecord &occupied) {
-                             return occupied.occupantKey;
-                           }));
-            slotRecord.envelopeIndex = envelopeIndex;
-            slotRecord.minAlignment = slotState.minAlignment;
-            slotRecord.state = slot.match(
-                [](const FreeSlotRecord &) {
-                  return static_cast<uint16_t>(WireIncrementalSlotState::Free);
-                },
-                [](const OccupiedSlotRecord &) {
-                  return static_cast<uint16_t>(
-                      WireIncrementalSlotState::Occupied);
-                });
-            slotRecord.fillByte = slotState.fillByte;
-            slotRecord.startRVA = slotState.startRVA;
-            slotRecord.capacity = slotState.capacity;
-            slotRecord.committedSize = slotState.committedSize;
-            slotRecords.push_back(slotRecord);
-          }
+          appendSlotRecords(rdata.slotSection.slots, envelopeIndex, slotRecords,
+                            strings);
 
           for (const ExistingSlotChunkPlacement &placement :
                rdata.slotSection.preservedChunks) {
@@ -1424,32 +1411,8 @@ Error writeIncrementalState(StringRef path,
           envelope.activeEndRVA = data.slotSection.activeEndRVA;
           uint32_t envelopeIndex = envelopeRecords.size();
           envelopeRecords.push_back(envelope);
-
-          for (const IncrementalPreservedSlot &slot : data.slotSection.slots) {
-            SlotRecord slotRecord = {};
-            const IncrementalPreservedSlotState &slotState =
-                getIncrementalPreservedSlotState(slot);
-            slotRecord.occupantKeyOffset = strings.add(
-                slot.match([](const FreeSlotRecord &) { return std::string(); },
-                           [](const OccupiedSlotRecord &occupied) {
-                             return occupied.occupantKey;
-                           }));
-            slotRecord.envelopeIndex = envelopeIndex;
-            slotRecord.minAlignment = slotState.minAlignment;
-            slotRecord.state = slot.match(
-                [](const FreeSlotRecord &) {
-                  return static_cast<uint16_t>(WireIncrementalSlotState::Free);
-                },
-                [](const OccupiedSlotRecord &) {
-                  return static_cast<uint16_t>(
-                      WireIncrementalSlotState::Occupied);
-                });
-            slotRecord.fillByte = slotState.fillByte;
-            slotRecord.startRVA = slotState.startRVA;
-            slotRecord.capacity = slotState.capacity;
-            slotRecord.committedSize = slotState.committedSize;
-            slotRecords.push_back(slotRecord);
-          }
+          appendSlotRecords(data.slotSection.slots, envelopeIndex, slotRecords,
+                            strings);
 
           for (const ExistingSlotChunkPlacement &placement :
                data.slotSection.preservedChunks) {

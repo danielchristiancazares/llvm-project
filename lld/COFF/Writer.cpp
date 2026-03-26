@@ -765,7 +765,7 @@ void Writer::finalizeAddresses() {
 }
 
 void Writer::writePEChecksum() {
-  if (!ctx.config.writeCheckSum) {
+  if (ctx.config.peChecksumMode != PEChecksumMode::WritePEChecksum) {
     return;
   }
 
@@ -1345,7 +1345,7 @@ void Writer::createMiscChunks() {
 
   createECChunks();
 
-  if (config->autoImport)
+  if (config->autoImportMode == AutoImportMode::ApplyAutoImport)
     createRuntimePseudoRelocs();
 
   if (config->mingw) {
@@ -1462,7 +1462,8 @@ void Writer::createExportTable() {
   }
   ctx.forEachActiveSymtab([&](SymbolTable &symtab) {
     if (symtab.edataStart) {
-      if (symtab.hadExplicitExports)
+      if (symtab.exportConfigurationMode ==
+          ExportConfigurationMode::HonorExplicitExports)
         Warn(ctx) << "literal .edata sections override exports";
     } else if (!symtab.exports.empty()) {
       std::vector<Chunk *> edataChunks;
@@ -2485,7 +2486,7 @@ void Writer::createRuntimePseudoRelocs() {
       sc->getRuntimePseudoRelocs(rels);
     }
 
-    if (!ctx.config.pseudoRelocs) {
+    if (ctx.config.pseudoRelocMode != PseudoRelocMode::EmitRuntimePseudoRelocs) {
       // Not writing any pseudo relocs; if some were needed, error out and
       // indicate what required them.
       for (const RuntimePseudoReloc &rpr : rels)

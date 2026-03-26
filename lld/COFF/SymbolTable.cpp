@@ -264,7 +264,8 @@ void SymbolTable::loadMinGWSymbols() {
       continue;
     StringRef name = undef->getName();
 
-    if (machine == I386 && ctx.config.stdcallFixup) {
+    if (machine == I386 &&
+        ctx.config.stdcallFixupMode == StdcallFixupMode::ApplyStdcallFixups) {
       // Check if we can resolve an undefined decorated symbol by finding
       // the intended target as an undecorated symbol (only with a leading
       // underscore).
@@ -285,7 +286,8 @@ void SymbolTable::loadMinGWSymbols() {
         }
         // If it's lazy or already defined, hook it up as weak alias.
         if (l->isLazy() || isa<Defined>(l)) {
-          if (ctx.config.warnStdcallFixup)
+          if (ctx.config.stdcallFixupDiagnosticMode ==
+              StdcallFixupDiagnosticMode::WarnOnResolvedFixup)
             Warn(ctx) << "Resolving " << origName << " by linking to "
                       << newName;
           else
@@ -297,7 +299,7 @@ void SymbolTable::loadMinGWSymbols() {
       }
     }
 
-    if (ctx.config.autoImport) {
+    if (ctx.config.autoImportMode == AutoImportMode::ApplyAutoImport) {
       if (name.starts_with("__imp_"))
         continue;
       // If we have an undefined symbol, but we have a lazy symbol we could
@@ -444,7 +446,8 @@ void SymbolTable::reportUnresolvable() {
     }
     if (name.contains("_PchSym_"))
       continue;
-    if (ctx.config.autoImport && impSymbol(name))
+    if (ctx.config.autoImportMode == AutoImportMode::ApplyAutoImport &&
+        impSymbol(name))
       continue;
     undefs.insert(sym);
   }
@@ -509,7 +512,8 @@ void SymbolTable::resolveRemainingUndefines(std::vector<Undefined *> &aliases) {
     if (name.contains("_PchSym_"))
       continue;
 
-    if (ctx.config.autoImport && handleMinGWAutomaticImport(sym, name))
+    if (ctx.config.autoImportMode == AutoImportMode::ApplyAutoImport &&
+        handleMinGWAutomaticImport(sym, name))
       continue;
 
     // Remaining undefined symbols are not fatal if /force is specified.

@@ -44,6 +44,11 @@ struct WrappedSymbol {
 
 struct UndefinedDiag;
 
+enum class ExportConfigurationMode {
+  AllowAutoExports,
+  HonorExplicitExports,
+};
+
 // SymbolTable is a bucket of all known symbols, including defined,
 // undefined, or lazy symbols (the last one is symbols in archive
 // files whose archive members are not yet loaded).
@@ -155,18 +160,16 @@ public:
   // An entry point symbol.
   Symbol *entry = nullptr;
 
-  // A list of chunks which to be added to .rdata.
   std::vector<Chunk *> localImportChunks;
 
-  // A list of EC EXP+ symbols.
   std::vector<Symbol *> expSymbols;
 
   std::vector<SameAddressThunkARM64EC *> sameAddressThunks;
 
-  // A list of DLL exports.
   std::vector<Export> exports;
   llvm::DenseSet<StringRef> directivesExports;
-  bool hadExplicitExports;
+  ExportConfigurationMode exportConfigurationMode =
+      ExportConfigurationMode::AllowAutoExports;
 
   Chunk *edataStart = nullptr;
   Chunk *edataEnd = nullptr;
@@ -174,13 +177,10 @@ public:
   Symbol *delayLoadHelper = nullptr;
   Chunk *tailMergeUnwindInfoChunk = nullptr;
 
-  // A list of wrapped symbols.
   std::vector<WrappedSymbol> wrapped;
 
-  // Used for /alternatename.
   std::map<StringRef, StringRef> alternateNames;
 
-  // Used for /aligncomm.
   std::map<std::string, int> alignComm;
 
   void fixupExports();

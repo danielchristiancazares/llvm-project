@@ -28,8 +28,6 @@ Optional debug/asserts build:
 
 `cmake --build build --target lld`
 
-`cmake --build build --target lld-link`
-
 3. Run full COFF + linker checks:
 
 `cmake --build build --target check-lld`
@@ -44,13 +42,13 @@ For COFF-focused local validation, use direct lit runs from `build`:
 
 4. Rebuild after source or CMake option changes:
 
-`cmake --build build -j`
+`cmake --build build --target lld`
 
 When CMake options change, re-run configure with Ninja (same `build` directory):
 
 `cmake -S llvm -B build -G Ninja -DLLVM_ENABLE_PROJECTS=lld -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM" -DCMAKE_BUILD_TYPE=RelWithDebInfo`
 
-`cmake --build build -j`
+`cmake --build build --target lld`
 
 Built binaries are in `build/bin` (for example `lld`, `lld-link`, and `ld.lld`).
 

@@ -71,7 +71,8 @@ public:
   Closed() = delete;
   Closed(const Closed &) = delete;
   Closed &operator=(const Closed &) = delete;
-  Closed(Closed &&) = default;
+  Closed(Closed &&)
+      noexcept((std::is_nothrow_move_constructible_v<Ts> && ...)) = default;
   Closed &operator=(Closed &&) = delete;
 
   template <class T, class... Args>

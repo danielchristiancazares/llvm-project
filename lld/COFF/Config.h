@@ -110,6 +110,76 @@ enum class BuildIDHash {
   Binary,
 };
 
+enum class TailMergeMode {
+  SkipTailMerge,
+  TailMergeStringLiterals,
+};
+
+enum class LTODebugPassManagerMode {
+  SuppressDebugPassManagerOutput,
+  EmitDebugPassManagerOutput,
+};
+
+enum class ThinLTOImportsFileMode {
+  SkipImportsFiles,
+  EmitImportsFiles,
+};
+
+enum class ThinLTOIndexingMode {
+  GenerateNativeObjectFiles,
+  WriteThinLTOIndexes,
+};
+
+enum class LTOPGOMismatchWarningMode {
+  WarnOnProfileMismatch,
+  SuppressProfileMismatchWarning,
+};
+
+enum class CallGraphProfileSortMode {
+  SortByCallGraphProfile,
+  PreserveObjectFileOrder,
+};
+
+enum class StdcallFixupMode {
+  RejectStdcallFixups,
+  ApplyStdcallFixups,
+};
+
+enum class StdcallFixupDiagnosticMode {
+  WarnOnResolvedFixup,
+  LogResolvedFixup,
+};
+
+enum class TimeTraceMode {
+  SkipTimeTrace,
+  EmitTimeTrace,
+};
+
+enum class AutoImportMode {
+  RequireExplicitImports,
+  ApplyAutoImport,
+};
+
+enum class PseudoRelocMode {
+  RejectRuntimePseudoRelocs,
+  EmitRuntimePseudoRelocs,
+};
+
+enum class PEChecksumMode {
+  SkipPEChecksum,
+  WritePEChecksum,
+};
+
+enum class InputPrefetchMode {
+  ReadInputsOnDemand,
+  PrefetchInputBuffers,
+};
+
+enum class DuplicateWeakPolicy {
+  ReportDuplicateWeak,
+  KeepFirstDuplicateWeak,
+};
+
 enum class IncrementalRequestPolicy {
   FullRelinkOnly,
   AttemptIncrementalReuse,
@@ -132,7 +202,7 @@ struct Configuration {
   bool demangle = true;
   bool doGC = true;
   ICFLevel doICF = ICFLevel::None;
-  bool tailMerge;
+  TailMergeMode tailMergeMode = TailMergeMode::SkipTailMerge;
   bool relocatable = true;
   bool forceMultiple = false;
   bool forceMultipleRes = false;
@@ -216,7 +286,8 @@ struct Configuration {
   bool fatLTOObjects = false;
 
   // Used for /opt:[no]ltodebugpassmanager
-  bool ltoDebugPassManager = false;
+  LTODebugPassManagerMode ltoDebugPassManagerMode =
+      LTODebugPassManagerMode::SuppressDebugPassManagerOutput;
 
   // Used for /merge:from=to (e.g. /merge:.rdata=.text)
   std::map<StringRef, StringRef> merge;
@@ -284,7 +355,8 @@ struct Configuration {
   llvm::StringRef ltoCSProfileFile;
 
   // Used for /lto-pgo-warn-mismatch:
-  bool ltoPGOWarnMismatch = true;
+  LTOPGOMismatchWarningMode ltoPGOWarnMismatchMode =
+      LTOPGOMismatchWarningMode::WarnOnProfileMismatch;
 
   // Used for /lto-sample-profile:
   llvm::StringRef ltoSampleProfileName;
@@ -293,7 +365,8 @@ struct Configuration {
   llvm::MapVector<std::pair<const SectionChunk *, const SectionChunk *>,
                   uint64_t>
       callGraphProfile;
-  bool callGraphProfileSort = false;
+  CallGraphProfileSortMode callGraphProfileSortMode =
+      CallGraphProfileSortMode::PreserveObjectFileOrder;
 
   // Used for /print-symbol-order:
   StringRef printSymbolOrder;
@@ -340,7 +413,6 @@ struct Configuration {
   bool warnLocallyDefinedImported = true;
   bool warnDebugInfoUnusable = true;
   bool warnLongSectionNames = true;
-  bool warnStdcallFixup = true;
   bool warnImportedDllMain = true;
   bool keepUnchangedImplib = true;
   IncrementalRequestPolicy incrementalRequestPolicy =
@@ -350,16 +422,21 @@ struct Configuration {
   bool repro = false;
   bool swaprunCD = false;
   bool swaprunNet = false;
-  bool thinLTOEmitImportsFiles;
-  bool thinLTOIndexOnly;
-  bool timeTraceEnabled = false;
-  bool autoImport = false;
-  bool pseudoRelocs = false;
-  bool stdcallFixup = false;
-  bool writeCheckSum = false;
-  bool prefetchInputs = false;
+  ThinLTOImportsFileMode thinLTOImportsFileMode =
+      ThinLTOImportsFileMode::SkipImportsFiles;
+  ThinLTOIndexingMode thinLTOIndexingMode =
+      ThinLTOIndexingMode::GenerateNativeObjectFiles;
+  TimeTraceMode timeTraceMode = TimeTraceMode::SkipTimeTrace;
+  AutoImportMode autoImportMode = AutoImportMode::RequireExplicitImports;
+  PseudoRelocMode pseudoRelocMode = PseudoRelocMode::RejectRuntimePseudoRelocs;
+  StdcallFixupMode stdcallFixupMode = StdcallFixupMode::RejectStdcallFixups;
+  PEChecksumMode peChecksumMode = PEChecksumMode::SkipPEChecksum;
+  InputPrefetchMode inputPrefetchMode = InputPrefetchMode::ReadInputsOnDemand;
   EmitKind emit = EmitKind::Obj;
-  bool allowDuplicateWeak = false;
+  DuplicateWeakPolicy duplicateWeakPolicy =
+      DuplicateWeakPolicy::ReportDuplicateWeak;
+  StdcallFixupDiagnosticMode stdcallFixupDiagnosticMode =
+      StdcallFixupDiagnosticMode::WarnOnResolvedFixup;
   BuildIDHash buildIDHash = BuildIDHash::None;
   llvm::SmallString<128> incrementalStatePath;
 };

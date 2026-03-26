@@ -154,7 +154,7 @@ using MBErrPair = std::pair<std::unique_ptr<MemoryBuffer>, std::error_code>;
 // Create a std::future that opens and maps a file using the best strategy for
 // the host platform.
 static std::future<MBErrPair> createFutureForFile(std::string path,
-                                                  bool prefetchInputs) {
+                                                  InputPrefetchMode prefetchMode) {
 #if _WIN64
   // On Windows, file I/O is relatively slow so it is best to do this
   // asynchronously.  But 32-bit has issues with potentially launching tons
@@ -169,7 +169,7 @@ static std::future<MBErrPair> createFutureForFile(std::string path,
     if (!mbOrErr)
       return MBErrPair{nullptr, mbOrErr.getError()};
     // Prefetch memory pages in the background as we will need them soon enough.
-    if (prefetchInputs)
+    if (prefetchMode == InputPrefetchMode::PrefetchInputBuffers)
       (*mbOrErr)->willNeedIfMmap();
     return MBErrPair{std::move(*mbOrErr), std::error_code()};
   });
@@ -373,7 +373,7 @@ void LinkerDriver::handleReproFile(StringRef path, InputOpt inputOpt) {
 
 void LinkerDriver::enqueuePath(StringRef path, bool lazy, InputOpt inputOpt) {
   auto future = std::make_shared<std::future<MBErrPair>>(
-      createFutureForFile(std::string(path), ctx.config.prefetchInputs));
+      createFutureForFile(std::string(path), ctx.config.inputPrefetchMode));
   std::string pathStr = std::string(path);
   enqueueTask([=]() {
     llvm::TimeTraceScope timeScope("File: ", path);
@@ -394,7 +394,8 @@ void LinkerDriver::enqueuePath(StringRef path, bool lazy, InputOpt inputOpt) {
           mb = std::move(*retryMb);
           // Prefetch memory pages in the background as we will need them soon
           // enough.
-          if (ctx.config.prefetchInputs)
+          if (ctx.config.inputPrefetchMode ==
+              InputPrefetchMode::PrefetchInputBuffers)
             mb->willNeedIfMmap();
         }
       } else {
@@ -521,7 +522,7 @@ void LinkerDriver::enqueueArchiveMember(const Archive::Child &c,
             "could not get the filename for the member defining symbol " +
                 symName);
   auto future = std::make_shared<std::future<MBErrPair>>(
-      createFutureForFile(childName, ctx.config.prefetchInputs));
+      createFutureForFile(childName, ctx.config.inputPrefetchMode));
   enqueueTask([=]() {
     auto mbOrErr = future->get();
     if (mbOrErr.second)
@@ -627,7 +628,7 @@ void LinkerDriver::parseDirectives(InputFile *file) {
       ctx.config.noDefaultLibs.insert(findLib(arg->getValue()).lower());
       break;
     case OPT_release:
-      ctx.config.writeCheckSum = true;
+      ctx.config.peChecksumMode = PEChecksumMode::WritePEChecksum;
       break;
     case OPT_section:
       parseSection(arg->getValue());
@@ -1487,8 +1488,11 @@ void LinkerDriver::maybeExportMinGWSymbols(const opt::InputArgList &args) {
     if (!ctx.config.dll)
       return;
 
-    if (ctx.symtab.hadExplicitExports ||
-        (ctx.config.machine == ARM64X && ctx.hybridSymtab->hadExplicitExports))
+    if (ctx.symtab.exportConfigurationMode ==
+            ExportConfigurationMode::HonorExplicitExports ||
+        (ctx.config.machine == ARM64X &&
+         ctx.hybridSymtab->exportConfigurationMode ==
+             ExportConfigurationMode::HonorExplicitExports))
       return;
     if (args.hasArg(OPT_exclude_all_symbols))
       return;
@@ -1615,11 +1619,13 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   opt::InputArgList args = parser.parse(argsArr);
 
   // Initialize time trace profiler.
-  config->timeTraceEnabled = args.hasArg(OPT_time_trace_eq);
+  config->timeTraceMode = args.hasArg(OPT_time_trace_eq)
+                              ? TimeTraceMode::EmitTimeTrace
+                              : TimeTraceMode::SkipTimeTrace;
   config->timeTraceGranularity =
       args::getInteger(args, OPT_time_trace_granularity_eq, 500);
 
-  if (config->timeTraceEnabled)
+  if (config->timeTraceMode == TimeTraceMode::EmitTimeTrace)
     timeTraceProfilerInitialize(config->timeTraceGranularity, argsArr[0]);
 
   llvm::TimeTraceScope timeScope("COFF link");
@@ -2048,8 +2054,14 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   std::optional<ICFLevel> icfLevel;
   if (args.hasArg(OPT_profile))
     icfLevel = ICFLevel::None;
-  unsigned tailMerge = 1;
-  bool ltoDebugPM = false;
+  enum class TailMergePreference {
+    FollowICF,
+    SkipTailMerge,
+    TailMergeStringLiterals,
+  };
+  TailMergePreference tailMergePreference = TailMergePreference::FollowICF;
+  LTODebugPassManagerMode ltoDebugPassManagerMode =
+      LTODebugPassManagerMode::SuppressDebugPassManagerOutput;
   for (auto *arg : args.filtered(OPT_opt)) {
     std::string str = StringRef(arg->getValue()).lower();
     SmallVector<StringRef, 1> vec;
@@ -2066,13 +2078,15 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
       } else if (s == "noicf") {
         icfLevel = ICFLevel::None;
       } else if (s == "lldtailmerge") {
-        tailMerge = 2;
+        tailMergePreference = TailMergePreference::TailMergeStringLiterals;
       } else if (s == "nolldtailmerge") {
-        tailMerge = 0;
+        tailMergePreference = TailMergePreference::SkipTailMerge;
       } else if (s == "ltodebugpassmanager") {
-        ltoDebugPM = true;
+        ltoDebugPassManagerMode =
+            LTODebugPassManagerMode::EmitDebugPassManagerOutput;
       } else if (s == "noltodebugpassmanager") {
-        ltoDebugPM = false;
+        ltoDebugPassManagerMode =
+            LTODebugPassManagerMode::SuppressDebugPassManagerOutput;
       } else if (s.consume_front("lldlto=")) {
         if (s.getAsInteger(10, config->ltoo) || config->ltoo > 3)
           Err(ctx) << "/opt:lldlto: invalid optimization level: " << s;
@@ -2098,9 +2112,20 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     icfLevel = doGC ? ICFLevel::All : ICFLevel::None;
   config->doGC = doGC;
   config->doICF = *icfLevel;
-  config->tailMerge =
-      (tailMerge == 1 && config->doICF != ICFLevel::None) || tailMerge == 2;
-  config->ltoDebugPassManager = ltoDebugPM;
+  switch (tailMergePreference) {
+  case TailMergePreference::FollowICF:
+    config->tailMergeMode = config->doICF != ICFLevel::None
+                                ? TailMergeMode::TailMergeStringLiterals
+                                : TailMergeMode::SkipTailMerge;
+    break;
+  case TailMergePreference::SkipTailMerge:
+    config->tailMergeMode = TailMergeMode::SkipTailMerge;
+    break;
+  case TailMergePreference::TailMergeStringLiterals:
+    config->tailMergeMode = TailMergeMode::TailMergeStringLiterals;
+    break;
+  }
+  config->ltoDebugPassManagerMode = ltoDebugPassManagerMode;
 
   // Handle /lldsavetemps
   if (args.hasArg(OPT_lldsavetemps)) {
@@ -2246,9 +2271,15 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   // Handle /dwodir
   config->dwoDir = args.getLastArgValue(OPT_dwodir);
 
-  config->thinLTOEmitImportsFiles = args.hasArg(OPT_thinlto_emit_imports_files);
-  config->thinLTOIndexOnly = args.hasArg(OPT_thinlto_index_only) ||
-                             args.hasArg(OPT_thinlto_index_only_arg);
+  config->thinLTOImportsFileMode =
+      args.hasArg(OPT_thinlto_emit_imports_files)
+          ? ThinLTOImportsFileMode::EmitImportsFiles
+          : ThinLTOImportsFileMode::SkipImportsFiles;
+  config->thinLTOIndexingMode =
+      args.hasArg(OPT_thinlto_index_only) ||
+              args.hasArg(OPT_thinlto_index_only_arg)
+          ? ThinLTOIndexingMode::WriteThinLTOIndexes
+          : ThinLTOIndexingMode::GenerateNativeObjectFiles;
   config->thinLTOIndexOnlyArg =
       args.getLastArgValue(OPT_thinlto_index_only_arg);
   std::tie(config->thinLTOPrefixReplaceOld, config->thinLTOPrefixReplaceNew,
@@ -2261,8 +2292,11 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   config->ltoCSProfileFile = args.getLastArgValue(OPT_lto_cs_profile_file);
   config->ltoSampleProfileName = args.getLastArgValue(OPT_lto_sample_profile);
   // Handle miscellaneous boolean flags.
-  config->ltoPGOWarnMismatch = args.hasFlag(OPT_lto_pgo_warn_mismatch,
-                                            OPT_lto_pgo_warn_mismatch_no, true);
+  config->ltoPGOWarnMismatchMode =
+      args.hasFlag(OPT_lto_pgo_warn_mismatch, OPT_lto_pgo_warn_mismatch_no,
+                   true)
+          ? LTOPGOMismatchWarningMode::WarnOnProfileMismatch
+          : LTOPGOMismatchWarningMode::SuppressProfileMismatchWarning;
   config->allowBind = args.hasFlag(OPT_allowbind, OPT_allowbind_no, true);
   config->allowIsolation =
       args.hasFlag(OPT_allowisolation, OPT_allowisolation_no, true);
@@ -2290,18 +2324,34 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     parseSwaprun(arg->getValue());
   config->terminalServerAware =
       !config->dll && args.hasFlag(OPT_tsaware, OPT_tsaware_no, true);
-  config->autoImport =
-      args.hasFlag(OPT_auto_import, OPT_auto_import_no, config->mingw);
-  config->pseudoRelocs = args.hasFlag(
-      OPT_runtime_pseudo_reloc, OPT_runtime_pseudo_reloc_no, config->mingw);
-  config->callGraphProfileSort = args.hasFlag(
-      OPT_call_graph_profile_sort, OPT_call_graph_profile_sort_no, true);
-  config->stdcallFixup =
-      args.hasFlag(OPT_stdcall_fixup, OPT_stdcall_fixup_no, config->mingw);
-  config->warnStdcallFixup = !args.hasArg(OPT_stdcall_fixup);
-  config->allowDuplicateWeak =
+  config->autoImportMode =
+      args.hasFlag(OPT_auto_import, OPT_auto_import_no, config->mingw)
+          ? AutoImportMode::ApplyAutoImport
+          : AutoImportMode::RequireExplicitImports;
+  config->pseudoRelocMode =
+      args.hasFlag(OPT_runtime_pseudo_reloc, OPT_runtime_pseudo_reloc_no,
+                   config->mingw)
+          ? PseudoRelocMode::EmitRuntimePseudoRelocs
+          : PseudoRelocMode::RejectRuntimePseudoRelocs;
+  config->callGraphProfileSortMode =
+      args.hasFlag(OPT_call_graph_profile_sort,
+                   OPT_call_graph_profile_sort_no, true)
+          ? CallGraphProfileSortMode::SortByCallGraphProfile
+          : CallGraphProfileSortMode::PreserveObjectFileOrder;
+  config->stdcallFixupMode =
+      args.hasFlag(OPT_stdcall_fixup, OPT_stdcall_fixup_no, config->mingw)
+          ? StdcallFixupMode::ApplyStdcallFixups
+          : StdcallFixupMode::RejectStdcallFixups;
+  config->stdcallFixupDiagnosticMode = args.hasArg(OPT_stdcall_fixup)
+                                           ? StdcallFixupDiagnosticMode::
+                                                 LogResolvedFixup
+                                           : StdcallFixupDiagnosticMode::
+                                                 WarnOnResolvedFixup;
+  config->duplicateWeakPolicy =
       args.hasFlag(OPT_lld_allow_duplicate_weak,
-                   OPT_lld_allow_duplicate_weak_no, config->mingw);
+                   OPT_lld_allow_duplicate_weak_no, config->mingw)
+          ? DuplicateWeakPolicy::KeepFirstDuplicateWeak
+          : DuplicateWeakPolicy::ReportDuplicateWeak;
 
   if (args.hasFlag(OPT_inferasanlibs, OPT_inferasanlibs_no, false))
     Warn(ctx) << "ignoring '/inferasanlibs', this flag is not supported";
@@ -2339,7 +2389,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
                            : IncrementalRequestPolicy::FullRelinkOnly;
 
   if (args.hasFlag(OPT_prefetch_inputs, OPT_prefetch_inputs_no, false))
-    config->prefetchInputs = true;
+    config->inputPrefetchMode = InputPrefetchMode::PrefetchInputBuffers;
 
   if (errCount(ctx))
     return;
@@ -2435,7 +2485,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
 
   // Handle /RELEASE
   if (args.hasArg(OPT_release))
-    config->writeCheckSum = true;
+    config->peChecksumMode = PEChecksumMode::WritePEChecksum;
 
   // Handle /safeseh, x86 only, on by default, except for mingw.
   if (config->machine == I386) {
@@ -2684,7 +2734,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
       symtab.addSynthetic("__arm64x_native_entrypoint", nullptr);
     }
 
-    if (config->pseudoRelocs) {
+    if (config->pseudoRelocMode == PseudoRelocMode::EmitRuntimePseudoRelocs) {
       symtab.addAbsolute(symtab.mangle("__RUNTIME_PSEUDO_RELOC_LIST__"), 0);
       symtab.addAbsolute(symtab.mangle("__RUNTIME_PSEUDO_RELOC_LIST_END__"), 0);
     }
@@ -2772,7 +2822,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
         ;
   });
 
-  if (config->autoImport || config->stdcallFixup) {
+  if (config->autoImportMode == AutoImportMode::ApplyAutoImport ||
+      config->stdcallFixupMode == StdcallFixupMode::ApplyStdcallFixups) {
     // MinGW specific.
     // Load any further object files that might be needed for doing automatic
     // imports, and do stdcall fixups.
@@ -2810,7 +2861,9 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     return;
 
   ctx.forEachSymtab([](SymbolTable &symtab) {
-    symtab.hadExplicitExports = !symtab.exports.empty();
+    symtab.exportConfigurationMode =
+        symtab.exports.empty() ? ExportConfigurationMode::AllowAutoExports
+                               : ExportConfigurationMode::HonorExplicitExports;
   });
   if (config->mingw) {
     // In MinGW, all symbols are automatically exported if no symbols
@@ -2832,7 +2885,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   // files" and not object files. Index file creation is already done
   // in addCombinedLTOObject, so we are done if that's the case.
   // Likewise, don't emit object files for other /lldemit options.
-  if (config->emit != EmitKind::Obj || config->thinLTOIndexOnly)
+  if (config->emit != EmitKind::Obj ||
+      config->thinLTOIndexingMode == ThinLTOIndexingMode::WriteThinLTOIndexes)
     return;
 
   // If we generated native object files from bitcode files, this resolves
@@ -2966,11 +3020,13 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     if (args.hasArg(OPT_call_graph_ordering_file))
       Err(ctx) << "/order and /call-graph-order-file may not be used together";
     parseOrderFile(arg->getValue());
-    config->callGraphProfileSort = false;
+    config->callGraphProfileSortMode =
+        CallGraphProfileSortMode::PreserveObjectFileOrder;
   }
 
   // Handle /call-graph-ordering-file and /call-graph-profile-sort (default on).
-  if (config->callGraphProfileSort) {
+  if (config->callGraphProfileSortMode ==
+      CallGraphProfileSortMode::SortByCallGraphProfile) {
     llvm::TimeTraceScope timeScope("Call graph");
     if (auto *arg = args.getLastArg(OPT_call_graph_ordering_file))
       parseCallGraphFile(arg->getValue());
@@ -3005,7 +3061,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   // Clean up /linkreprofullpathrsp file
   reproFile.reset();
 
-  if (config->timeTraceEnabled) {
+  if (config->timeTraceMode == TimeTraceMode::EmitTimeTrace) {
     // Manually stop the topmost "COFF link" scope, since we're shutting down.
     timeTraceProfilerEnd();
 

@@ -54,6 +54,7 @@ autoconf/autom4te.cache
 /.idea
 /cmake-build*
 # Coding assistants' stuff
+AGENTS.md
 /CLAUDE.md
 /instructions.md
 .claude/
@@ -66,7 +67,7 @@ autoconf/autom4te.cache
 .cursorindexingignore
 #Unrelated documentation
 llvm-lld.md
-DESIGN.md
+CPP_DESIGN.md
 repomix.config.json
 OPTIMIZATION_PATH_FAILURES.md
 SDD.md
