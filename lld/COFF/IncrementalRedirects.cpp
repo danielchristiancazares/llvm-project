@@ -102,15 +102,17 @@ buildIncrementalEdgeStates(COFFLinkerContext &ctx,
         auto *targetChunk = dyn_cast<SectionChunk>(sym->getChunk());
         if (!targetChunk)
           continue;
-        if (!(targetChunk->getOutputCharacteristics() & llvm::COFF::IMAGE_SCN_CNT_CODE))
-          continue;
 
         std::string targetKey = getIncrementalChunkKey(inputIndices, *targetChunk);
         uint32_t targetOffset = sym->getRVA() - targetChunk->getRVA();
 
         IncrementalEdgeRouting routing =
             IncrementalEdgeRouting::BodyOnlyReference;
-        if (source->getMachine() == AMD64) {
+        bool targetIsCode =
+            targetChunk->getOutputCharacteristics() & llvm::COFF::IMAGE_SCN_CNT_CODE;
+        // Byte reuse must invalidate stale relocations for any moved section
+        // chunk target. Redirect rewriting stays limited to code-entry references.
+        if (targetIsCode && source->getMachine() == AMD64) {
           auto it = targetHasCanonicalEntry.find(targetKey);
           if (it == targetHasCanonicalEntry.end()) {
             bool hasEntry = hasIncrementalCanonicalEntry(*targetChunk);

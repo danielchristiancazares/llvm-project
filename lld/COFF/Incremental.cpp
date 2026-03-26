@@ -326,23 +326,18 @@ static std::string getIncrementalArchiveMemberKey(StringRef archiveName,
 }
 
 static uint64_t computeIncrementalImportTopologyHash(COFFLinkerContext &ctx) {
-  SmallVector<std::string, 16> records;
-  records.reserve(ctx.importFileInstances.size());
+  SmallString<512> buffer;
+  raw_svector_ostream os(buffer);
   for (ImportFile *file : ctx.importFileInstances) {
-    std::string record;
-    raw_string_ostream os(record);
+    if (!file->live)
+      continue;
+    // Preserve the live import order because createImportTables() keeps the
+    // first-seen DLL order, which affects the observable IAT layout.
     os << file->dllName << '\n'
        << file->externalName << '\n'
        << file->hdr->OrdinalHint << '\n'
        << file->hdr->TypeInfo << '\n';
-    records.push_back(std::move(record));
   }
-  llvm::sort(records);
-
-  SmallString<512> buffer;
-  raw_svector_ostream os(buffer);
-  for (const std::string &record : records)
-    os << record;
   return xxh3_64bits(buffer);
 }
 

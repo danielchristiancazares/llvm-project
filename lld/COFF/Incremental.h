@@ -73,7 +73,7 @@ struct IncrementalReuseData {
   IncrementalTextThunkPoolState currentTextThunkPool;
   llvm::StringMap<Defined *> redirectSymbols;
   llvm::StringMap<Defined *> poolThunkSymbols;
-  llvm::StringSet<> movedTextTargets;
+  llvm::StringSet<> movedChunkTargets;
   llvm::StringSet<> activeRedirectTargets;
 };
 

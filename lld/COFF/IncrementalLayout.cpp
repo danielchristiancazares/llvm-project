@@ -91,7 +91,7 @@ static void clearReuseState(IncrementalReuseData &reuse) {
   reuse.currentTextThunkPool = {};
   reuse.redirectSymbols.clear();
   reuse.poolThunkSymbols.clear();
-  reuse.movedTextTargets.clear();
+  reuse.movedChunkTargets.clear();
   reuse.activeRedirectTargets.clear();
   reuse.currentEdges.clear();
 }
@@ -637,7 +637,7 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       if (auto placementIt = placementsByKey.find(key);
           placementIt != placementsByKey.end() &&
           placementIt->second->startRVA != slot.slot.startRVA)
-        reuse.movedTextTargets.insert(key);
+        reuse.movedChunkTargets.insert(key);
       exactLayoutOnly = false;
       verboseLogs.push_back(formatPlacementLog("reused free slot",
                                                currentSection.name,
@@ -666,7 +666,7 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       redirectIt->second.engagement = IncrementalRedirectEngagement::Installed;
     }
     if (placementsByKey.count(key))
-      reuse.movedTextTargets.insert(key);
+      reuse.movedChunkTargets.insert(key);
     tailCursor = startRVA + size;
     exactLayoutOnly = false;
     verboseLogs.push_back(formatPlacementLog("allocated tail reserve",
@@ -709,7 +709,7 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
 
       if (!hasInstalledRedirect(plan)) {
         if (hadLegacyRedirect(plan)) {
-          reuse.movedTextTargets.insert(plan.targetKey);
+          reuse.movedChunkTargets.insert(plan.targetKey);
           exactLayoutOnly = false;
         }
         continue;
@@ -1048,7 +1048,7 @@ bool applyIncrementalLayout(COFFLinkerContext &ctx,
 
   StringSet<> affectedSourceKeys;
   for (const IncrementalEdgeState &edge : reuse.currentEdges) {
-    if (!reuse.movedTextTargets.contains(edge.targetKey) &&
+    if (!reuse.movedChunkTargets.contains(edge.targetKey) &&
         !reuse.activeRedirectTargets.contains(edge.targetKey))
       continue;
     if (reuse.activeRedirectTargets.contains(edge.targetKey) &&
