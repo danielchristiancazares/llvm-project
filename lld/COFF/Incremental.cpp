@@ -80,7 +80,7 @@ namespace {
 struct IncrementalStateBuildResult {
   IncrementalBaselineEmission baselineEmission =
       IncrementalBaselineEmission::make<EmitNextBaseline>();
-  IncrementalStateFile state;
+  IncrementalBaselineSnapshot snapshot;
 };
 
 static bool
@@ -382,7 +382,9 @@ static uint64_t computeIncrementalResourceInputHash(COFFLinkerContext &ctx) {
 static IncrementalBaselineEmission
 buildIncrementalLayoutTables(COFFLinkerContext &ctx,
                              const IncrementalInputIndexMap &inputIndices,
-                             IncrementalStateFile &state) {
+                             const IncrementalReuseData *reuseData,
+                             llvm::ArrayRef<IncrementalSectionState> sectionStates,
+                             IncrementalBaselineSnapshot &snapshot) {
   enum class BaselineEmissionChoice : uint8_t {
     Emit = 1,
     Skip = 2,
@@ -394,56 +396,52 @@ buildIncrementalLayoutTables(COFFLinkerContext &ctx,
     if (section->getVirtualSize() != 0)
       activeSections.push_back(section);
 
-  DenseMap<const OutputSection *, uint32_t> envelopeIndices;
-  for (size_t sectionIndex = 0; sectionIndex < activeSections.size();
+  DenseMap<const OutputSection *, uint64_t> maxSectionEndRVABySection;
+  for (size_t i = 0; i < activeSections.size(); ++i)
+    maxSectionEndRVABySection[activeSections[i]] =
+        i + 1 < activeSections.size() ? activeSections[i + 1]->getRVA()
+                                      : snapshot.sizeOfImage;
+
+  snapshot.sections.reserve(sectionStates.size());
+  for (size_t sectionIndex = 0; sectionIndex < ctx.outputSections.size();
        ++sectionIndex) {
-    OutputSection *section = activeSections[sectionIndex];
+    OutputSection *section = ctx.outputSections[sectionIndex];
+    const IncrementalSectionState &sectionState = sectionStates[sectionIndex];
     IncrementalSectionLayoutKind layoutKind = classifyIncrementalSection(
         section->name, section->header.Characteristics);
-    if (layoutKind == IncrementalSectionLayoutKind::ExactSectionLayout)
-      continue;
 
-    IncrementalSectionEnvelopeState envelope;
-    envelope.name = section->name.str();
-    envelope.characteristics = section->header.Characteristics;
-    envelope.sectionRVA = section->getRVA();
-    envelope.maxSectionEndRVA = sectionIndex + 1 < activeSections.size()
-                                    ? activeSections[sectionIndex + 1]->getRVA()
-                                    : state.sizeOfImage;
-    envelope.layoutKind = layoutKind;
-    uint64_t activeEndRVA = section->getRVA() + section->getVirtualSize();
-    if (layoutKind == IncrementalSectionLayoutKind::TextFreeSlots) {
-      activeEndRVA = section->getRVA();
-      for (Chunk *chunk : section->chunks) {
-        if (isa<IncrementalLongThunkChunkX64>(chunk))
-          continue;
-        activeEndRVA =
-            std::max(activeEndRVA, chunk->getRVA() + chunk->getSize());
-      }
+    if (section->getVirtualSize() == 0 ||
+        layoutKind == IncrementalSectionLayoutKind::ExactSectionLayout) {
+      snapshot.sections.push_back(
+          IncrementalSectionSnapshot::make<ExactSectionSnapshot>(
+              ExactSectionSnapshot{sectionState}));
+      continue;
     }
-    envelope.activeEndRVA = activeEndRVA;
-    envelopeIndices[section] = state.sectionEnvelopes.size();
-    state.sectionEnvelopes.push_back(std::move(envelope));
-  }
 
-  for (OutputSection *section : activeSections) {
-    auto envelopeIt = envelopeIndices.find(section);
-    if (envelopeIt == envelopeIndices.end())
-      continue;
-
-    uint32_t envelopeIndex = envelopeIt->second;
-    const IncrementalSectionEnvelopeState &envelope =
-        state.sectionEnvelopes[envelopeIndex];
-
-    if (isIncrementalFreeSlotLayout(envelope.layoutKind)) {
+    if (isIncrementalFreeSlotLayout(layoutKind)) {
       auto suppressStateWrite = [&](const Twine &detail) {
         baselineEmission = BaselineEmissionChoice::Skip;
         if (ctx.config.verbose)
           Log(ctx) << "incremental: not writing state: " << detail;
       };
       auto isPersistedSlotChunk = [&](Chunk *chunk) {
-        return isIncrementalPersistedSlotChunk(envelope.layoutKind, *chunk);
+        return isIncrementalPersistedSlotChunk(layoutKind, *chunk);
       };
+
+      IncrementalSlotSectionSnapshot slotSection;
+      slotSection.section = sectionState;
+      slotSection.maxSectionEndRVA = maxSectionEndRVABySection.lookup(section);
+      slotSection.activeEndRVA = section->getRVA() + section->getVirtualSize();
+      if (layoutKind == IncrementalSectionLayoutKind::TextFreeSlots) {
+        slotSection.activeEndRVA = section->getRVA();
+        for (Chunk *chunk : section->chunks) {
+          if (isa<IncrementalLongThunkChunkX64>(chunk))
+            continue;
+          slotSection.activeEndRVA = std::max(slotSection.activeEndRVA,
+                                              chunk->getRVA() + chunk->getSize());
+        }
+      }
+
       for (size_t chunkIndex = 0; chunkIndex < section->chunks.size();
            ++chunkIndex) {
         Chunk *chunk = section->chunks[chunkIndex];
@@ -452,7 +450,7 @@ buildIncrementalLayoutTables(COFFLinkerContext &ctx,
         std::string key = getIncrementalChunkKey(inputIndices, *chunk);
         bool isPadding = isa<IncrementalPaddingChunk>(chunk);
 
-        uint64_t slotEnd = envelope.activeEndRVA;
+        uint64_t slotEnd = slotSection.activeEndRVA;
         for (size_t nextIndex = chunkIndex + 1;
              nextIndex < section->chunks.size(); ++nextIndex) {
           Chunk *nextChunk = section->chunks[nextIndex];
@@ -468,61 +466,83 @@ buildIncrementalLayoutTables(COFFLinkerContext &ctx,
           return IncrementalBaselineEmission::make<SkipNextBaseline>();
         }
 
-        IncrementalSlotRecordState slot;
-        slot.envelopeIndex = envelopeIndex;
-        slot.startRVA = chunk->getRVA();
-        slot.capacity = slotEnd - chunk->getRVA();
-        slot.committedSize = chunk->getSize();
-        slot.minAlignment = chunk->getAlignment();
-        slot.fillByte =
+        IncrementalPreservedSlotState slotState;
+        slotState.startRVA = chunk->getRVA();
+        slotState.capacity = slotEnd - chunk->getRVA();
+        slotState.committedSize = chunk->getSize();
+        slotState.minAlignment = chunk->getAlignment();
+        slotState.fillByte =
             isPadding ? cast<IncrementalPaddingChunk>(chunk)->getFillByte()
-                      : getIncrementalFillByte(envelope.layoutKind);
-        slot.state = isPadding ? IncrementalSlotState::Free
-                               : IncrementalSlotState::Occupied;
-        if (!isPadding)
-          slot.occupantKey = key;
-        state.slotRecords.push_back(std::move(slot));
-
-        if (isPadding)
+                      : getIncrementalFillByte(layoutKind);
+        if (isPadding) {
+          slotSection.slots.push_back(
+              IncrementalPreservedSlot::make<FreeSlotRecord>(
+                  FreeSlotRecord{slotState}));
           continue;
+        }
 
-        IncrementalPlacementState placement;
-        placement.key = key;
-        placement.envelopeIndex = envelopeIndex;
-        placement.kind = IncrementalPlacementKind::ExistingSlot;
-        placement.startRVA = chunk->getRVA();
-        placement.size = chunk->getSize();
-        placement.alignment = chunk->getAlignment();
-        state.placements.push_back(std::move(placement));
+        slotSection.slots.push_back(
+            IncrementalPreservedSlot::make<OccupiedSlotRecord>(
+                OccupiedSlotRecord{slotState, key}));
+        slotSection.preservedChunks.push_back(
+            ExistingSlotChunkPlacement{key, chunk->getRVA(), chunk->getSize(),
+                                       chunk->getAlignment()});
+      }
+
+      if (layoutKind == IncrementalSectionLayoutKind::TextFreeSlots) {
+        TextSlotSectionSnapshot text;
+        text.slotSection = std::move(slotSection);
+        if (reuseData) {
+          text.redirects = reuseData->currentTextRedirects;
+          text.thunkPool = reuseData->currentTextThunkPool;
+        }
+        snapshot.sections.push_back(
+            IncrementalSectionSnapshot::make<TextSlotSectionSnapshot>(
+                std::move(text)));
+      } else if (layoutKind ==
+                 IncrementalSectionLayoutKind::ReadOnlyDataFreeSlots) {
+        snapshot.sections.push_back(
+            IncrementalSectionSnapshot::make<ReadOnlySlotSectionSnapshot>(
+                ReadOnlySlotSectionSnapshot{std::move(slotSection)}));
+      } else {
+        snapshot.sections.push_back(
+            IncrementalSectionSnapshot::make<WritableSlotSectionSnapshot>(
+                WritableSlotSectionSnapshot{std::move(slotSection)}));
       }
       continue;
     }
 
-    if (!isIncrementalPackedLayout(envelope.layoutKind))
+    if (!isIncrementalPackedLayout(layoutKind)) {
+      snapshot.sections.push_back(
+          IncrementalSectionSnapshot::make<ExactSectionSnapshot>(
+              ExactSectionSnapshot{sectionState}));
       continue;
+    }
 
-    IncrementalPackedSectionState packedSection;
-    packedSection.envelopeIndex = envelopeIndex;
+    IncrementalPackedPrefixSectionSnapshot packedSection;
+    packedSection.section = sectionState;
     packedSection.activePrefixSize =
-        envelope.activeEndRVA - envelope.sectionRVA;
+        section->getRVA() + section->getVirtualSize() - section->getRVA();
     packedSection.reserveSize =
-        envelope.maxSectionEndRVA - envelope.activeEndRVA;
+        maxSectionEndRVABySection.lookup(section) -
+        (section->getRVA() + section->getVirtualSize());
     for (Chunk *chunk : section->chunks) {
       if (chunk->getSize() == 0)
         continue;
       std::string key = getIncrementalChunkKey(inputIndices, *chunk);
-      packedSection.recordKeys.push_back(key);
-
-      IncrementalPlacementState placement;
-      placement.key = key;
-      placement.envelopeIndex = envelopeIndex;
-      placement.kind = IncrementalPlacementKind::PackedPrefix;
-      placement.startRVA = chunk->getRVA();
-      placement.size = chunk->getSize();
-      placement.alignment = chunk->getAlignment();
-      state.placements.push_back(std::move(placement));
+      packedSection.members.push_back(
+          PackedPrefixChunkPlacement{key, chunk->getRVA(), chunk->getSize(),
+                                     chunk->getAlignment()});
     }
-    state.packedSections.push_back(std::move(packedSection));
+
+    if (layoutKind == IncrementalSectionLayoutKind::PackedPDataPrefix)
+      snapshot.sections.push_back(
+          IncrementalSectionSnapshot::make<PDataPackedPrefixSectionSnapshot>(
+              PDataPackedPrefixSectionSnapshot{std::move(packedSection)}));
+    else
+      snapshot.sections.push_back(
+          IncrementalSectionSnapshot::make<XDataPackedPrefixSectionSnapshot>(
+              XDataPackedPrefixSectionSnapshot{std::move(packedSection)}));
   }
 
   if (baselineEmission == BaselineEmissionChoice::Skip)
@@ -530,10 +550,70 @@ buildIncrementalLayoutTables(COFFLinkerContext &ctx,
   return IncrementalBaselineEmission::make<EmitNextBaseline>();
 }
 
-static std::vector<IncrementalSymbolState>
+static std::string
+describeIncrementalResolvedSymbol(const IncrementalResolvedSymbolSnapshot &state) {
+  SmallString<128> buffer;
+  raw_svector_ostream os(buffer);
+  state.match(
+      [&](const RegularResolvedSymbol &regular) {
+        os << regular.name << '\n' << "regular\n";
+        regular.owner.match(
+            [&](const PersistedInputOwner &owner) {
+              os << "input:" << owner.inputIndex << '\n';
+            },
+            [&](const NoPersistedInputOwner &) { os << "input:none\n"; });
+        os << regular.value << '\n';
+        regular.chunk.match(
+            [&](const PersistedChunkReference &chunk) {
+              os << "chunk:" << chunk.chunkKey << '\n';
+            },
+            [&](const NoPersistedChunkReference &) { os << "chunk:none\n"; });
+      },
+      [&](const CommonResolvedSymbol &common) {
+        os << common.name << '\n' << "common\n";
+        common.owner.match(
+            [&](const PersistedInputOwner &owner) {
+              os << "input:" << owner.inputIndex << '\n';
+            },
+            [&](const NoPersistedInputOwner &) { os << "input:none\n"; });
+        os << common.size << '\n' << common.alignment << '\n';
+      },
+      [&](const ImportDataResolvedSymbol &importData) {
+        os << importData.name << '\n' << "importdata\n" << importData.ordinal
+           << '\n' << importData.dllName << '\n' << importData.externalName
+           << '\n' << importData.typeInfo << '\n';
+      },
+      [&](const ImportThunkResolvedSymbol &importThunk) {
+        os << importThunk.name << '\n' << "importthunk\n"
+           << importThunk.wrappedSymbolName << '\n';
+      },
+      [&](const LocalImportResolvedSymbol &localImport) {
+        os << localImport.name << '\n' << "localimport\n";
+        localImport.chunk.match(
+            [&](const PersistedChunkReference &chunk) {
+              os << "chunk:" << chunk.chunkKey << '\n';
+            },
+            [&](const NoPersistedChunkReference &) { os << "chunk:none\n"; });
+      },
+      [&](const AbsoluteResolvedSymbol &absolute) {
+        os << absolute.name << '\n' << "absolute\n" << absolute.value << '\n';
+      },
+      [&](const SyntheticResolvedSymbol &synthetic) {
+        os << synthetic.name << '\n' << "synthetic\n";
+        synthetic.chunk.match(
+            [&](const PersistedChunkReference &chunk) {
+              os << "chunk:" << chunk.chunkKey << '\n';
+            },
+            [&](const NoPersistedChunkReference &) { os << "chunk:none\n"; });
+      });
+  return std::string(buffer);
+}
+
+static std::vector<IncrementalResolvedSymbolSnapshot>
 buildIncrementalSymbolStates(COFFLinkerContext &ctx,
                              const IncrementalInputIndexMap &inputIndices) {
-  std::vector<IncrementalSymbolState> states;
+  std::vector<IncrementalResolvedSymbolSnapshot> states;
+  std::vector<std::pair<std::string, size_t>> order;
   ctx.forEachActiveSymtab([&](SymbolTable &symtab) {
     symtab.forEachSymbol([&](Symbol *sym) {
       auto *def = dyn_cast<Defined>(sym);
@@ -543,81 +623,135 @@ buildIncrementalSymbolStates(COFFLinkerContext &ctx,
         if (!coff->getCOFFSymbol().isExternal())
           return;
 
-      IncrementalSymbolState state;
-      state.name = sym->getName().str();
-
       if (auto *reg = dyn_cast<DefinedRegular>(sym)) {
-        state.kind = IncrementalSymbolKind::Regular;
-        if (auto *file = dyn_cast<ObjFile>(reg->getFile()))
-          if (auto it = inputIndices.find(file); it != inputIndices.end())
-            state.inputIndex = it->second;
-        state.value = reg->getValue();
-        if (SectionChunk *chunk = reg->getChunk())
-          state.auxiliaryKey = getIncrementalChunkKey(inputIndices, *chunk);
+        IncrementalPersistedInputOwner owner = [&]() {
+          if (auto *file = dyn_cast<ObjFile>(reg->getFile()))
+            if (auto it = inputIndices.find(file); it != inputIndices.end())
+              return IncrementalPersistedInputOwner::make<PersistedInputOwner>(
+                  PersistedInputOwner{it->second});
+          return IncrementalPersistedInputOwner::make<NoPersistedInputOwner>();
+        }();
+        IncrementalPersistedChunkReference chunkRef = [&]() {
+          if (SectionChunk *chunk = reg->getChunk())
+            return IncrementalPersistedChunkReference::make<PersistedChunkReference>(
+                PersistedChunkReference{
+                    getIncrementalChunkKey(inputIndices, *chunk)});
+          return IncrementalPersistedChunkReference::make<
+              NoPersistedChunkReference>();
+        }();
+        RegularResolvedSymbol state{sym->getName().str(), std::move(owner),
+                                    reg->getValue(), std::move(chunkRef)};
+        states.push_back(
+            IncrementalResolvedSymbolSnapshot::make<RegularResolvedSymbol>(
+                std::move(state)));
+        order.emplace_back(describeIncrementalResolvedSymbol(states.back()),
+                           states.size() - 1);
       } else if (auto *common = dyn_cast<DefinedCommon>(sym)) {
-        state.kind = IncrementalSymbolKind::Common;
-        if (auto *file = dyn_cast<ObjFile>(common->getFile()))
-          if (auto it = inputIndices.find(file); it != inputIndices.end())
-            state.inputIndex = it->second;
-        state.value = common->getChunk()->getSize();
-        std::string key;
-        raw_string_ostream os(key);
-        os << common->getChunk()->getAlignment();
-        state.auxiliaryKey = os.str();
+        IncrementalPersistedInputOwner owner = [&]() {
+          if (auto *file = dyn_cast<ObjFile>(common->getFile()))
+            if (auto it = inputIndices.find(file); it != inputIndices.end())
+              return IncrementalPersistedInputOwner::make<PersistedInputOwner>(
+                  PersistedInputOwner{it->second});
+          return IncrementalPersistedInputOwner::make<NoPersistedInputOwner>();
+        }();
+        CommonResolvedSymbol state{sym->getName().str(), std::move(owner),
+                                   common->getChunk()->getSize(),
+                                   common->getChunk()->getAlignment()};
+        states.push_back(
+            IncrementalResolvedSymbolSnapshot::make<CommonResolvedSymbol>(
+                std::move(state)));
+        order.emplace_back(describeIncrementalResolvedSymbol(states.back()),
+                           states.size() - 1);
       } else if (auto *imp = dyn_cast<DefinedImportData>(sym)) {
-        state.kind = IncrementalSymbolKind::ImportData;
-        state.value = imp->getOrdinal();
-        std::string key;
-        raw_string_ostream os(key);
-        os << imp->getDLLName() << '\n'
-           << imp->getExternalName() << '\n'
-           << imp->file->hdr->TypeInfo;
-        state.auxiliaryKey = os.str();
+        ImportDataResolvedSymbol state;
+        state.name = sym->getName().str();
+        state.ordinal = imp->getOrdinal();
+        state.dllName = imp->getDLLName().str();
+        state.externalName = imp->getExternalName().str();
+        state.typeInfo = imp->file->hdr->TypeInfo;
+        states.push_back(
+            IncrementalResolvedSymbolSnapshot::make<ImportDataResolvedSymbol>(
+                std::move(state)));
+        order.emplace_back(describeIncrementalResolvedSymbol(states.back()),
+                           states.size() - 1);
       } else if (auto *thunk = dyn_cast<DefinedImportThunk>(sym)) {
-        state.kind = IncrementalSymbolKind::ImportThunk;
-        state.auxiliaryKey = thunk->wrappedSym->getName().str();
+        ImportThunkResolvedSymbol state;
+        state.name = sym->getName().str();
+        state.wrappedSymbolName = thunk->wrappedSym->getName().str();
+        states.push_back(
+            IncrementalResolvedSymbolSnapshot::make<ImportThunkResolvedSymbol>(
+                std::move(state)));
+        order.emplace_back(describeIncrementalResolvedSymbol(states.back()),
+                           states.size() - 1);
       } else if (auto *localImport = dyn_cast<DefinedLocalImport>(sym)) {
-        state.kind = IncrementalSymbolKind::LocalImport;
-        if (Chunk *chunk = localImport->getChunk())
-          state.auxiliaryKey = chunk->getDebugName().str();
+        IncrementalPersistedChunkReference chunkRef = [&]() {
+          if (Chunk *chunk = localImport->getChunk())
+            return IncrementalPersistedChunkReference::make<
+                PersistedChunkReference>(
+                PersistedChunkReference{chunk->getDebugName().str()});
+          return IncrementalPersistedChunkReference::make<
+              NoPersistedChunkReference>();
+        }();
+        LocalImportResolvedSymbol state{sym->getName().str(),
+                                        std::move(chunkRef)};
+        states.push_back(
+            IncrementalResolvedSymbolSnapshot::make<LocalImportResolvedSymbol>(
+                std::move(state)));
+        order.emplace_back(describeIncrementalResolvedSymbol(states.back()),
+                           states.size() - 1);
       } else if (auto *absolute = dyn_cast<DefinedAbsolute>(sym)) {
-        state.kind = IncrementalSymbolKind::Absolute;
+        AbsoluteResolvedSymbol state;
+        state.name = sym->getName().str();
         state.value = absolute->getVA();
+        states.push_back(
+            IncrementalResolvedSymbolSnapshot::make<AbsoluteResolvedSymbol>(
+                std::move(state)));
+        order.emplace_back(describeIncrementalResolvedSymbol(states.back()),
+                           states.size() - 1);
       } else if (auto *synthetic = dyn_cast<DefinedSynthetic>(sym)) {
-        state.kind = IncrementalSymbolKind::Synthetic;
-        if (Chunk *chunk = synthetic->getChunk())
-          state.auxiliaryKey = chunk->getDebugName().str();
+        IncrementalPersistedChunkReference chunkRef = [&]() {
+          if (Chunk *chunk = synthetic->getChunk())
+            return IncrementalPersistedChunkReference::make<
+                PersistedChunkReference>(
+                PersistedChunkReference{chunk->getDebugName().str()});
+          return IncrementalPersistedChunkReference::make<
+              NoPersistedChunkReference>();
+        }();
+        SyntheticResolvedSymbol state{sym->getName().str(),
+                                      std::move(chunkRef)};
+        states.push_back(
+            IncrementalResolvedSymbolSnapshot::make<SyntheticResolvedSymbol>(
+                std::move(state)));
+        order.emplace_back(describeIncrementalResolvedSymbol(states.back()),
+                           states.size() - 1);
       } else {
         return;
       }
-
-      states.push_back(std::move(state));
     });
   });
 
-  llvm::sort(states, [](const IncrementalSymbolState &lhs,
-                        const IncrementalSymbolState &rhs) {
-    return std::tie(lhs.name, lhs.kind, lhs.inputIndex, lhs.value,
-                    lhs.auxiliaryKey) < std::tie(rhs.name, rhs.kind,
-                                                 rhs.inputIndex, rhs.value,
-                                                 rhs.auxiliaryKey);
-  });
-  return states;
+  llvm::sort(order, llvm::less_first());
+  std::vector<IncrementalResolvedSymbolSnapshot> sortedStates;
+  sortedStates.reserve(states.size());
+  for (const auto &[description, index] : order) {
+    (void)description;
+    sortedStates.push_back(std::move(states[index]));
+  }
+  return sortedStates;
 }
 
 static IncrementalStateBuildResult
 buildIncrementalState(COFFLinkerContext &ctx,
                       const IncrementalCurrentInputs &currentInputs,
                       const IncrementalReuseData *reuseData) {
-  IncrementalStateFile state;
-  state.layoutMode = IncrementalLayoutMode::Slotted;
-  state.machine = ctx.config.machine;
-  state.outputPath = ctx.config.outputFile;
-  state.hardConfigHash = computeIncrementalHardConfigHash(ctx.config);
-  state.softConfigHash = computeIncrementalSoftConfigHash(ctx.config);
-  state.importTopologyHash = computeIncrementalImportTopologyHash(ctx);
-  state.exportTopologyHash = computeIncrementalExportTopologyHash(ctx);
-  state.resourceInputHash = computeIncrementalResourceInputHash(ctx);
+  IncrementalBaselineSnapshot snapshot;
+  snapshot.machine = ctx.config.machine;
+  snapshot.outputPath = ctx.config.outputFile;
+  snapshot.hardConfigHash = computeIncrementalHardConfigHash(ctx.config);
+  snapshot.softConfigHash = computeIncrementalSoftConfigHash(ctx.config);
+  snapshot.importTopologyHash = computeIncrementalImportTopologyHash(ctx);
+  snapshot.exportTopologyHash = computeIncrementalExportTopologyHash(ctx);
+  snapshot.resourceInputHash = computeIncrementalResourceInputHash(ctx);
 
   ErrorOr<std::unique_ptr<MemoryBuffer>> output =
       MemoryBuffer::getFile(ctx.config.outputFile, /*IsText=*/false,
@@ -627,8 +761,8 @@ buildIncrementalState(COFFLinkerContext &ctx,
                                        errorCodeToError(output.getError())));
   }
   StringRef outputData = (*output)->getBuffer();
-  state.outputSize = outputData.size();
-  state.outputHash = xxh3_64bits(outputData);
+  snapshot.outputSize = outputData.size();
+  snapshot.outputHash = xxh3_64bits(outputData);
 
   if (outputData.size() >= sizeof(dos_header)) {
     const uint8_t *buf = reinterpret_cast<const uint8_t *>(outputData.data());
@@ -640,17 +774,17 @@ buildIncrementalState(COFFLinkerContext &ctx,
         outputData.size() >= headerOff + sizeof(pe32plus_header)) {
       const pe32plus_header *pe =
           reinterpret_cast<const pe32plus_header *>(buf + headerOff);
-      state.sizeOfHeaders = pe->SizeOfHeaders;
-      state.sizeOfImage = pe->SizeOfImage;
+      snapshot.sizeOfHeaders = pe->SizeOfHeaders;
+      snapshot.sizeOfImage = pe->SizeOfImage;
     } else if (outputData.size() >= headerOff + sizeof(pe32_header)) {
       const pe32_header *pe =
           reinterpret_cast<const pe32_header *>(buf + headerOff);
-      state.sizeOfHeaders = pe->SizeOfHeaders;
-      state.sizeOfImage = pe->SizeOfImage;
+      snapshot.sizeOfHeaders = pe->SizeOfHeaders;
+      snapshot.sizeOfImage = pe->SizeOfImage;
     }
   }
 
-  state.inputs.reserve(ctx.objFileInstances.size());
+  snapshot.inputs.reserve(ctx.objFileInstances.size());
   for (size_t i = 0; i < ctx.objFileInstances.size(); ++i) {
     IncrementalInputState input;
     input.name = currentInputs.names[i];
@@ -658,9 +792,10 @@ buildIncrementalState(COFFLinkerContext &ctx,
     input.archiveOffset = currentInputs.archiveOffsets[i];
     input.contentHash = currentInputs.hashes[i];
     input.size = ctx.objFileInstances[i]->mb.getBufferSize();
-    state.inputs.push_back(std::move(input));
+    snapshot.inputs.push_back(std::move(input));
   }
 
+  SmallVector<IncrementalSectionState, 16> sectionStates;
   for (OutputSection *section : ctx.outputSections) {
     IncrementalSectionState sectionState;
     sectionState.name = section->name.str();
@@ -669,18 +804,17 @@ buildIncrementalState(COFFLinkerContext &ctx,
     sectionState.fileOffset = section->getFileOff();
     sectionState.virtualSize = section->getVirtualSize();
     sectionState.rawSize = section->getRawSize();
-    sectionState.firstChunk = state.chunks.size();
+    sectionState.firstChunk = snapshot.chunks.size();
     sectionState.chunkCount = section->chunks.size();
-    state.sections.push_back(sectionState);
+    sectionStates.push_back(sectionState);
 
     uint64_t sectionEnd = section->getRVA() + section->getVirtualSize();
     for (size_t i = 0; i < section->chunks.size(); ++i) {
       Chunk *chunk = section->chunks[i];
       IncrementalChunkState chunkState;
-      chunkState.kind = classifyIncrementalChunk(*chunk);
       chunkState.key =
           getIncrementalChunkKey(currentInputs.inputIndices, *chunk);
-      chunkState.sectionIndex = state.sections.size() - 1;
+      chunkState.sectionIndex = sectionStates.size() - 1;
       chunkState.outputCharacteristics = chunk->getOutputCharacteristics();
       chunkState.alignment = chunk->getAlignment();
       chunkState.rva = chunk->getRVA();
@@ -692,26 +826,44 @@ buildIncrementalState(COFFLinkerContext &ctx,
         chunkState.slotCapacity = sectionEnd - chunk->getRVA();
 
       if (auto *sec = dyn_cast<SectionChunk>(chunk)) {
+        ObjSectionChunkSnapshot objChunk;
+        objChunk.chunk = std::move(chunkState);
         auto it = currentInputs.inputIndices.find(sec->file);
         if (it != currentInputs.inputIndices.end())
-          chunkState.inputIndex = it->second;
-        chunkState.sectionNumber = sec->getSectionNumber();
-        chunkState.contentHash = xxh3_64bits(sec->getContents());
-        chunkState.symbolHash = computeIncrementalSymbolHash(*sec);
+          objChunk.inputIndex = it->second;
+        objChunk.sectionNumber = sec->getSectionNumber();
+        objChunk.contentHash = xxh3_64bits(sec->getContents());
+        objChunk.symbolHash = computeIncrementalSymbolHash(*sec);
+        snapshot.chunks.push_back(
+            IncrementalChunkSnapshot::make<ObjSectionChunkSnapshot>(
+                std::move(objChunk)));
+      } else if (isa<IncrementalPaddingChunk>(chunk)) {
+        snapshot.chunks.push_back(
+            IncrementalChunkSnapshot::make<PaddingChunkSnapshot>(
+                PaddingChunkSnapshot{std::move(chunkState)}));
+      } else if (isa<IncrementalEntryRedirectChunkX64>(chunk)) {
+        snapshot.chunks.push_back(
+            IncrementalChunkSnapshot::make<EntryRedirectChunkSnapshot>(
+                EntryRedirectChunkSnapshot{std::move(chunkState)}));
+      } else if (isa<IncrementalLongThunkChunkX64>(chunk)) {
+        snapshot.chunks.push_back(
+            IncrementalChunkSnapshot::make<LongThunkChunkSnapshot>(
+                LongThunkChunkSnapshot{std::move(chunkState)}));
+      } else {
+        snapshot.chunks.push_back(
+            IncrementalChunkSnapshot::make<SyntheticChunkSnapshot>(
+                SyntheticChunkSnapshot{std::move(chunkState)}));
       }
-      state.chunks.push_back(std::move(chunkState));
     }
   }
 
   IncrementalBaselineEmission baselineEmission =
-      buildIncrementalLayoutTables(ctx, currentInputs.inputIndices, state);
-  if (reuseData) {
-    state.textRedirects = reuseData->currentTextRedirects;
-    state.textThunkPool = reuseData->currentTextThunkPool;
-  }
-  state.symbols = buildIncrementalSymbolStates(ctx, currentInputs.inputIndices);
+      buildIncrementalLayoutTables(ctx, currentInputs.inputIndices, reuseData,
+                                   sectionStates, snapshot);
+  snapshot.symbols =
+      buildIncrementalSymbolStates(ctx, currentInputs.inputIndices);
   return IncrementalStateBuildResult{std::move(baselineEmission),
-                                     std::move(state)};
+                                     std::move(snapshot)};
 }
 
 } // namespace
@@ -816,17 +968,20 @@ bool isIncrementalPersistedSlotChunk(IncrementalSectionLayoutKind layoutKind,
 }
 
 IncrementalFreeSlotSelection
-findBestFitIncrementalFreeSlot(ArrayRef<IncrementalSlotRecordState> slots,
+findBestFitIncrementalFreeSlot(ArrayRef<IncrementalPreservedSlot> slots,
                                uint64_t size, uint32_t alignment) {
   size_t bestIndex = 0;
   bool found = false;
   for (size_t i = 0; i < slots.size(); ++i) {
-    const IncrementalSlotRecordState &slot = slots[i];
+    const IncrementalPreservedSlotState &slot =
+        getIncrementalPreservedSlotState(slots[i]);
     if (slot.capacity < size || slot.startRVA % alignment != 0)
       continue;
-    if (!found || slot.capacity < slots[bestIndex].capacity ||
-        (slot.capacity == slots[bestIndex].capacity &&
-         slot.startRVA < slots[bestIndex].startRVA)) {
+    const IncrementalPreservedSlotState &bestSlot =
+        getIncrementalPreservedSlotState(slots[bestIndex]);
+    if (!found || slot.capacity < bestSlot.capacity ||
+        (slot.capacity == bestSlot.capacity &&
+         slot.startRVA < bestSlot.startRVA)) {
       bestIndex = i;
       found = true;
     }
@@ -1125,23 +1280,30 @@ uint64_t computeIncrementalSymbolHash(const SectionChunk &chunk) {
 static bool
 validateIncrementalSymbolStates(COFFLinkerContext &ctx,
                                 const IncrementalBaselineData &baseline) {
-  std::vector<IncrementalSymbolState> currentSymbols =
+  std::vector<IncrementalResolvedSymbolSnapshot> currentSymbols =
       buildIncrementalSymbolStates(ctx, baseline.currentInputs.inputIndices);
-  if (currentSymbols.size() != baseline.state.symbols.size()) {
+  if (currentSymbols.size() != baseline.snapshot.symbols.size()) {
     installPendingIncrementalFullImageBuild(
         ctx, rebuildForLayoutRewrite("resolved symbol count changed"));
     return false;
   }
 
   for (size_t i = 0; i < currentSymbols.size(); ++i) {
-    const IncrementalSymbolState &current = currentSymbols[i];
-    const IncrementalSymbolState &old = baseline.state.symbols[i];
-    if (current.name != old.name || current.kind != old.kind ||
-        current.inputIndex != old.inputIndex || current.value != old.value ||
-        current.auxiliaryKey != old.auxiliaryKey) {
+    const IncrementalResolvedSymbolSnapshot &current = currentSymbols[i];
+    const IncrementalResolvedSymbolSnapshot &old = baseline.snapshot.symbols[i];
+    if (describeIncrementalResolvedSymbol(current) !=
+        describeIncrementalResolvedSymbol(old)) {
       std::string detail;
       raw_string_ostream os(detail);
-      os << "symbol winner changed: " << current.name;
+      std::string symbolName = current.match(
+          [](const RegularResolvedSymbol &symbol) { return symbol.name; },
+          [](const CommonResolvedSymbol &symbol) { return symbol.name; },
+          [](const ImportDataResolvedSymbol &symbol) { return symbol.name; },
+          [](const ImportThunkResolvedSymbol &symbol) { return symbol.name; },
+          [](const LocalImportResolvedSymbol &symbol) { return symbol.name; },
+          [](const AbsoluteResolvedSymbol &symbol) { return symbol.name; },
+          [](const SyntheticResolvedSymbol &symbol) { return symbol.name; });
+      os << "symbol winner changed: " << symbolName;
       installPendingIncrementalFullImageBuild(
           ctx, rebuildForLayoutRewrite(os.str()));
       return false;
@@ -1191,7 +1353,7 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
     return;
   }
 
-  Expected<IncrementalStateFile> stateOrErr =
+  Expected<IncrementalBaselineSnapshot> stateOrErr =
       loadIncrementalState(ctx.config.incrementalStatePath);
   if (!stateOrErr) {
     installFallback(
@@ -1211,13 +1373,6 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
         "incremental state was written for a different output"));
     return;
   }
-  if (stateOrErr->version < 3 ||
-      stateOrErr->layoutMode != IncrementalLayoutMode::Slotted) {
-    installFallback(
-        rebuildForMissingBaseline("slotted baseline state is missing"));
-    return;
-  }
-
   ErrorOr<std::unique_ptr<MemoryBuffer>> oldImage =
       MemoryBuffer::getFile(ctx.config.outputFile, /*IsText=*/false,
                             /*RequiresNullTerminator=*/false);
@@ -1232,12 +1387,12 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   }
 
   IncrementalBaselineData baseline;
-  baseline.state = std::move(*stateOrErr);
+  baseline.snapshot = std::move(*stateOrErr);
   baseline.oldImage = std::move(*oldImage);
   for (ArchiveFile *file : ctx.archiveFileInstances)
     baseline.replayableArchives.insert(file->getName());
 
-  for (const IncrementalInputState &input : baseline.state.inputs) {
+  for (const IncrementalInputState &input : baseline.snapshot.inputs) {
     if (input.parentName.empty())
       continue;
 
@@ -1249,7 +1404,7 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   }
 
   IncrementalPdbReusePolicy pdbReuse =
-      baseline.state.softConfigHash == softHash
+      baseline.snapshot.softConfigHash == softHash
           ? IncrementalPdbReusePolicy::make<ReusePdbMetadata>()
           : IncrementalPdbReusePolicy::make<RebuildPdbMetadata>();
   installIncrementalCoordinator(
@@ -1271,7 +1426,7 @@ void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
   }
 
   uint64_t resourceHash = computeIncrementalResourceInputHash(ctx);
-  if (resourceHash != loaded->baseline.state.resourceInputHash) {
+  if (resourceHash != loaded->baseline.snapshot.resourceInputHash) {
     installPendingIncrementalFullImageBuild(
         ctx, rebuildForLayoutRewrite("resource or manifest inputs changed"));
     return;
@@ -1280,15 +1435,15 @@ void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
   loaded->baseline.currentInputs = prepareCurrentIncrementalInputs(ctx);
   loaded->baseline.changedInputs.clear();
 
-  if (loaded->baseline.state.inputs.size() !=
+  if (loaded->baseline.snapshot.inputs.size() !=
       loaded->baseline.currentInputs.hashes.size()) {
     installPendingIncrementalFullImageBuild(
         ctx, rebuildForLayoutRewrite("input count changed"));
     return;
   }
 
-  for (size_t i = 0; i < loaded->baseline.state.inputs.size(); ++i) {
-    const IncrementalInputState &input = loaded->baseline.state.inputs[i];
+  for (size_t i = 0; i < loaded->baseline.snapshot.inputs.size(); ++i) {
+    const IncrementalInputState &input = loaded->baseline.snapshot.inputs[i];
     if (input.name != loaded->baseline.currentInputs.names[i] ||
         input.parentName != loaded->baseline.currentInputs.parentNames[i] ||
         input.archiveOffset !=
@@ -1315,13 +1470,13 @@ void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
     }
   }
 
-  if (loaded->baseline.state.importTopologyHash !=
+  if (loaded->baseline.snapshot.importTopologyHash !=
       computeIncrementalImportTopologyHash(ctx)) {
     installPendingIncrementalFullImageBuild(
         ctx, rebuildForLayoutRewrite("import topology changed"));
     return;
   }
-  if (loaded->baseline.state.exportTopologyHash !=
+  if (loaded->baseline.snapshot.exportTopologyHash !=
       computeIncrementalExportTopologyHash(ctx)) {
     installPendingIncrementalFullImageBuild(
         ctx, rebuildForLayoutRewrite("export topology changed"));
@@ -1362,7 +1517,7 @@ void finalizeIncrementalLink(COFFLinkerContext &ctx) {
   if (!shouldEmitNextBaseline(buildResult.baselineEmission))
     return;
   if (Error err = writeIncrementalState(ctx.config.incrementalStatePath,
-                                        buildResult.state))
+                                        buildResult.snapshot))
     Warn(ctx) << "failed to write incremental state: "
               << toString(std::move(err));
 }

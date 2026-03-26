@@ -110,18 +110,21 @@ public:
   /// it is unique. This prevents a record from being added to the input ghash
   /// table.
   bool shouldOmitFromPdb(uint32_t ghashIdx) {
-    return ghashIdx == endPrecompIdx;
+    return replayBoundary.match(
+        [&](const ReplayAllTypeRecords &) { return false; },
+        [&](const ReplayTypeRecordsSkippingEndPrecomp &boundary) {
+          return ghashIdx == boundary.ghashIndex;
+        });
   }
 
   const TpiKind kind;
   bool ownedGHashes = true;
   uint32_t tpiSrcIdx = 0;
 
-  /// The index (zero based, not 0x1000-based) of the LF_ENDPRECOMP record in
-  /// this object, if one exists. This is the all ones value otherwise. It is
-  /// recorded here for validation, and so that it can be omitted from the final
-  /// ghash table.
-  uint32_t endPrecompIdx = ~0U;
+  /// If this source carries an LF_ENDPRECOMP record that must be omitted from
+  /// the output PDB, this boundary records which ghash slot to skip.
+  IncrementalPDBTypeReplayBoundary replayBoundary =
+      IncrementalPDBTypeReplayBoundary::make<ReplayAllTypeRecords>();
 
 public:
   ObjFile *file;
@@ -176,13 +179,22 @@ TpiSource *makePrecompSource(COFFLinkerContext &ctx, ObjFile *file);
 TpiSource *makeUsePrecompSource(COFFLinkerContext &ctx, ObjFile *file,
                                 llvm::codeview::PrecompRecord ts);
 
+struct SkipRecordedTypeReplay {};
+
+struct RecordTypeReplay {
+  IncrementalPDBTypeReplaySnapshot replay;
+};
+
+using IncrementalPDBTypeReplayBuild =
+    Closed<SkipRecordedTypeReplay, RecordTypeReplay>;
+
 std::string getIncrementalPDBTypeCacheKey(const TpiSource &source);
-bool matchesIncrementalPDBTypeCacheEntry(
-    const TpiSource &source, const IncrementalPDBTypeCacheEntry &entry);
-bool buildIncrementalPDBTypeCacheEntry(const TpiSource &source,
-                                       IncrementalPDBTypeCacheEntry &entry);
-bool restoreIncrementalPDBTypeCacheEntry(
-    const IncrementalPDBTypeCacheEntry &entry, TpiSource &source);
+bool matchesIncrementalPDBTypeReplay(
+    const TpiSource &source, const IncrementalPDBTypeReplaySnapshot &entry);
+IncrementalPDBTypeReplayBuild
+buildIncrementalPDBTypeReplay(const TpiSource &source);
+bool restoreIncrementalPDBTypeReplay(
+    const IncrementalPDBTypeReplaySnapshot &entry, TpiSource &source);
 
 } // namespace lld::coff
 

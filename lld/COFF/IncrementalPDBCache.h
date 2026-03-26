@@ -9,6 +9,7 @@
 #ifndef LLD_COFF_INCREMENTALPDBCACHE_H
 #define LLD_COFF_INCREMENTALPDBCACHE_H
 
+#include "lld/Common/Closed.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringMap.h"
@@ -16,6 +17,7 @@
 #include "llvm/DebugInfo/CodeView/TypeHashing.h"
 #include "llvm/DebugInfo/CodeView/TypeIndexDiscovery.h"
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -26,33 +28,6 @@ class COFFLinkerContext;
 class Configuration;
 class ObjFile;
 class TpiSource;
-
-enum class IncrementalPDBTypeSourceKind : uint8_t {
-  Regular = 1,
-  PCH = 2,
-  UsingPCH = 3,
-  PDB = 4,
-};
-
-enum class IncrementalPDBDebugChunkKind : uint8_t {
-  DebugS = 1,
-  DebugF = 2,
-};
-
-enum class IncrementalPDBScopeAction : uint8_t {
-  None = 0,
-  Open = 1,
-  Close = 2,
-};
-
-enum IncrementalPDBSymbolDestMask : uint8_t {
-  IncrementalPDBGoesToGlobals = 1 << 0,
-  IncrementalPDBGoesToModule = 1 << 1,
-};
-
-enum IncrementalPDBSymbolPlanFlags : uint8_t {
-  IncrementalPDBUsesGlobalProcRef = 1 << 0,
-};
 
 struct IncrementalPDBTypeRef {
   llvm::codeview::TiRefKind kind = llvm::codeview::TiRefKind::TypeRef;
@@ -65,37 +40,167 @@ struct IncrementalPDBStringFixup {
   uint32_t symOffsetOfReference = 0;
 };
 
-struct IncrementalPDBSymbolPlan {
-  uint32_t recordOffset = 0;
-  uint32_t recordLength = 0;
-  uint32_t alignedLength = 0;
-  uint32_t relocIndex = 0;
-  uint32_t typeRefStart = 0;
-  uint16_t typeRefCount = 0;
-  uint8_t destMask = 0;
-  uint8_t flags = 0;
-  uint8_t rewriteKind = 0;
-  IncrementalPDBScopeAction scopeAction = IncrementalPDBScopeAction::None;
+struct ReplayAllTypeRecords {};
+
+struct ReplayTypeRecordsSkippingEndPrecomp {
+  uint32_t ghashIndex = 0;
 };
 
-struct IncrementalPDBSubsectionPlan {
+using IncrementalPDBTypeReplayBoundary =
+    Closed<ReplayAllTypeRecords, ReplayTypeRecordsSkippingEndPrecomp>;
+
+struct ReplayObjectTypes {
+  std::string path;
+  std::string parentPath;
+  uint64_t archiveOffset = 0;
+  uint64_t contentHash = 0;
+  IncrementalPDBTypeReplayBoundary boundary =
+      IncrementalPDBTypeReplayBoundary::make<ReplayAllTypeRecords>();
+  std::vector<llvm::codeview::GloballyHashedType> ghashes;
+  std::vector<uint8_t> isItemIndexBits;
+};
+
+struct ReplayPrecompiledHeaderTypes {
+  std::string path;
+  std::string parentPath;
+  uint64_t archiveOffset = 0;
+  uint64_t contentHash = 0;
+  uint32_t pchSignature = 0;
+  IncrementalPDBTypeReplayBoundary boundary =
+      IncrementalPDBTypeReplayBoundary::make<ReplayAllTypeRecords>();
+  std::vector<llvm::codeview::GloballyHashedType> ghashes;
+  std::vector<uint8_t> isItemIndexBits;
+};
+
+struct ReplayUsingPrecompiledHeaderTypes {
+  std::string path;
+  std::string parentPath;
+  uint64_t archiveOffset = 0;
+  uint64_t contentHash = 0;
+  uint64_t dependencyHash = 0;
+  IncrementalPDBTypeReplayBoundary boundary =
+      IncrementalPDBTypeReplayBoundary::make<ReplayAllTypeRecords>();
+  std::vector<llvm::codeview::GloballyHashedType> ghashes;
+  std::vector<uint8_t> isItemIndexBits;
+};
+
+struct ReplayTypeServerTpiOnly {
+  std::string path;
+  std::string parentPath;
+  uint64_t archiveOffset = 0;
+  uint64_t contentHash = 0;
+  IncrementalPDBTypeReplayBoundary boundary =
+      IncrementalPDBTypeReplayBoundary::make<ReplayAllTypeRecords>();
+  std::vector<llvm::codeview::GloballyHashedType> ghashes;
+  std::vector<uint8_t> isItemIndexBits;
+};
+
+struct ReplayTypeServerTpiAndIpi {
+  std::string path;
+  std::string parentPath;
+  uint64_t archiveOffset = 0;
+  uint64_t contentHash = 0;
+  IncrementalPDBTypeReplayBoundary boundary =
+      IncrementalPDBTypeReplayBoundary::make<ReplayAllTypeRecords>();
+  std::vector<llvm::codeview::GloballyHashedType> ghashes;
+  std::vector<uint8_t> isItemIndexBits;
+  std::vector<llvm::codeview::GloballyHashedType> auxGHashes;
+  std::vector<uint8_t> auxIsItemIndexBits;
+};
+
+using IncrementalPDBTypeReplaySnapshot =
+    Closed<ReplayObjectTypes, ReplayPrecompiledHeaderTypes,
+           ReplayUsingPrecompiledHeaderTypes, ReplayTypeServerTpiOnly,
+           ReplayTypeServerTpiAndIpi>;
+
+struct IncrementalPDBRecordLocation {
+  uint32_t recordOffset = 0;
+  uint32_t recordLength = 0;
+  uint32_t relocIndex = 0;
+};
+
+struct EmitGlobalOnlySymbol {};
+
+struct EmitModuleOnlySymbol {};
+
+struct EmitGlobalAndModuleSymbol {};
+
+using SymbolReplayRouting =
+    Closed<EmitGlobalOnlySymbol, EmitModuleOnlySymbol, EmitGlobalAndModuleSymbol>;
+
+struct OmitGlobalReplay {};
+
+struct ReplayGlobalSymbolBytes {};
+
+struct ReplayGlobalProcedureReference {};
+
+using GlobalSymbolReplay = Closed<OmitGlobalReplay, ReplayGlobalSymbolBytes,
+                                  ReplayGlobalProcedureReference>;
+
+struct ReplaySymbolWithoutTypeRewrite {};
+
+struct ReplayProcIdEndSymbol {};
+
+struct ReplayProcIdWithFixedTypeIndex {};
+
+struct ReplaySymbolWithDiscoveredTypeRefs {
+  std::vector<IncrementalPDBTypeRef> typeRefs;
+};
+
+using SymbolRewritePlan =
+    Closed<ReplaySymbolWithoutTypeRewrite, ReplayProcIdEndSymbol,
+           ReplayProcIdWithFixedTypeIndex, ReplaySymbolWithDiscoveredTypeRefs>;
+
+struct ReplayStandaloneSymbol {};
+
+struct ReplayScopeOpeningSymbol {};
+
+struct ReplayScopeClosingSymbol {};
+
+using SymbolScopeReplay =
+    Closed<ReplayStandaloneSymbol, ReplayScopeOpeningSymbol,
+           ReplayScopeClosingSymbol>;
+
+struct CachedSymbolReplay {
+  IncrementalPDBRecordLocation location;
+  uint32_t alignedLength = 0;
+  SymbolReplayRouting routing =
+      SymbolReplayRouting::make<EmitModuleOnlySymbol>();
+  GlobalSymbolReplay globalReplay =
+      GlobalSymbolReplay::make<OmitGlobalReplay>();
+  SymbolRewritePlan rewrite =
+      SymbolRewritePlan::make<ReplaySymbolWithoutTypeRewrite>();
+  SymbolScopeReplay scope =
+      SymbolScopeReplay::make<ReplayStandaloneSymbol>();
+};
+
+struct ReplayOpaqueSubsection {
   llvm::codeview::DebugSubsectionKind kind =
       llvm::codeview::DebugSubsectionKind::None;
-  uint32_t recordOffset = 0;
-  uint32_t recordLength = 0;
-  uint32_t relocIndex = 0;
-  uint32_t symbolPlanStart = 0;
-  uint32_t symbolPlanCount = 0;
+  IncrementalPDBRecordLocation location;
 };
 
-struct IncrementalPDBChunkPlan {
+struct ReplaySymbolSubsection {
+  IncrementalPDBRecordLocation location;
+  std::vector<CachedSymbolReplay> symbols;
+};
+
+using IncrementalPDBSubsectionReplay =
+    Closed<ReplayOpaqueSubsection, ReplaySymbolSubsection>;
+
+struct ReplayDebugSChunk {
   uint32_t chunkOrdinal = 0;
-  IncrementalPDBDebugChunkKind kind = IncrementalPDBDebugChunkKind::DebugS;
-  uint32_t subsectionStart = 0;
-  uint32_t subsectionCount = 0;
+  std::vector<IncrementalPDBSubsectionReplay> subsections;
 };
 
-struct IncrementalPDBModuleCacheEntry {
+struct ReplayDebugFChunk {
+  uint32_t chunkOrdinal = 0;
+};
+
+using IncrementalPDBChunkReplay =
+    Closed<ReplayDebugSChunk, ReplayDebugFChunk>;
+
+struct CachedModuleReplay {
   std::string path;
   std::string parentPath;
   uint64_t archiveOffset = 0;
@@ -103,33 +208,36 @@ struct IncrementalPDBModuleCacheEntry {
   uint64_t debugFHash = 0;
   uint64_t relocHash = 0;
   uint32_t moduleStreamSize = 0;
-  std::vector<IncrementalPDBChunkPlan> chunkPlans;
-  std::vector<IncrementalPDBSubsectionPlan> subsectionPlans;
-  std::vector<IncrementalPDBSymbolPlan> symbolPlans;
-  std::vector<IncrementalPDBTypeRef> typeRefs;
+  std::vector<IncrementalPDBChunkReplay> chunks;
   std::vector<IncrementalPDBStringFixup> stringFixups;
 };
 
-struct IncrementalPDBTypeCacheEntry {
-  std::string path;
-  std::string parentPath;
-  uint64_t archiveOffset = 0;
-  IncrementalPDBTypeSourceKind kind = IncrementalPDBTypeSourceKind::Regular;
-  uint64_t contentHash = 0;
-  uint64_t dependencyHash = 0;
-  uint32_t endPrecompIdx = ~0U;
-  std::vector<llvm::codeview::GloballyHashedType> ghashes;
-  std::vector<uint8_t> isItemIndexBits;
-  std::vector<llvm::codeview::GloballyHashedType> auxGHashes;
-  std::vector<uint8_t> auxIsItemIndexBits;
-};
-
-struct IncrementalPDBCacheFile {
+struct IncrementalPDBCacheSnapshot {
   uint64_t linkerBuildId = 0;
   uint64_t hardConfigHash = 0;
-  std::vector<IncrementalPDBTypeCacheEntry> typeEntries;
-  std::vector<IncrementalPDBModuleCacheEntry> moduleEntries;
+  std::vector<IncrementalPDBTypeReplaySnapshot> typeReplays;
+  std::vector<CachedModuleReplay> moduleReplays;
 };
+
+CachedModuleReplay cloneCachedModuleReplay(const CachedModuleReplay &entry);
+
+struct ReplayTypeFromCache {
+  std::reference_wrapper<const IncrementalPDBTypeReplaySnapshot> replay;
+};
+
+struct RebuildTypeFromCurrentInput {};
+
+using IncrementalPDBTypeReplayLookup =
+    Closed<ReplayTypeFromCache, RebuildTypeFromCurrentInput>;
+
+struct ReplayModuleFromCache {
+  std::reference_wrapper<const CachedModuleReplay> replay;
+};
+
+struct RebuildModuleFromCurrentInput {};
+
+using IncrementalPDBModuleReplayLookup =
+    Closed<ReplayModuleFromCache, RebuildModuleFromCurrentInput>;
 
 enum class IncrementalPDBCacheRuntimeMode : uint8_t {
   BypassCache = 1,
@@ -147,13 +255,12 @@ public:
   IncrementalPDBCacheSession &
   operator=(const IncrementalPDBCacheSession &) = delete;
 
-  const IncrementalPDBTypeCacheEntry *findTypeEntry(const TpiSource &source);
-  const IncrementalPDBModuleCacheEntry *findModuleEntry(const ObjFile &file);
+  IncrementalPDBTypeReplayLookup lookupTypeReplay(const TpiSource &source);
+  IncrementalPDBModuleReplayLookup lookupModuleReplay(const ObjFile &file);
 
   void recordTypeEntries(llvm::ArrayRef<TpiSource *> sources);
   llvm::Error writeCache(const llvm::DenseMap<const ObjFile *,
-                                              IncrementalPDBModuleCacheEntry>
-                             &modulePlans) const;
+                                              CachedModuleReplay> &modulePlans) const;
 
   IncrementalPDBCacheRuntimeMode runtimeMode() const { return mode; }
   uint64_t getTypeCacheHits() const { return typeCacheHits; }
@@ -164,19 +271,19 @@ public:
 private:
   explicit IncrementalPDBCacheSession(COFFLinkerContext &ctx);
 
-  const IncrementalPDBTypeCacheEntry *
-  findLoadedTypeEntry(llvm::StringRef key, const TpiSource &source) const;
-  const IncrementalPDBModuleCacheEntry *
-  findLoadedModuleEntry(llvm::StringRef key, const ObjFile &file) const;
+  const IncrementalPDBTypeReplaySnapshot *
+  findLoadedTypeReplay(llvm::StringRef key, const TpiSource &source) const;
+  const CachedModuleReplay *
+  findLoadedModuleReplay(llvm::StringRef key, const ObjFile &file) const;
 
   COFFLinkerContext &ctx;
   llvm::SmallString<128> cachePath;
   IncrementalPDBCacheRuntimeMode mode =
       IncrementalPDBCacheRuntimeMode::BypassCache;
-  IncrementalPDBCacheFile loadedCache;
-  llvm::StringMap<const IncrementalPDBTypeCacheEntry *> loadedTypesByKey;
-  llvm::StringMap<const IncrementalPDBModuleCacheEntry *> loadedModulesByKey;
-  std::vector<IncrementalPDBTypeCacheEntry> recordedTypeEntries;
+  IncrementalPDBCacheSnapshot loadedCache;
+  llvm::StringMap<const IncrementalPDBTypeReplaySnapshot *> loadedTypesByKey;
+  llvm::StringMap<const CachedModuleReplay *> loadedModulesByKey;
+  std::vector<IncrementalPDBTypeReplaySnapshot> recordedTypeReplays;
   uint64_t typeCacheHits = 0;
   uint64_t typeCacheMisses = 0;
   uint64_t moduleCacheHits = 0;
@@ -190,10 +297,10 @@ IncrementalPDBCacheRuntimeMode
 classifyIncrementalPDBCacheRuntimeMode(const COFFLinkerContext &ctx);
 uint64_t computeIncrementalPDBCacheBuildId();
 uint64_t computeIncrementalPDBCacheHardConfigHash(const Configuration &config);
-llvm::Expected<IncrementalPDBCacheFile>
+llvm::Expected<IncrementalPDBCacheSnapshot>
 loadIncrementalPDBCache(llvm::StringRef path);
 llvm::Error writeIncrementalPDBCache(llvm::StringRef path,
-                                     const IncrementalPDBCacheFile &cache);
+                                     const IncrementalPDBCacheSnapshot &cache);
 
 std::string getIncrementalPDBCacheObjectKey(const ObjFile &file);
 uint64_t computeIncrementalPDBModuleDebugSHash(const ObjFile &file);

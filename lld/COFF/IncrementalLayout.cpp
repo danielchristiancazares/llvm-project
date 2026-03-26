@@ -23,7 +23,7 @@ struct FreeRange {
 };
 
 struct PlannedSlot {
-  IncrementalSlotRecordState slot;
+  const IncrementalPreservedSlot *slot = nullptr;
   enum class Availability : uint8_t {
     Blocked = 1,
     Available = 2,
@@ -144,13 +144,15 @@ static void clearReuseState(IncrementalReuseData &reuse) {
 
 static SmallVector<OutputSection *, 16>
 getActiveSections(COFFLinkerContext &ctx,
-                  const IncrementalStateFile *loadedState) {
+                  const IncrementalBaselineSnapshot *loadedState) {
   SmallVector<OutputSection *, 16> activeSections;
   for (OutputSection *section : ctx.outputSections) {
     bool preserved = false;
-    if (loadedState &&
-        loadedState->layoutMode == IncrementalLayoutMode::Slotted) {
-      for (const IncrementalSectionState &oldSection : loadedState->sections) {
+    if (loadedState) {
+      for (const IncrementalSectionSnapshot &oldSectionSnapshot :
+           loadedState->sections) {
+        const IncrementalSectionState &oldSection =
+            getIncrementalSectionState(oldSectionSnapshot);
         if (section->name == oldSection.name &&
             section->header.Characteristics == oldSection.characteristics) {
           preserved = true;
@@ -178,15 +180,14 @@ hasDuplicateIncrementalChunkKeys(const IncrementalInputIndexMap &inputIndices,
   return false;
 }
 
-static const IncrementalSectionEnvelopeState *
-findSectionEnvelope(const IncrementalStateFile &state, StringRef name,
-                    uint32_t characteristics, uint32_t &envelopeIndex) {
-  for (size_t i = 0; i < state.sectionEnvelopes.size(); ++i) {
-    const IncrementalSectionEnvelopeState &envelope = state.sectionEnvelopes[i];
-    if (envelope.name == name && envelope.characteristics == characteristics) {
-      envelopeIndex = i;
-      return &envelope;
-    }
+static const IncrementalSectionSnapshot *
+findSectionSnapshot(const IncrementalBaselineSnapshot &snapshot, StringRef name,
+                    uint32_t characteristics) {
+  for (const IncrementalSectionSnapshot &section : snapshot.sections) {
+    const IncrementalSectionState &sectionState = getIncrementalSectionState(section);
+    if (sectionState.name == name &&
+        sectionState.characteristics == characteristics)
+      return &section;
   }
   return nullptr;
 }
@@ -207,51 +208,45 @@ static uint64_t getMinFragmentSize(IncrementalSectionLayoutKind layoutKind) {
 }
 
 static bool validateSlotReuseState(
-    COFFLinkerContext &ctx, const IncrementalSectionEnvelopeState &envelope,
-    uint32_t envelopeIndex, ArrayRef<IncrementalSlotRecordState> slotRecords) {
-  if (envelope.sectionRVA > envelope.activeEndRVA ||
-      envelope.activeEndRVA > envelope.maxSectionEndRVA ||
-      envelope.maxSectionEndRVA - envelope.sectionRVA > UINT32_MAX) {
+    COFFLinkerContext &ctx, const IncrementalSlotSectionSnapshot &slotSection,
+    bool isTextSection) {
+  const IncrementalSectionState &section = slotSection.section;
+  if (section.rva > slotSection.activeEndRVA ||
+      slotSection.activeEndRVA > slotSection.maxSectionEndRVA ||
+      slotSection.maxSectionEndRVA - section.rva > UINT32_MAX) {
     installRejectedBaseline(
         ctx, "slot envelope contains an invalid preserved range");
     return false;
   }
 
-  SmallVector<const IncrementalSlotRecordState *, 16> slots;
-  for (const IncrementalSlotRecordState &slot : slotRecords) {
-    if (slot.envelopeIndex != envelopeIndex)
-      continue;
-
+  SmallVector<const IncrementalPreservedSlot *, 16> slots;
+  for (const IncrementalPreservedSlot &slot : slotSection.slots) {
+    const IncrementalPreservedSlotState &slotState =
+        getIncrementalPreservedSlotState(slot);
     uint64_t slotEnd = 0;
-    if (slot.capacity == 0 || slot.capacity > UINT32_MAX ||
-        slot.minAlignment == 0 || slot.startRVA < envelope.sectionRVA ||
-        slot.startRVA >= envelope.activeEndRVA ||
-        slot.startRVA > UINT64_MAX - slot.capacity) {
+    if (slotState.capacity == 0 || slotState.capacity > UINT32_MAX ||
+        slotState.minAlignment == 0 || slotState.startRVA < section.rva ||
+        slotState.startRVA >= slotSection.activeEndRVA ||
+        slotState.startRVA > UINT64_MAX - slotState.capacity) {
       installRejectedBaseline(ctx,
                               "slot table contains invalid preserved range");
       return false;
     }
-    slotEnd = slot.startRVA + slot.capacity;
-    if (slotEnd > envelope.activeEndRVA || slot.committedSize > slot.capacity) {
+    slotEnd = slotState.startRVA + slotState.capacity;
+    if (slotEnd > slotSection.activeEndRVA ||
+        slotState.committedSize > slotState.capacity) {
       installRejectedBaseline(ctx,
                               "slot table contains invalid preserved range");
       return false;
     }
 
-    if (slot.state != IncrementalSlotState::Occupied &&
-        slot.state != IncrementalSlotState::Free) {
-      installRejectedBaseline(ctx, "slot table contains an invalid slot state");
-      return false;
-    }
-
-    if (slot.state == IncrementalSlotState::Occupied) {
-      if (slot.occupantKey.empty()) {
+    if (const std::string *occupant = getIncrementalPreservedSlotOccupant(slot)) {
+      if (occupant->empty()) {
         installRejectedBaseline(
             ctx, "occupied slot is missing its preserved occupant");
         return false;
       }
-      if (envelope.layoutKind == IncrementalSectionLayoutKind::TextFreeSlots &&
-          StringRef(slot.occupantKey).starts_with("longthunk:")) {
+      if (isTextSection && StringRef(*occupant).starts_with("longthunk:")) {
         installRejectedBaseline(ctx,
                                 "slot table contains stale long thunk state");
         return false;
@@ -261,15 +256,18 @@ static bool validateSlotReuseState(
     slots.push_back(&slot);
   }
 
-  llvm::sort(slots, [](const IncrementalSlotRecordState *lhs,
-                       const IncrementalSlotRecordState *rhs) {
-    return lhs->startRVA < rhs->startRVA;
+  llvm::sort(slots, [](const IncrementalPreservedSlot *lhs,
+                       const IncrementalPreservedSlot *rhs) {
+    return getIncrementalPreservedSlotState(*lhs).startRVA <
+           getIncrementalPreservedSlotState(*rhs).startRVA;
   });
 
-  uint64_t previousEnd = envelope.sectionRVA;
-  for (const IncrementalSlotRecordState *slot : slots) {
-    uint64_t slotEnd = slot->startRVA + slot->capacity;
-    if (slot->startRVA < previousEnd) {
+  uint64_t previousEnd = section.rva;
+  for (const IncrementalPreservedSlot *slot : slots) {
+    const IncrementalPreservedSlotState &slotState =
+        getIncrementalPreservedSlotState(*slot);
+    uint64_t slotEnd = slotState.startRVA + slotState.capacity;
+    if (slotState.startRVA < previousEnd) {
       installRejectedBaseline(
           ctx, "slot table contains overlapping preserved ranges");
       return false;
@@ -412,8 +410,8 @@ static bool applyExactSectionLayout(COFFLinkerContext &ctx,
     return false;
   }
 
-  if (oldSection.firstChunk > baseline.state.chunks.size() ||
-      baseline.state.chunks.size() - oldSection.firstChunk <
+  if (oldSection.firstChunk > baseline.snapshot.chunks.size() ||
+      baseline.snapshot.chunks.size() - oldSection.firstChunk <
           oldSection.chunkCount) {
     installRejectedBaseline(ctx, "chunk table range is invalid");
     return false;
@@ -426,11 +424,42 @@ static bool applyExactSectionLayout(COFFLinkerContext &ctx,
   for (size_t chunkOffset = 0; chunkOffset < currentSection.chunks.size();
        ++chunkOffset) {
     Chunk *currentChunk = currentSection.chunks[chunkOffset];
+    const IncrementalChunkSnapshot &oldChunkSnapshot =
+        baseline.snapshot.chunks[oldSection.firstChunk + chunkOffset];
     const IncrementalChunkState &oldChunk =
-        baseline.state.chunks[oldSection.firstChunk + chunkOffset];
+        getIncrementalChunkState(oldChunkSnapshot);
 
     if (oldChunk.sectionIndex != sectionIndex ||
-        classifyIncrementalChunk(*currentChunk) != oldChunk.kind ||
+        getIncrementalChunkKey(baseline.currentInputs.inputIndices,
+                               *currentChunk) != oldChunk.key) {
+      bool kindMatches = oldChunkSnapshot.match(
+          [&](const ObjSectionChunkSnapshot &) {
+            return isa<SectionChunk>(currentChunk);
+          },
+          [&](const SyntheticChunkSnapshot &) {
+            return !isa<SectionChunk>(currentChunk) &&
+                   !isa<IncrementalPaddingChunk>(currentChunk) &&
+                   !isa<IncrementalEntryRedirectChunkX64>(currentChunk) &&
+                   !isa<IncrementalLongThunkChunkX64>(currentChunk);
+          },
+          [&](const PaddingChunkSnapshot &) {
+            return isa<IncrementalPaddingChunk>(currentChunk);
+          },
+          [&](const EntryRedirectChunkSnapshot &) {
+            return isa<IncrementalEntryRedirectChunkX64>(currentChunk);
+          },
+          [&](const LongThunkChunkSnapshot &) {
+            return isa<IncrementalLongThunkChunkX64>(currentChunk);
+          });
+      if (kindMatches)
+        ;
+      else {
+        installLayoutRewrite(ctx, "chunk key mismatch in section " +
+                                      currentSection.name);
+        return false;
+      }
+    }
+    if (oldChunk.sectionIndex != sectionIndex ||
         getIncrementalChunkKey(baseline.currentInputs.inputIndices,
                                *currentChunk) != oldChunk.key) {
       installLayoutRewrite(ctx, "chunk key mismatch in section " +
@@ -446,19 +475,35 @@ static bool applyExactSectionLayout(COFFLinkerContext &ctx,
     currentChunk->setRVA(oldChunk.rva);
 
     auto *sectionChunk = dyn_cast<SectionChunk>(currentChunk);
-    if (!sectionChunk || oldChunk.kind != IncrementalChunkKind::ObjSection)
+    auto *oldObjChunk = oldChunkSnapshot.match(
+        [](const ObjSectionChunkSnapshot &obj) {
+          return const_cast<ObjSectionChunkSnapshot *>(&obj);
+        },
+        [](const SyntheticChunkSnapshot &) -> ObjSectionChunkSnapshot * {
+          return nullptr;
+        },
+        [](const PaddingChunkSnapshot &) -> ObjSectionChunkSnapshot * {
+          return nullptr;
+        },
+        [](const EntryRedirectChunkSnapshot &) -> ObjSectionChunkSnapshot * {
+          return nullptr;
+        },
+        [](const LongThunkChunkSnapshot &) -> ObjSectionChunkSnapshot * {
+          return nullptr;
+        });
+    if (!sectionChunk || !oldObjChunk)
       continue;
 
     auto fileIt = baseline.currentInputs.inputIndices.find(sectionChunk->file);
     if (fileIt == baseline.currentInputs.inputIndices.end() ||
-        fileIt->second != oldChunk.inputIndex ||
-        oldChunk.inputIndex >= baseline.state.inputs.size()) {
+        fileIt->second != oldObjChunk->inputIndex ||
+        oldObjChunk->inputIndex >= baseline.snapshot.inputs.size()) {
       installLayoutRewrite(ctx, "input index mismatch for section chunk");
       return false;
     }
 
     if (baseline.changedInputs.contains(sectionChunk->file) &&
-        computeIncrementalSymbolHash(*sectionChunk) != oldChunk.symbolHash) {
+        computeIncrementalSymbolHash(*sectionChunk) != oldObjChunk->symbolHash) {
       installLayoutRewrite(ctx, "symbol layout changed inside section chunk");
       return false;
     }
@@ -473,14 +518,24 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
                                  OutputSection &currentSection,
                                  bool &exactLayoutOnly,
                                  SmallVectorImpl<std::string> &verboseLogs) {
-  uint32_t envelopeIndex = UINT32_MAX;
-  const IncrementalSectionEnvelopeState *envelope =
-      findSectionEnvelope(baseline.state, currentSection.name,
-                          currentSection.header.Characteristics, envelopeIndex);
-  if (!envelope || !isIncrementalFreeSlotLayout(envelope->layoutKind)) {
+  const IncrementalSectionSnapshot *sectionSnapshot =
+      findSectionSnapshot(baseline.snapshot, currentSection.name,
+                          currentSection.header.Characteristics);
+  const IncrementalSlotSectionSnapshot *slotSection =
+      sectionSnapshot ? getIncrementalSlotSectionSnapshot(*sectionSnapshot)
+                      : nullptr;
+  const TextSlotSectionSnapshot *textSection =
+      sectionSnapshot ? getTextSlotSectionSnapshot(*sectionSnapshot) : nullptr;
+  IncrementalSectionLayoutKind layoutKind = classifyIncrementalSection(
+      currentSection.name, currentSection.header.Characteristics);
+  if (!slotSection || !isIncrementalFreeSlotLayout(layoutKind)) {
     installRejectedBaseline(ctx, "missing slot envelope in incremental state");
     return false;
   }
+  auto getSlotState = [](const PlannedSlot &slot)
+      -> const IncrementalPreservedSlotState & {
+    return getIncrementalPreservedSlotState(*slot.slot);
+  };
 
   StringSet<> currentKeys;
   SmallVector<std::pair<std::string, Chunk *>, 16> currentEntries;
@@ -500,41 +555,39 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
     currentEntries.emplace_back(std::move(key), chunk);
   }
 
-  StringMap<const IncrementalPlacementState *> placementsByKey;
-  for (const IncrementalPlacementState &placement : baseline.state.placements) {
-    if (placement.envelopeIndex != envelopeIndex)
-      continue;
+  StringMap<const ExistingSlotChunkPlacement *> placementsByKey;
+  for (const ExistingSlotChunkPlacement &placement : slotSection->preservedChunks)
     placementsByKey[placement.key] = &placement;
-  }
 
   StringMap<const IncrementalTextRedirectState *> redirectsByKey;
-  for (const IncrementalTextRedirectState &redirect :
-       baseline.state.textRedirects)
-    redirectsByKey[redirect.targetKey] = &redirect;
+  if (textSection) {
+    for (const IncrementalTextRedirectState &redirect : textSection->redirects)
+      redirectsByKey[redirect.targetKey] = &redirect;
+  }
 
   SmallVector<PlannedSlot, 16> slots;
-  for (const IncrementalSlotRecordState &slot : baseline.state.slotRecords) {
-    if (slot.envelopeIndex != envelopeIndex)
-      continue;
+  for (const IncrementalPreservedSlot &slot : slotSection->slots) {
     PlannedSlot plannedSlot;
-    plannedSlot.slot = slot;
-    plannedSlot.availability = slot.state == IncrementalSlotState::Free ||
-                                       !currentKeys.contains(slot.occupantKey)
-                                   ? PlannedSlot::Availability::Available
-                                   : PlannedSlot::Availability::Blocked;
+    plannedSlot.slot = &slot;
+    const std::string *occupant = getIncrementalPreservedSlotOccupant(*plannedSlot.slot);
+    plannedSlot.availability =
+        !occupant || !currentKeys.contains(*occupant)
+            ? PlannedSlot::Availability::Available
+            : PlannedSlot::Availability::Blocked;
     slots.push_back(std::move(plannedSlot));
   }
   llvm::sort(slots, [](const PlannedSlot &lhs, const PlannedSlot &rhs) {
-    return lhs.slot.startRVA < rhs.slot.startRVA;
+    return getIncrementalPreservedSlotState(*lhs.slot).startRVA <
+           getIncrementalPreservedSlotState(*rhs.slot).startRVA;
   });
 
   DenseMap<uint64_t, size_t> slotByStart;
   for (size_t i = 0; i < slots.size(); ++i)
-    slotByStart[slots[i].slot.startRVA] = i;
+    slotByStart[getSlotState(slots[i]).startRVA] = i;
 
   StringMap<RedirectPlanEntry> redirectPlans;
   SmallVector<RedirectPlanEntry *, 8> orderedRedirectPlans;
-  if (envelope->layoutKind == IncrementalSectionLayoutKind::TextFreeSlots) {
+  if (textSection) {
     for (const auto &[key, chunk] : currentEntries) {
       auto *sectionChunk = dyn_cast<SectionChunk>(chunk);
       if (!sectionChunk || sectionChunk->getMachine() != AMD64)
@@ -545,7 +598,7 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       if (!canonicalSymbol)
         continue;
 
-      const IncrementalPlacementState *oldPlacement = nullptr;
+      const ExistingSlotChunkPlacement *oldPlacement = nullptr;
       if (auto placementIt = placementsByKey.find(key);
           placementIt != placementsByKey.end())
         oldPlacement = placementIt->second;
@@ -576,10 +629,11 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
           return false;
         }
         const PlannedSlot &oldSlot = slots[slotIt->second];
-        if (chunk->getSize() > oldSlot.slot.capacity &&
-            oldSlot.slot.capacity >= 5) {
+        const IncrementalPreservedSlotState &oldSlotState = getSlotState(oldSlot);
+        if (chunk->getSize() > oldSlotState.capacity &&
+            oldSlotState.capacity >= 5) {
           redirectRVA = oldPlacement->startRVA;
-          redirectCapacity = oldSlot.slot.capacity;
+          redirectCapacity = oldSlotState.capacity;
           slotIndex = slotIt->second;
         }
       }
@@ -596,7 +650,7 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       plan.canonicalSymbol = canonicalSymbol->getName().str();
       plan.redirectRVA = redirectRVA;
       plan.redirectCapacity = redirectCapacity;
-      plan.minAlignment = redirectSlot.slot.minAlignment;
+      plan.minAlignment = getSlotState(redirectSlot).minAlignment;
       plan.bodyTarget = canonicalSymbol;
       if (oldRedirect) {
         plan.engagement = IncrementalRedirectEngagement::Installed;
@@ -618,8 +672,8 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
 
   SmallVector<PlannedChunk, 16> plannedChunks;
   SmallVector<FreeRange, 16> splitFreeRanges;
-  uint64_t tailCursor = envelope->activeEndRVA;
-  uint8_t fillByte = getIncrementalFillByte(envelope->layoutKind);
+  uint64_t tailCursor = slotSection->activeEndRVA;
+  uint8_t fillByte = getIncrementalFillByte(layoutKind);
 
   for (const auto &[key, chunk] : currentEntries) {
     uint64_t size = chunk->getSize();
@@ -635,8 +689,9 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       }
 
       PlannedSlot &oldSlot = slots[slotIt->second];
+      const IncrementalPreservedSlotState &oldSlotState = getSlotState(oldSlot);
       if (oldSlot.availability != PlannedSlot::Availability::Claimed &&
-          size <= oldSlot.slot.capacity) {
+          size <= oldSlotState.capacity) {
         oldSlot.availability = PlannedSlot::Availability::Claimed;
         plannedChunks.push_back({placementIt->second->startRVA, chunk});
         if (auto redirectIt = redirectPlans.find(key);
@@ -653,48 +708,50 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
     size_t bestSlotIndex = UINT32_MAX;
     for (size_t i = 0; i < slots.size(); ++i) {
       PlannedSlot &slot = slots[i];
+      const IncrementalPreservedSlotState &slotState = getSlotState(slot);
       if (slot.availability != PlannedSlot::Availability::Available)
         continue;
-      if (slot.slot.capacity < size)
+      if (slotState.capacity < size)
         continue;
-      if (slot.slot.startRVA % alignment != 0)
+      if (slotState.startRVA % alignment != 0)
         continue;
 
       if (bestSlotIndex == UINT32_MAX ||
-          slot.slot.capacity < slots[bestSlotIndex].slot.capacity ||
-          (slot.slot.capacity == slots[bestSlotIndex].slot.capacity &&
-           slot.slot.startRVA < slots[bestSlotIndex].slot.startRVA))
+          slotState.capacity < getSlotState(slots[bestSlotIndex]).capacity ||
+          (slotState.capacity == getSlotState(slots[bestSlotIndex]).capacity &&
+           slotState.startRVA < getSlotState(slots[bestSlotIndex]).startRVA))
         bestSlotIndex = i;
     }
 
     if (bestSlotIndex != UINT32_MAX) {
       PlannedSlot &slot = slots[bestSlotIndex];
+      const IncrementalPreservedSlotState &slotState = getSlotState(slot);
       slot.availability = PlannedSlot::Availability::Claimed;
-      plannedChunks.push_back({slot.slot.startRVA, chunk});
+      plannedChunks.push_back({slotState.startRVA, chunk});
       if (auto redirectIt = redirectPlans.find(key);
           redirectIt != redirectPlans.end()) {
-        redirectIt->second.bodyRVA = slot.slot.startRVA;
+        redirectIt->second.bodyRVA = slotState.startRVA;
         redirectIt->second.engagement =
             IncrementalRedirectEngagement::Installed;
       }
       if (auto placementIt = placementsByKey.find(key);
           placementIt != placementsByKey.end() &&
-          placementIt->second->startRVA != slot.slot.startRVA)
+          placementIt->second->startRVA != slotState.startRVA)
         reuse.movedChunkTargets.insert(key);
       exactLayoutOnly = false;
       verboseLogs.push_back(formatPlacementLog(
-          "reused free slot", currentSection.name, slot.slot.startRVA, size));
+          "reused free slot", currentSection.name, slotState.startRVA, size));
 
-      uint64_t remaining = slot.slot.capacity - size;
-      if (remaining >= getMinFragmentSize(envelope->layoutKind))
+      uint64_t remaining = slotState.capacity - size;
+      if (remaining >= getMinFragmentSize(layoutKind))
         splitFreeRanges.push_back(
-            {slot.slot.startRVA + size, remaining, slot.slot.fillByte});
+            {slotState.startRVA + size, remaining, slotState.fillByte});
       continue;
     }
 
     uint64_t startRVA = alignTo(tailCursor, uint64_t(alignment));
-    if (startRVA > envelope->maxSectionEndRVA ||
-        envelope->maxSectionEndRVA - startRVA < size) {
+    if (startRVA > slotSection->maxSectionEndRVA ||
+        slotSection->maxSectionEndRVA - startRVA < size) {
       installSlotCapacityFallback(ctx,
                                   "chunk grew past preserved section envelope");
       return false;
@@ -716,7 +773,7 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
         "allocated tail reserve", currentSection.name, startRVA, size));
   }
 
-  if (envelope->layoutKind == IncrementalSectionLayoutKind::TextFreeSlots) {
+  if (textSection) {
     auto makeSyntheticName = [&](StringRef prefix, uint64_t rva) {
       std::string name;
       raw_string_ostream os(name);
@@ -724,13 +781,13 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       return saver().save(os.str());
     };
 
-    uint64_t poolCursor = baseline.state.textThunkPool.nextFreeRVA != 0
-                              ? baseline.state.textThunkPool.nextFreeRVA
-                              : envelope->maxSectionEndRVA;
-    uint64_t poolStart = baseline.state.textThunkPool.poolStartRVA;
-    uint64_t poolEnd = baseline.state.textThunkPool.poolEndRVA != 0
-                           ? baseline.state.textThunkPool.poolEndRVA
-                           : envelope->maxSectionEndRVA;
+    uint64_t poolCursor = textSection->thunkPool.nextFreeRVA != 0
+                              ? textSection->thunkPool.nextFreeRVA
+                              : slotSection->maxSectionEndRVA;
+    uint64_t poolStart = textSection->thunkPool.poolStartRVA;
+    uint64_t poolEnd = textSection->thunkPool.poolEndRVA != 0
+                           ? textSection->thunkPool.poolEndRVA
+                           : slotSection->maxSectionEndRVA;
     SmallVector<IncrementalTextThunkPlanState, 8> thunkPlans;
     thunkPlans.reserve(orderedRedirectPlans.size());
     for (RedirectPlanEntry *plan : orderedRedirectPlans)
@@ -812,14 +869,14 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
     uint64_t endRVA = 0;
     if (size == 0)
       return true;
-    if (size > UINT32_MAX || startRVA < envelope->sectionRVA ||
+    if (size > UINT32_MAX || startRVA < slotSection->section.rva ||
         startRVA > UINT64_MAX - size) {
       installRejectedBaseline(
           ctx, "padding range exceeds preserved section envelope");
       return false;
     }
     endRVA = startRVA + size;
-    if (endRVA > envelope->maxSectionEndRVA) {
+    if (endRVA > slotSection->maxSectionEndRVA) {
       installRejectedBaseline(
           ctx, "padding range exceeds preserved section envelope");
       return false;
@@ -832,12 +889,13 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
   };
 
   for (const PlannedSlot &slot : slots) {
+    const IncrementalPreservedSlotState &slotState = getSlotState(slot);
     if (slot.availability != PlannedSlot::Availability::Available)
       continue;
-    if (!appendPadding(slot.slot.startRVA, slot.slot.capacity,
-                       slot.slot.fillByte))
+    if (!appendPadding(slotState.startRVA, slotState.capacity,
+                       slotState.fillByte))
       return false;
-    if (slot.slot.state != IncrementalSlotState::Free)
+    if (getIncrementalPreservedSlotOccupant(*slot.slot))
       exactLayoutOnly = false;
   }
   for (const FreeRange &range : splitFreeRanges)
@@ -845,7 +903,7 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
       return false;
 
   for (const auto &[key, chunk] : zeroSizedEntries) {
-    uint64_t startRVA = envelope->sectionRVA;
+    uint64_t startRVA = slotSection->section.rva;
     if (auto placementIt = placementsByKey.find(key);
         placementIt != placementsByKey.end())
       startRVA = placementIt->second->startRVA;
@@ -859,26 +917,26 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
                return lhs.chunk->getSize() < rhs.chunk->getSize();
              });
 
-  uint64_t previousEnd = envelope->sectionRVA;
+  uint64_t previousEnd = slotSection->section.rva;
   for (const PlannedChunk &planned : plannedChunks) {
     uint64_t chunkEnd = planned.startRVA;
     if (planned.chunk->getSize() != 0) {
       if (planned.startRVA < previousEnd ||
-          planned.startRVA < envelope->sectionRVA ||
+          planned.startRVA < slotSection->section.rva ||
           planned.startRVA > UINT64_MAX - uint64_t(planned.chunk->getSize())) {
         installRejectedBaseline(
             ctx, "planned chunks exceed preserved section envelope");
         return false;
       }
       chunkEnd = planned.startRVA + uint64_t(planned.chunk->getSize());
-      if (chunkEnd > envelope->maxSectionEndRVA) {
+      if (chunkEnd > slotSection->maxSectionEndRVA) {
         installRejectedBaseline(
             ctx, "planned chunks exceed preserved section envelope");
         return false;
       }
       previousEnd = chunkEnd;
-    } else if (planned.startRVA < envelope->sectionRVA ||
-               planned.startRVA > envelope->maxSectionEndRVA) {
+    } else if (planned.startRVA < slotSection->section.rva ||
+               planned.startRVA > slotSection->maxSectionEndRVA) {
       installRejectedBaseline(
           ctx, "zero-sized placement lies outside preserved section envelope");
       return false;
@@ -886,15 +944,15 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
   }
 
   currentSection.chunks.clear();
-  currentSection.header.VirtualAddress = envelope->sectionRVA;
-  uint64_t activeEnd = envelope->sectionRVA;
+  currentSection.header.VirtualAddress = slotSection->section.rva;
+  uint64_t activeEnd = slotSection->section.rva;
   for (const PlannedChunk &planned : plannedChunks) {
     planned.chunk->setRVA(planned.startRVA);
     currentSection.chunks.push_back(planned.chunk);
     activeEnd =
         std::max(activeEnd, planned.startRVA + planned.chunk->getSize());
   }
-  currentSection.header.VirtualSize = activeEnd - envelope->sectionRVA;
+  currentSection.header.VirtualSize = activeEnd - slotSection->section.rva;
   currentSection.header.SizeOfRawData = alignTo(
       currentSection.header.VirtualSize, uint64_t(ctx.config.fileAlign));
   return true;
@@ -904,25 +962,26 @@ static bool planPackedSection(COFFLinkerContext &ctx,
                               IncrementalBaselineData &baseline,
                               OutputSection &currentSection,
                               bool &exactLayoutOnly) {
-  uint32_t envelopeIndex = UINT32_MAX;
-  const IncrementalSectionEnvelopeState *envelope =
-      findSectionEnvelope(baseline.state, currentSection.name,
-                          currentSection.header.Characteristics, envelopeIndex);
-  if (!envelope || !isIncrementalPackedLayout(envelope->layoutKind)) {
+  const IncrementalSectionSnapshot *sectionSnapshot =
+      findSectionSnapshot(baseline.snapshot, currentSection.name,
+                          currentSection.header.Characteristics);
+  const IncrementalPackedPrefixSectionSnapshot *packedSection =
+      sectionSnapshot ? getIncrementalPackedPrefixSectionSnapshot(*sectionSnapshot)
+                      : nullptr;
+  IncrementalSectionLayoutKind layoutKind = classifyIncrementalSection(
+      currentSection.name, currentSection.header.Characteristics);
+  if (!packedSection || !isIncrementalPackedLayout(layoutKind)) {
     installRejectedBaseline(
         ctx, "missing packed-section envelope in incremental state");
     return false;
   }
 
-  StringMap<const IncrementalPlacementState *> placementsByKey;
-  for (const IncrementalPlacementState &placement : baseline.state.placements) {
-    if (placement.envelopeIndex != envelopeIndex)
-      continue;
+  StringMap<const PackedPrefixChunkPlacement *> placementsByKey;
+  for (const PackedPrefixChunkPlacement &placement : packedSection->members)
     placementsByKey[placement.key] = &placement;
-  }
 
-  currentSection.header.VirtualAddress = envelope->sectionRVA;
-  uint64_t cursor = envelope->sectionRVA;
+  currentSection.header.VirtualAddress = packedSection->section.rva;
+  uint64_t cursor = packedSection->section.rva;
   for (Chunk *chunk : currentSection.chunks) {
     if (chunk->getSize() == 0) {
       chunk->setRVA(cursor);
@@ -932,8 +991,11 @@ static bool planPackedSection(COFFLinkerContext &ctx,
     std::string key =
         getIncrementalChunkKey(baseline.currentInputs.inputIndices, *chunk);
     uint64_t startRVA = alignTo(cursor, uint64_t(chunk->getAlignment()));
-    if (startRVA > envelope->maxSectionEndRVA ||
-        envelope->maxSectionEndRVA - startRVA < chunk->getSize()) {
+    uint64_t maxSectionEndRVA =
+        packedSection->section.rva + packedSection->activePrefixSize +
+        packedSection->reserveSize;
+    if (startRVA > maxSectionEndRVA ||
+        maxSectionEndRVA - startRVA < chunk->getSize()) {
       installPackedSectionGrowthFallback(
           ctx, "packed section exceeded preserved envelope");
       return false;
@@ -947,7 +1009,7 @@ static bool planPackedSection(COFFLinkerContext &ctx,
       exactLayoutOnly = false;
   }
 
-  currentSection.header.VirtualSize = cursor - envelope->sectionRVA;
+  currentSection.header.VirtualSize = cursor - packedSection->section.rva;
   currentSection.header.SizeOfRawData = alignTo(
       currentSection.header.VirtualSize, uint64_t(ctx.config.fileAlign));
   return true;
@@ -955,7 +1017,7 @@ static bool planPackedSection(COFFLinkerContext &ctx,
 
 static void recomputeOutputLayout(COFFLinkerContext &ctx,
                                   ArrayRef<OutputSection *> activeSections,
-                                  const IncrementalStateFile &loadedState,
+                                  const IncrementalBaselineSnapshot &loadedState,
                                   IncrementalLayoutResult &result) {
   result.sizeOfHeaders = loadedState.sizeOfHeaders;
   uint64_t fileSize = result.sizeOfHeaders;
@@ -1005,7 +1067,7 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
   };
 
   SmallVector<OutputSection *, 16> activeSections =
-      getActiveSections(ctx, &baseline.state);
+      getActiveSections(ctx, &baseline.snapshot);
   sectionSnapshots.reserve(activeSections.size());
   for (OutputSection *section : activeSections) {
     SectionRestoreSnapshot sectionSnapshot;
@@ -1021,7 +1083,7 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
       relocSnapshots.push_back({sectionChunk, sectionChunk->getRelocs()});
     }
   }
-  if (activeSections.size() != baseline.state.sections.size()) {
+  if (activeSections.size() != baseline.snapshot.sections.size()) {
     installLayoutRewrite(ctx, "output section count changed");
     return installLayoutFallback();
   }
@@ -1032,17 +1094,20 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
     if (!isIncrementalFreeSlotLayout(layoutKind))
       continue;
 
-    uint32_t envelopeIndex = UINT32_MAX;
-    const IncrementalSectionEnvelopeState *envelope =
-        findSectionEnvelope(baseline.state, section->name,
-                            section->header.Characteristics, envelopeIndex);
-    if (!envelope || !isIncrementalFreeSlotLayout(envelope->layoutKind)) {
+    const IncrementalSectionSnapshot *sectionSnapshot =
+        findSectionSnapshot(baseline.snapshot, section->name,
+                            section->header.Characteristics);
+    const IncrementalSlotSectionSnapshot *slotSection =
+        sectionSnapshot ? getIncrementalSlotSectionSnapshot(*sectionSnapshot)
+                        : nullptr;
+    if (!slotSection) {
       installRejectedBaseline(ctx,
                               "missing slot envelope in incremental state");
       return installLayoutFallback();
     }
-    if (!validateSlotReuseState(ctx, *envelope, envelopeIndex,
-                                baseline.state.slotRecords))
+    if (!validateSlotReuseState(
+            ctx, *slotSection,
+            getTextSlotSectionSnapshot(*sectionSnapshot) != nullptr))
       return installLayoutFallback();
   }
 
@@ -1052,7 +1117,7 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
        ++sectionIndex) {
     OutputSection *currentSection = activeSections[sectionIndex];
     const IncrementalSectionState &oldSection =
-        baseline.state.sections[sectionIndex];
+        getIncrementalSectionState(baseline.snapshot.sections[sectionIndex]);
 
     if (currentSection->name != oldSection.name ||
         currentSection->header.Characteristics != oldSection.characteristics) {
@@ -1089,21 +1154,36 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
   reuse.currentEdges =
       buildIncrementalEdgeStates(ctx, baseline.currentInputs.inputIndices);
 
-  StringMap<const IncrementalPlacementState *> oldPlacementsByKey;
-  for (const IncrementalPlacementState &placement : baseline.state.placements)
-    oldPlacementsByKey[placement.key] = &placement;
+  StringMap<uint64_t> oldPlacementRVAs;
+  for (const IncrementalSectionSnapshot &sectionSnapshot : baseline.snapshot.sections) {
+    if (const IncrementalSlotSectionSnapshot *slotSection =
+            getIncrementalSlotSectionSnapshot(sectionSnapshot)) {
+      for (const ExistingSlotChunkPlacement &placement :
+           slotSection->preservedChunks)
+        oldPlacementRVAs[placement.key] = placement.startRVA;
+    }
+    if (const IncrementalPackedPrefixSectionSnapshot *packedSection =
+            getIncrementalPackedPrefixSectionSnapshot(sectionSnapshot)) {
+      for (const PackedPrefixChunkPlacement &placement : packedSection->members)
+        oldPlacementRVAs[placement.key] = placement.startRVA;
+    }
+  }
 
   StringMap<const IncrementalChunkState *> oldChunksByKey;
   DenseMap<const IncrementalChunkState *, const IncrementalSectionState *>
       oldSectionsByChunk;
-  for (const IncrementalSectionState &oldSection : baseline.state.sections) {
-    if (oldSection.firstChunk > baseline.state.chunks.size() ||
-        baseline.state.chunks.size() - oldSection.firstChunk <
+  for (const IncrementalSectionSnapshot &oldSectionSnapshot :
+       baseline.snapshot.sections) {
+    const IncrementalSectionState &oldSection =
+        getIncrementalSectionState(oldSectionSnapshot);
+    if (oldSection.firstChunk > baseline.snapshot.chunks.size() ||
+        baseline.snapshot.chunks.size() - oldSection.firstChunk <
             oldSection.chunkCount)
       continue;
     for (size_t i = 0; i < oldSection.chunkCount; ++i) {
       const IncrementalChunkState &oldChunk =
-          baseline.state.chunks[oldSection.firstChunk + i];
+          getIncrementalChunkState(
+              baseline.snapshot.chunks[oldSection.firstChunk + i]);
       oldChunksByKey[oldChunk.key] = &oldChunk;
       oldSectionsByChunk[&oldChunk] = &oldSection;
     }
@@ -1131,9 +1211,9 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
 
       std::string key = getIncrementalChunkKey(
           baseline.currentInputs.inputIndices, *sectionChunk);
-      auto placementIt = oldPlacementsByKey.find(key);
+      auto placementIt = oldPlacementRVAs.find(key);
       auto oldChunkIt = oldChunksByKey.find(key);
-      if (placementIt == oldPlacementsByKey.end() ||
+      if (placementIt == oldPlacementRVAs.end() ||
           oldChunkIt == oldChunksByKey.end()) {
         reuse.rewrittenChunks.insert(sectionChunk);
         continue;
@@ -1143,7 +1223,7 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
           baseline.currentInputs.inputIndices.find(sectionChunk->file);
       if (fileIt == baseline.currentInputs.inputIndices.end() ||
           baseline.changedInputs.contains(sectionChunk->file) ||
-          placementIt->second->startRVA != sectionChunk->getRVA() ||
+          placementIt->second != sectionChunk->getRVA() ||
           affectedSourceKeys.contains(key)) {
         reuse.rewrittenChunks.insert(sectionChunk);
         continue;
@@ -1189,7 +1269,7 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
       return installLayoutFallback();
   }
 
-  recomputeOutputLayout(ctx, activeSections, baseline.state, result);
+  recomputeOutputLayout(ctx, activeSections, baseline.snapshot, result);
 
   if (ctx.config.verbose) {
     Log(ctx) << "incremental: byte-reuse layout active";

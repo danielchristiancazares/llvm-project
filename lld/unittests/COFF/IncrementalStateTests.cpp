@@ -74,8 +74,7 @@ getSelectedPoolThunkRVA(const IncrementalTextThunkSelection &selection) {
 }
 
 TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
-  IncrementalStateFile state;
-  state.layoutMode = IncrementalLayoutMode::Slotted;
+  IncrementalBaselineSnapshot state;
   state.machine = AMD64;
   state.outputHash = 0x1111;
   state.outputSize = 0x2222;
@@ -105,66 +104,16 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   section.rawSize = 0x200;
   section.firstChunk = 0;
   section.chunkCount = 1;
-  state.sections.push_back(section);
-
-  IncrementalChunkState chunk;
-  chunk.kind = IncrementalChunkKind::ObjSection;
-  chunk.key = "obj:0:comdat:main";
-  chunk.sectionIndex = 0;
-  chunk.inputIndex = 0;
-  chunk.outputCharacteristics = 0x60000020;
-  chunk.sectionNumber = 1;
-  chunk.alignment = 16;
-  chunk.rva = 0x1000;
-  chunk.size = 32;
-  chunk.slotCapacity = 48;
-  chunk.contentHash = 0xbbbb;
-  chunk.symbolHash = 0xcccc;
-  state.chunks.push_back(chunk);
-
-  IncrementalSymbolState symbol;
-  symbol.name = "main";
-  symbol.auxiliaryKey = "obj:0:comdat:main";
-  symbol.kind = IncrementalSymbolKind::Regular;
-  symbol.inputIndex = 0;
-  symbol.value = 0;
-  state.symbols.push_back(symbol);
-
-  IncrementalSectionEnvelopeState envelope;
-  envelope.name = ".text";
-  envelope.characteristics = 0x60000020;
-  envelope.sectionRVA = 0x1000;
-  envelope.maxSectionEndRVA = 0x2000;
-  envelope.activeEndRVA = 0x1200;
-  envelope.layoutKind = IncrementalSectionLayoutKind::TextFreeSlots;
-  state.sectionEnvelopes.push_back(envelope);
-
-  IncrementalSlotRecordState slot;
-  slot.envelopeIndex = 0;
-  slot.startRVA = 0x1000;
-  slot.capacity = 48;
-  slot.committedSize = 32;
-  slot.minAlignment = 16;
-  slot.fillByte = 0xCC;
-  slot.state = IncrementalSlotState::Occupied;
-  slot.occupantKey = "obj:0:comdat:main";
-  state.slotRecords.push_back(slot);
-
-  IncrementalPackedSectionState packedSection;
-  packedSection.envelopeIndex = 0;
-  packedSection.activePrefixSize = 32;
-  packedSection.reserveSize = 16;
-  packedSection.recordKeys.push_back("obj:0:comdat:main");
-  state.packedSections.push_back(packedSection);
-
-  IncrementalPlacementState placement;
-  placement.key = "obj:0:comdat:main";
-  placement.envelopeIndex = 0;
-  placement.kind = IncrementalPlacementKind::ExistingSlot;
-  placement.startRVA = 0x1000;
-  placement.size = 32;
-  placement.alignment = 16;
-  state.placements.push_back(placement);
+  TextSlotSectionSnapshot textSection;
+  textSection.slotSection.section = section;
+  textSection.slotSection.maxSectionEndRVA = 0x2000;
+  textSection.slotSection.activeEndRVA = 0x1200;
+  textSection.slotSection.slots.push_back(
+      IncrementalPreservedSlot::make<OccupiedSlotRecord>(OccupiedSlotRecord{
+          IncrementalPreservedSlotState{0x1000, 48, 32, 16, 0xCC},
+          "obj:0:comdat:main"}));
+  textSection.slotSection.preservedChunks.push_back(
+      ExistingSlotChunkPlacement{"obj:0:comdat:main", 0x1000, 32, 16});
 
   IncrementalTextRedirectState redirect;
   redirect.targetKey = "obj:0:comdat:main";
@@ -173,20 +122,54 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   redirect.redirectCapacity = 16;
   redirect.bodyRVA = 0x1200;
   redirect.poolThunkRVA = 0;
-  state.textRedirects.push_back(redirect);
+  textSection.redirects.push_back(redirect);
+  textSection.thunkPool.poolStartRVA = 0x1800;
+  textSection.thunkPool.poolEndRVA = 0x1A00;
+  textSection.thunkPool.nextFreeRVA = 0x1A00;
+  state.sections.push_back(
+      IncrementalSectionSnapshot::make<TextSlotSectionSnapshot>(
+          std::move(textSection)));
 
-  state.textThunkPool.poolStartRVA = 0x1800;
-  state.textThunkPool.poolEndRVA = 0x1A00;
-  state.textThunkPool.nextFreeRVA = 0x1A00;
+  IncrementalSectionState packedSectionState;
+  packedSectionState.name = ".pdata";
+  packedSectionState.characteristics = 0x40000040;
+  packedSectionState.rva = 0x2000;
+  packedSectionState.fileOffset = 0x600;
+  packedSectionState.virtualSize = 0x40;
+  packedSectionState.rawSize = 0x40;
+  packedSectionState.firstChunk = 1;
+  packedSectionState.chunkCount = 0;
+
+  PDataPackedPrefixSectionSnapshot packedSection;
+  packedSection.packedSection.section = packedSectionState;
+  packedSection.packedSection.activePrefixSize = 32;
+  packedSection.packedSection.reserveSize = 16;
+  packedSection.packedSection.members.push_back(
+      PackedPrefixChunkPlacement{"obj:0:comdat:main", 0x2000, 32, 16});
+  state.sections.push_back(
+      IncrementalSectionSnapshot::make<PDataPackedPrefixSectionSnapshot>(
+          std::move(packedSection)));
+
+  state.chunks.push_back(IncrementalChunkSnapshot::make<ObjSectionChunkSnapshot>(
+      ObjSectionChunkSnapshot{
+          IncrementalChunkState{"obj:0:comdat:main", 0, 0x60000020, 16, 0x1000,
+                                32, 48},
+          0, 1, 0xbbbb, 0xcccc}));
+  state.symbols.push_back(IncrementalResolvedSymbolSnapshot::make<
+                          RegularResolvedSymbol>(RegularResolvedSymbol{
+      "main",
+      IncrementalPersistedInputOwner::make<PersistedInputOwner>(
+          PersistedInputOwner{0}),
+      0,
+      IncrementalPersistedChunkReference::make<PersistedChunkReference>(
+          PersistedChunkReference{"obj:0:comdat:main"})}));
 
   SmallString<128> path = getPath("state.llilk");
   expectNoError(writeIncrementalState(path, state));
 
-  Expected<IncrementalStateFile> loaded = loadIncrementalState(path);
+  Expected<IncrementalBaselineSnapshot> loaded = loadIncrementalState(path);
   ASSERT_TRUE(static_cast<bool>(loaded)) << toString(loaded.takeError());
 
-  EXPECT_EQ(loaded->version, 6u);
-  EXPECT_EQ(loaded->layoutMode, IncrementalLayoutMode::Slotted);
   EXPECT_EQ(loaded->machine, AMD64);
   EXPECT_EQ(loaded->importTopologyHash, state.importTopologyHash);
   EXPECT_EQ(loaded->exportTopologyHash, state.exportTopologyHash);
@@ -194,31 +177,95 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   ASSERT_EQ(loaded->inputs.size(), 1u);
   EXPECT_EQ(loaded->inputs[0].parentName, "libfoo.lib");
   EXPECT_EQ(loaded->inputs[0].archiveOffset, 42u);
+  ASSERT_EQ(loaded->chunks.size(), 1u);
+  loaded->chunks[0].match(
+      [&](const ObjSectionChunkSnapshot &chunk) {
+        EXPECT_EQ(chunk.chunk.key, "obj:0:comdat:main");
+        EXPECT_EQ(chunk.inputIndex, 0u);
+        EXPECT_EQ(chunk.sectionNumber, 1u);
+        EXPECT_EQ(chunk.contentHash, 0xbbbbu);
+        EXPECT_EQ(chunk.symbolHash, 0xccccu);
+      },
+      [&](const SyntheticChunkSnapshot &) {
+        ADD_FAILURE() << "unexpected synthetic chunk";
+      },
+      [&](const PaddingChunkSnapshot &) {
+        ADD_FAILURE() << "unexpected padding chunk";
+      },
+      [&](const EntryRedirectChunkSnapshot &) {
+        ADD_FAILURE() << "unexpected redirect chunk";
+      },
+      [&](const LongThunkChunkSnapshot &) {
+        ADD_FAILURE() << "unexpected thunk chunk";
+      });
   ASSERT_EQ(loaded->symbols.size(), 1u);
-  EXPECT_EQ(loaded->symbols[0].name, "main");
-  EXPECT_EQ(loaded->symbols[0].auxiliaryKey, "obj:0:comdat:main");
-  EXPECT_EQ(loaded->symbols[0].kind, IncrementalSymbolKind::Regular);
-  ASSERT_EQ(loaded->sectionEnvelopes.size(), 1u);
-  EXPECT_EQ(loaded->sectionEnvelopes[0].name, ".text");
-  EXPECT_EQ(loaded->sectionEnvelopes[0].layoutKind,
-            IncrementalSectionLayoutKind::TextFreeSlots);
-  ASSERT_EQ(loaded->slotRecords.size(), 1u);
-  EXPECT_EQ(loaded->slotRecords[0].occupantKey, "obj:0:comdat:main");
-  EXPECT_EQ(loaded->slotRecords[0].fillByte, 0xCC);
-  EXPECT_EQ(loaded->slotRecords[0].state, IncrementalSlotState::Occupied);
-  ASSERT_EQ(loaded->packedSections.size(), 1u);
-  ASSERT_EQ(loaded->packedSections[0].recordKeys.size(), 1u);
-  EXPECT_EQ(loaded->packedSections[0].recordKeys[0], "obj:0:comdat:main");
-  ASSERT_EQ(loaded->placements.size(), 1u);
-  EXPECT_EQ(loaded->placements[0].key, "obj:0:comdat:main");
-  EXPECT_EQ(loaded->placements[0].kind,
-            IncrementalPlacementKind::ExistingSlot);
-  ASSERT_EQ(loaded->textRedirects.size(), 1u);
-  EXPECT_EQ(loaded->textRedirects[0].canonicalSymbol, "main");
-  EXPECT_EQ(loaded->textRedirects[0].redirectCapacity, 16u);
-  EXPECT_EQ(loaded->textThunkPool.poolStartRVA, 0x1800u);
-  EXPECT_EQ(loaded->textThunkPool.poolEndRVA, 0x1A00u);
-  EXPECT_EQ(loaded->textThunkPool.nextFreeRVA, 0x1A00u);
+  loaded->symbols[0].match(
+      [&](const RegularResolvedSymbol &symbol) {
+        EXPECT_EQ(symbol.name, "main");
+        symbol.owner.match(
+            [&](const PersistedInputOwner &owner) { EXPECT_EQ(owner.inputIndex, 0u); },
+            [&](const NoPersistedInputOwner &) {
+              ADD_FAILURE() << "expected a persisted owner";
+            });
+        symbol.chunk.match(
+            [&](const PersistedChunkReference &chunk) {
+              EXPECT_EQ(chunk.chunkKey, "obj:0:comdat:main");
+            },
+            [&](const NoPersistedChunkReference &) {
+              ADD_FAILURE() << "expected a persisted chunk reference";
+            });
+      },
+      [&](const CommonResolvedSymbol &) {
+        ADD_FAILURE() << "unexpected common symbol";
+      },
+      [&](const ImportDataResolvedSymbol &) {
+        ADD_FAILURE() << "unexpected import-data symbol";
+      },
+      [&](const ImportThunkResolvedSymbol &) {
+        ADD_FAILURE() << "unexpected import-thunk symbol";
+      },
+      [&](const LocalImportResolvedSymbol &) {
+        ADD_FAILURE() << "unexpected local import symbol";
+      },
+      [&](const AbsoluteResolvedSymbol &) {
+        ADD_FAILURE() << "unexpected absolute symbol";
+      },
+      [&](const SyntheticResolvedSymbol &) {
+        ADD_FAILURE() << "unexpected synthetic symbol";
+      });
+  ASSERT_EQ(loaded->sections.size(), 2u);
+  const TextSlotSectionSnapshot *loadedText =
+      getTextSlotSectionSnapshot(loaded->sections[0]);
+  ASSERT_NE(loadedText, nullptr);
+  EXPECT_EQ(loadedText->slotSection.section.name, ".text");
+  EXPECT_EQ(loadedText->slotSection.maxSectionEndRVA, 0x2000u);
+  EXPECT_EQ(loadedText->slotSection.activeEndRVA, 0x1200u);
+  ASSERT_EQ(loadedText->slotSection.slots.size(), 1u);
+  const std::string *occupant =
+      getIncrementalPreservedSlotOccupant(loadedText->slotSection.slots[0]);
+  ASSERT_NE(occupant, nullptr);
+  EXPECT_EQ(*occupant, "obj:0:comdat:main");
+  EXPECT_EQ(getIncrementalPreservedSlotState(loadedText->slotSection.slots[0])
+                .fillByte,
+            0xCC);
+  ASSERT_EQ(loadedText->slotSection.preservedChunks.size(), 1u);
+  EXPECT_EQ(loadedText->slotSection.preservedChunks[0].key,
+            "obj:0:comdat:main");
+  ASSERT_EQ(loadedText->redirects.size(), 1u);
+  EXPECT_EQ(loadedText->redirects[0].canonicalSymbol, "main");
+  EXPECT_EQ(loadedText->redirects[0].redirectCapacity, 16u);
+  EXPECT_EQ(loadedText->thunkPool.poolStartRVA, 0x1800u);
+  EXPECT_EQ(loadedText->thunkPool.poolEndRVA, 0x1A00u);
+  EXPECT_EQ(loadedText->thunkPool.nextFreeRVA, 0x1A00u);
+
+  const IncrementalPackedPrefixSectionSnapshot *loadedPacked =
+      getIncrementalPackedPrefixSectionSnapshot(loaded->sections[1]);
+  ASSERT_NE(loadedPacked, nullptr);
+  EXPECT_EQ(loadedPacked->section.name, ".pdata");
+  EXPECT_EQ(loadedPacked->activePrefixSize, 32u);
+  EXPECT_EQ(loadedPacked->reserveSize, 16u);
+  ASSERT_EQ(loadedPacked->members.size(), 1u);
+  EXPECT_EQ(loadedPacked->members[0].key, "obj:0:comdat:main");
 }
 
 TEST_F(IncrementalStateTest, RejectsInvalidMagicAndVersion) {
@@ -234,11 +281,11 @@ TEST_F(IncrementalStateTest, RejectsInvalidMagicAndVersion) {
     os.write(bytes.data(), bytes.size());
   }
 
-  Expected<IncrementalStateFile> badMagic = loadIncrementalState(path);
+  Expected<IncrementalBaselineSnapshot> badMagic = loadIncrementalState(path);
   ASSERT_FALSE(static_cast<bool>(badMagic));
   consumeError(badMagic.takeError());
 
-  IncrementalStateFile state;
+  IncrementalBaselineSnapshot state;
   state.machine = AMD64;
   state.outputPath = "out.exe";
   expectNoError(writeIncrementalState(path, state));
@@ -259,19 +306,19 @@ TEST_F(IncrementalStateTest, RejectsInvalidMagicAndVersion) {
     os.write(bytes.data(), bytes.size());
   }
 
-  Expected<IncrementalStateFile> badVersion = loadIncrementalState(path);
+  Expected<IncrementalBaselineSnapshot> badVersion = loadIncrementalState(path);
   ASSERT_FALSE(static_cast<bool>(badVersion));
   consumeError(badVersion.takeError());
 }
 
 TEST(IncrementalHelpersTest, BestFitSelectionHonorsCapacityAndAlignment) {
-  std::vector<IncrementalSlotRecordState> slots(3);
-  slots[0].startRVA = 0x1000;
-  slots[0].capacity = 32;
-  slots[1].startRVA = 0x1010;
-  slots[1].capacity = 24;
-  slots[2].startRVA = 0x1024;
-  slots[2].capacity = 24;
+  std::vector<IncrementalPreservedSlot> slots;
+  slots.push_back(IncrementalPreservedSlot::make<FreeSlotRecord>(
+      FreeSlotRecord{IncrementalPreservedSlotState{0x1000, 32, 0, 1, 0}}));
+  slots.push_back(IncrementalPreservedSlot::make<FreeSlotRecord>(
+      FreeSlotRecord{IncrementalPreservedSlotState{0x1010, 24, 0, 1, 0}}));
+  slots.push_back(IncrementalPreservedSlot::make<FreeSlotRecord>(
+      FreeSlotRecord{IncrementalPreservedSlotState{0x1024, 24, 0, 1, 0}}));
 
   std::optional<size_t> slot =
       getSelectedFreeSlotIndex(findBestFitIncrementalFreeSlot(slots, 16, 16));
@@ -452,12 +499,8 @@ TEST(IncrementalHelpersTest, ChooseTextThunkRVAFailsWhenPoolIsExhausted) {
 }
 
 TEST(IncrementalHelpersTest, RedirectStateRoundTripPreservesPoolState) {
-  IncrementalStateFile state;
-  state.layoutMode = IncrementalLayoutMode::Slotted;
+  IncrementalBaselineSnapshot state;
   state.outputPath = "out.exe";
-  state.textThunkPool.poolStartRVA = 0x4000;
-  state.textThunkPool.poolEndRVA = 0x5000;
-  state.textThunkPool.nextFreeRVA = 0x4FF0;
 
   IncrementalTextRedirectState redirect;
   redirect.targetKey = "obj:0:comdat:target";
@@ -466,19 +509,35 @@ TEST(IncrementalHelpersTest, RedirectStateRoundTripPreservesPoolState) {
   redirect.redirectCapacity = 16;
   redirect.bodyRVA = 0x2400;
   redirect.poolThunkRVA = 0x4FF0;
-  state.textRedirects.push_back(redirect);
+
+  IncrementalSectionState section;
+  section.name = ".text";
+  section.characteristics = 0x60000020;
+  TextSlotSectionSnapshot textSection;
+  textSection.slotSection.section = section;
+  textSection.redirects.push_back(redirect);
+  textSection.thunkPool.poolStartRVA = 0x4000;
+  textSection.thunkPool.poolEndRVA = 0x5000;
+  textSection.thunkPool.nextFreeRVA = 0x4FF0;
+  state.sections.push_back(
+      IncrementalSectionSnapshot::make<TextSlotSectionSnapshot>(
+          std::move(textSection)));
 
   SmallString<128> path;
   ASSERT_FALSE(sys::fs::createTemporaryFile("redirect-pool", "llilk", path));
   Error err = writeIncrementalState(path, state);
   ASSERT_FALSE(static_cast<bool>(err)) << toString(std::move(err));
-  Expected<IncrementalStateFile> loaded = loadIncrementalState(path);
+  Expected<IncrementalBaselineSnapshot> loaded = loadIncrementalState(path);
   ASSERT_TRUE(static_cast<bool>(loaded)) << toString(loaded.takeError());
-  ASSERT_EQ(loaded->textRedirects.size(), 1u);
-  EXPECT_EQ(loaded->textRedirects[0].poolThunkRVA, 0x4FF0u);
-  EXPECT_EQ(loaded->textThunkPool.poolStartRVA, 0x4000u);
-  EXPECT_EQ(loaded->textThunkPool.poolEndRVA, 0x5000u);
-  EXPECT_EQ(loaded->textThunkPool.nextFreeRVA, 0x4FF0u);
+  ASSERT_EQ(loaded->sections.size(), 1u);
+  const TextSlotSectionSnapshot *loadedText =
+      getTextSlotSectionSnapshot(loaded->sections[0]);
+  ASSERT_NE(loadedText, nullptr);
+  ASSERT_EQ(loadedText->redirects.size(), 1u);
+  EXPECT_EQ(loadedText->redirects[0].poolThunkRVA, 0x4FF0u);
+  EXPECT_EQ(loadedText->thunkPool.poolStartRVA, 0x4000u);
+  EXPECT_EQ(loadedText->thunkPool.poolEndRVA, 0x5000u);
+  EXPECT_EQ(loadedText->thunkPool.nextFreeRVA, 0x4FF0u);
   std::error_code ec = sys::fs::remove(path);
   EXPECT_FALSE(ec);
 }

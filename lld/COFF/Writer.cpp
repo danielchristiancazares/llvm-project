@@ -379,31 +379,36 @@ void OutputSection::setPermissions(uint32_t c) {
 
 static bool isIncrementalPreservedSection(const COFFLinkerContext &ctx,
                                           const OutputSection *section) {
-  const IncrementalStateFile *loadedState = ctx.incremental->match(
-      [&](const IncrementalDisabled &) -> const IncrementalStateFile * {
+  const IncrementalBaselineSnapshot *loadedState = ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const IncrementalBaselineSnapshot * {
         return nullptr;
       },
-      [&](const PendingFullImageBuild &) -> const IncrementalStateFile * {
+      [&](const PendingFullImageBuild &) -> const IncrementalBaselineSnapshot * {
         return nullptr;
       },
-      [&](const FullImageBuild &) -> const IncrementalStateFile * {
+      [&](const FullImageBuild &) -> const IncrementalBaselineSnapshot * {
         return nullptr;
       },
-      [&](const StateBackedLink &loaded) -> const IncrementalStateFile * {
-        return &loaded.baseline.state;
+      [&](const StateBackedLink &loaded) -> const IncrementalBaselineSnapshot * {
+        return &loaded.baseline.snapshot;
       },
-      [&](const LayoutStableLink &validated) -> const IncrementalStateFile * {
-        return &validated.baseline.state;
+      [&](const LayoutStableLink &validated)
+          -> const IncrementalBaselineSnapshot * {
+        return &validated.baseline.snapshot;
       },
-      [&](const ByteReuseLink &reuse) -> const IncrementalStateFile * {
-        return &reuse.baseline.state;
+      [&](const ByteReuseLink &reuse) -> const IncrementalBaselineSnapshot * {
+        return &reuse.baseline.snapshot;
       });
-  if (!loadedState || loadedState->layoutMode != IncrementalLayoutMode::Slotted)
+  if (!loadedState)
     return false;
-  for (const IncrementalSectionState &oldSection : loadedState->sections)
+  for (const IncrementalSectionSnapshot &oldSectionSnapshot :
+       loadedState->sections) {
+    const IncrementalSectionState &oldSection =
+        getIncrementalSectionState(oldSectionSnapshot);
     if (section->name == oldSection.name &&
         section->header.Characteristics == oldSection.characteristics)
       return true;
+  }
   return false;
 }
 
