@@ -34,8 +34,6 @@ using namespace llvm::COFF;
 namespace lld::coff {
 namespace {
 
-// Import table
-
 // A chunk for the import descriptor table.
 class HintNameChunk : public NonSectionChunk {
 public:
@@ -601,10 +599,6 @@ private:
   const COFFLinkerContext &ctx;
 };
 
-// Export table
-// Read Microsoft PE/COFF spec 5.3 for details.
-
-// A chunk for the export descriptor table.
 class ExportDirectoryChunk : public NonSectionChunk {
 public:
   ExportDirectoryChunk(int baseOrdinal, int maxOrdinal, int nameTabSize,

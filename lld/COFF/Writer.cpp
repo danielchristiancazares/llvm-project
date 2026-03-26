@@ -201,7 +201,6 @@ struct ChunkRange {
   Chunk *first = nullptr, *last;
 };
 
-// The writer writes a SymbolTable result to a file.
 class Writer {
 public:
   Writer(COFFLinkerContext &c)
@@ -428,7 +427,6 @@ void OutputSection::merge(OutputSection *other) {
   }
 }
 
-// Write the section header to a given buffer.
 void OutputSection::writeHeaderTo(uint8_t *buf, bool isDebug) {
   auto *hdr = reinterpret_cast<coff_section *>(buf);
   *hdr = header;
@@ -803,7 +801,6 @@ void Writer::writePEChecksum() {
   peHeader->CheckSum = sum;
 }
 
-// The main function of the writer.
 void Writer::run() {
   {
     llvm::TimeTraceScope timeScope("Write PE");
@@ -904,7 +901,6 @@ static StringRef getOutputSectionName(StringRef name) {
   return s.substr(0, s.find('.', 1));
 }
 
-// For /order.
 void Writer::sortBySectionOrder(std::vector<Chunk *> &chunks) {
   auto getPriority = [&ctx = ctx](const Chunk *c) {
     if (auto *sec = dyn_cast<SectionChunk>(c))
@@ -918,8 +914,6 @@ void Writer::sortBySectionOrder(std::vector<Chunk *> &chunks) {
   });
 }
 
-// Change the characteristics of existing PartialSections that belong to the
-// section Name to Chars.
 void Writer::fixPartialSectionChars(StringRef name, uint32_t chars) {
   for (auto it : partialSections) {
     PartialSection *pSec = it.second;
@@ -1118,10 +1112,8 @@ void Writer::calculateStubDependentSizes() {
   dataDirOffset64 = peHeaderOffset + sizeof(pe32plus_header);
 }
 
-// Create output section objects and add them to OutputSections.
 void Writer::createSections() {
   llvm::TimeTraceScope timeScope("Output sections");
-  // First, create the builtin sections.
   const uint32_t data = IMAGE_SCN_CNT_INITIALIZED_DATA;
   const uint32_t bss = IMAGE_SCN_CNT_UNINITIALIZED_DATA;
   const uint32_t code = IMAGE_SCN_CNT_CODE;
@@ -1162,7 +1154,6 @@ void Writer::createSections() {
   ctorsSec = createSection(".ctors", data | r | w);
   dtorsSec = createSection(".dtors", data | r | w);
 
-  // Then bin chunks by name and output characteristics.
   for (Chunk *c : ctx.driver.getChunks()) {
     auto *sc = dyn_cast<SectionChunk>(c);
     if (sc && !sc->live) {
@@ -1205,7 +1196,6 @@ void Writer::createSections() {
   for (auto thunk : ctx.symtab.sameAddressThunks)
     wowthkSec->addChunk(thunk);
 
-  // Then create an OutputSection for each section.
   // '$' and all following characters in input section names are
   // discarded when determining output section. So, .text$foo
   // contributes to .text, for example. See PE/COFF spec 3.2.
@@ -1289,7 +1279,6 @@ void Writer::createMiscChunks() {
     }
   });
 
-  // Create Debug Information Chunks
   if (config->mingw) {
     debugInfoSec = buildidSec;
   } else if (!config->mergeDebugDirectory) {
@@ -1349,11 +1338,9 @@ void Writer::createMiscChunks() {
     debugInfoSec->addChunk(r.second);
   }
 
-  // Create SEH table. x86-only.
   if (config->safeSEH)
     createSEHTable();
 
-  // Create /guard:cf tables if requested.
   createGuardCFTables();
 
   createECChunks();
@@ -1582,8 +1569,7 @@ void Writer::refreshExceptionTableRanges() {
 
 void Writer::assignOutputSectionIndices() {
   llvm::TimeTraceScope timeScope("Output sections indices");
-  // Assign final output section indices, and assign each chunk to its output
-  // section.
+  // Assign final output section indices.
   uint32_t idx = 1;
   for (OutputSection *os : ctx.outputSections) {
     os->sectionIndex = idx;
@@ -1917,7 +1903,6 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   uint8_t *buf = buffer->getBufferStart();
   auto *dos = reinterpret_cast<dos_header *>(buf);
 
-  // Write DOS program.
   if (config->dosStub) {
     memcpy(buf, config->dosStub->getBufferStart(),
            config->dosStub->getBufferSize());
@@ -1945,11 +1930,9 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   // Make sure DOS stub is aligned to 8 bytes at this point
   assert((buf - buffer->getBufferStart()) % 8 == 0);
 
-  // Write PE magic
   memcpy(buf, PEMagic, sizeof(PEMagic));
   buf += sizeof(PEMagic);
 
-  // Write COFF header
   assert(coffHeaderOffset ==
          static_cast<size_t>(buf - buffer->getBufferStart()));
   auto *coff = reinterpret_cast<coff_file_header *>(buf);
@@ -1976,7 +1959,6 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   coff->SizeOfOptionalHeader =
       sizeof(PEHeaderTy) + sizeof(data_directory) * numberOfDataDirectory;
 
-  // Write PE header
   assert(peHeaderOffset == static_cast<size_t>(buf - buffer->getBufferStart()));
   auto *pe = reinterpret_cast<PEHeaderTy *>(buf);
   buf += sizeof(*pe);
@@ -2042,7 +2024,6 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   }
   pe->SizeOfInitializedData = getSizeOfInitializedData();
 
-  // Write data directory
   assert(!ctx.config.is64() ||
          dataDirOffset64 ==
              static_cast<size_t>(buf - buffer->getBufferStart()));
@@ -2106,7 +2087,6 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
     dir[DELAY_IMPORT_DESCRIPTOR].Size = delayIdata.getDirSize();
   }
 
-  // Write section table
   for (OutputSection *sec : ctx.outputSections) {
     sec->writeHeaderTo(buf, config->debug);
     buf += sizeof(coff_section);
@@ -2426,7 +2406,6 @@ void Writer::maybeAddRVATable(SymbolRVASet tableSymbols, StringRef tableSym,
   });
 }
 
-// Create CHPE metadata chunks.
 void Writer::createECChunks() {
   if (!ctx.symtab.isEC())
     return;
@@ -2596,8 +2575,6 @@ void Writer::insertBssDataStartEndSymbols() {
   }
 }
 
-// Handles /section options to allow users to overwrite
-// section attributes.
 void Writer::setSectionPermissions() {
   llvm::TimeTraceScope timeScope("Sections permissions");
   for (auto &p : ctx.config.section) {
@@ -2609,7 +2586,6 @@ void Writer::setSectionPermissions() {
   }
 }
 
-// Set symbols used by ARM64EC metadata.
 void Writer::setECSymbols() {
   if (!ctx.symtab.isEC())
     return;
@@ -2699,7 +2675,6 @@ void Writer::setECSymbols() {
     thunk->setDynamicRelocs(ctx);
 }
 
-// Write section contents to a mmap'ed file.
 void Writer::writeSections() {
   llvm::TimeTraceScope timeScope("Write sections");
   uint8_t *buf = buffer->getBufferStart();
@@ -2905,10 +2880,8 @@ void Writer::addBaserels() {
     if (sec->header.Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
       continue;
     llvm::TimeTraceScope timeScope("Base relocations: ", sec->name);
-    // Collect all locations for base relocations.
     for (Chunk *c : sec->chunks)
       c->getBaserels(&v);
-    // Add the addresses to .reloc section.
     if (!v.empty())
       addBaserelBlocks(v);
     v.clear();
@@ -3182,26 +3155,36 @@ void Writer::printSummary() {
            << " " << s << '\n';
   };
 
-  bool hasStats = ctx.pdbStats.has_value();
-
   print(ctx.objFileInstances.size(),
         "Input OBJ files (expanded from all cmd-line inputs)");
   print(ctx.consumedInputsSize,
         "Size of all consumed OBJ files (non-lazy), in bytes");
   print(ctx.typeServerSourceMappings.size(), "PDB type server dependencies");
   print(ctx.precompSourceMappings.size(), "Precomp OBJ dependencies");
-  print(hasStats ? ctx.pdbStats->nbTypeRecords : 0, "Input debug type records");
-  print(hasStats ? ctx.pdbStats->nbTypeRecordsBytes : 0,
-        "Size of all input debug type records, in bytes");
-  print(hasStats ? ctx.pdbStats->nbTPIrecords : 0, "Merged TPI records");
-  print(hasStats ? ctx.pdbStats->nbIPIrecords : 0, "Merged IPI records");
-  print(hasStats ? ctx.pdbStats->strTabSize : 0, "Output PDB strings");
-  print(hasStats ? ctx.pdbStats->globalSymbols : 0, "Global symbol records");
-  print(hasStats ? ctx.pdbStats->moduleSymbols : 0, "Module symbol records");
-  print(hasStats ? ctx.pdbStats->publicSymbols : 0, "Public symbol records");
-
-  if (hasStats)
-    stream << ctx.pdbStats->largeInputTypeRecs;
+  ctx.pdbSummary.match(
+      [&](const PrintZeroedPDBSummary &) {
+        print(0, "Input debug type records");
+        print(0, "Size of all input debug type records, in bytes");
+        print(0, "Merged TPI records");
+        print(0, "Merged IPI records");
+        print(0, "Output PDB strings");
+        print(0, "Global symbol records");
+        print(0, "Module symbol records");
+        print(0, "Public symbol records");
+      },
+      [&](const PrintMeasuredPDBSummary &summary) {
+        const PDBStats &stats = summary.stats;
+        print(stats.nbTypeRecords, "Input debug type records");
+        print(stats.nbTypeRecordsBytes,
+              "Size of all input debug type records, in bytes");
+        print(stats.nbTPIrecords, "Merged TPI records");
+        print(stats.nbIPIrecords, "Merged IPI records");
+        print(stats.strTabSize, "Output PDB strings");
+        print(stats.globalSymbols, "Global symbol records");
+        print(stats.moduleSymbols, "Module symbol records");
+        print(stats.publicSymbols, "Public symbol records");
+        stream << stats.largeInputTypeRecs;
+      });
 
   Msg(ctx) << buffer;
 }

@@ -7,6 +7,7 @@
 #include "llvm/Support/Error.h"
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace lld::coff {
@@ -69,37 +70,27 @@ using IncrementalChunkSnapshot =
                 PaddingChunkSnapshot, EntryRedirectChunkSnapshot,
                 LongThunkChunkSnapshot>;
 
-struct PersistedInputOwner final {
+struct ObjFileRegularResolvedSymbol final {
+  std::string name;
   uint32_t inputIndex = 0;
-};
-
-struct NoPersistedInputOwner final {};
-
-using IncrementalPersistedInputOwner =
-    lld::Closed<PersistedInputOwner, NoPersistedInputOwner>;
-
-struct PersistedChunkReference final {
+  uint64_t value = 0;
   std::string chunkKey;
 };
 
-struct NoPersistedChunkReference final {};
-
-using IncrementalPersistedChunkReference =
-    lld::Closed<PersistedChunkReference, NoPersistedChunkReference>;
-
-struct RegularResolvedSymbol final {
+struct BitcodeRegularResolvedSymbol final {
   std::string name;
-  IncrementalPersistedInputOwner owner =
-      IncrementalPersistedInputOwner::make<NoPersistedInputOwner>();
   uint64_t value = 0;
-  IncrementalPersistedChunkReference chunk =
-      IncrementalPersistedChunkReference::make<NoPersistedChunkReference>();
 };
 
-struct CommonResolvedSymbol final {
+struct ObjFileCommonResolvedSymbol final {
   std::string name;
-  IncrementalPersistedInputOwner owner =
-      IncrementalPersistedInputOwner::make<NoPersistedInputOwner>();
+  uint32_t inputIndex = 0;
+  uint64_t size = 0;
+  uint32_t alignment = 1;
+};
+
+struct BitcodeCommonResolvedSymbol final {
+  std::string name;
   uint64_t size = 0;
   uint32_t alignment = 1;
 };
@@ -119,8 +110,7 @@ struct ImportThunkResolvedSymbol final {
 
 struct LocalImportResolvedSymbol final {
   std::string name;
-  IncrementalPersistedChunkReference chunk =
-      IncrementalPersistedChunkReference::make<NoPersistedChunkReference>();
+  std::string chunkKey;
 };
 
 struct AbsoluteResolvedSymbol final {
@@ -128,17 +118,22 @@ struct AbsoluteResolvedSymbol final {
   uint64_t value = 0;
 };
 
-struct SyntheticResolvedSymbol final {
+struct ChunkBackedSyntheticResolvedSymbol final {
   std::string name;
-  IncrementalPersistedChunkReference chunk =
-      IncrementalPersistedChunkReference::make<NoPersistedChunkReference>();
+  std::string chunkKey;
+};
+
+struct ImageBaseSyntheticResolvedSymbol final {
+  std::string name;
 };
 
 using IncrementalResolvedSymbolSnapshot =
-    lld::Closed<RegularResolvedSymbol, CommonResolvedSymbol,
+    lld::Closed<ObjFileRegularResolvedSymbol, BitcodeRegularResolvedSymbol,
+                ObjFileCommonResolvedSymbol, BitcodeCommonResolvedSymbol,
                 ImportDataResolvedSymbol, ImportThunkResolvedSymbol,
                 LocalImportResolvedSymbol, AbsoluteResolvedSymbol,
-                SyntheticResolvedSymbol>;
+                ChunkBackedSyntheticResolvedSymbol,
+                ImageBaseSyntheticResolvedSymbol>;
 
 struct IncrementalPreservedSlotState {
   uint64_t startRVA = 0;
@@ -157,7 +152,8 @@ struct OccupiedSlotRecord final {
   std::string occupantKey;
 };
 
-using IncrementalPreservedSlot = lld::Closed<FreeSlotRecord, OccupiedSlotRecord>;
+using IncrementalPreservedSlot =
+    lld::Closed<FreeSlotRecord, OccupiedSlotRecord>;
 
 struct ExistingSlotChunkPlacement final {
   std::string key;
@@ -290,7 +286,8 @@ getIncrementalSectionState(const IncrementalSectionSnapshot &section) {
       [](const ExactSectionSnapshot &exact) -> const IncrementalSectionState & {
         return exact.section;
       },
-      [](const TextSlotSectionSnapshot &text) -> const IncrementalSectionState & {
+      [](const TextSlotSectionSnapshot &text)
+          -> const IncrementalSectionState & {
         return text.slotSection.section;
       },
       [](const ReadOnlySlotSectionSnapshot &rdata)
@@ -311,85 +308,104 @@ getIncrementalSectionState(const IncrementalSectionSnapshot &section) {
       });
 }
 
-inline const IncrementalSlotSectionSnapshot *
-getIncrementalSlotSectionSnapshot(const IncrementalSectionSnapshot &section) {
+template <class OnSlotSection, class OnOtherSection>
+decltype(auto)
+matchIncrementalSlotSectionSnapshot(const IncrementalSectionSnapshot &section,
+                                    OnSlotSection &&onSlotSection,
+                                    OnOtherSection &&onOtherSection) {
   return section.match(
-      [](const ExactSectionSnapshot &) -> const IncrementalSlotSectionSnapshot * {
-        return nullptr;
+      [&](const ExactSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
       },
-      [](const TextSlotSectionSnapshot &text)
-          -> const IncrementalSlotSectionSnapshot * {
-        return &text.slotSection;
+      [&](const TextSlotSectionSnapshot &text) -> decltype(auto) {
+        return std::forward<OnSlotSection>(onSlotSection)(text.slotSection);
       },
-      [](const ReadOnlySlotSectionSnapshot &rdata)
-          -> const IncrementalSlotSectionSnapshot * {
-        return &rdata.slotSection;
+      [&](const ReadOnlySlotSectionSnapshot &rdata) -> decltype(auto) {
+        return std::forward<OnSlotSection>(onSlotSection)(rdata.slotSection);
       },
-      [](const WritableSlotSectionSnapshot &data)
-          -> const IncrementalSlotSectionSnapshot * {
-        return &data.slotSection;
+      [&](const WritableSlotSectionSnapshot &data) -> decltype(auto) {
+        return std::forward<OnSlotSection>(onSlotSection)(data.slotSection);
       },
-      [](const PDataPackedPrefixSectionSnapshot &)
-          -> const IncrementalSlotSectionSnapshot * { return nullptr; },
-      [](const XDataPackedPrefixSectionSnapshot &)
-          -> const IncrementalSlotSectionSnapshot * { return nullptr; });
+      [&](const PDataPackedPrefixSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
+      },
+      [&](const XDataPackedPrefixSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
+      });
 }
 
-inline const TextSlotSectionSnapshot *
-getTextSlotSectionSnapshot(const IncrementalSectionSnapshot &section) {
+template <class OnTextSection, class OnOtherSection>
+decltype(auto) matchIncrementalTextSlotSectionSnapshot(
+    const IncrementalSectionSnapshot &section, OnTextSection &&onTextSection,
+    OnOtherSection &&onOtherSection) {
   return section.match(
-      [](const ExactSectionSnapshot &) -> const TextSlotSectionSnapshot * {
-        return nullptr;
+      [&](const ExactSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
       },
-      [](const TextSlotSectionSnapshot &text)
-          -> const TextSlotSectionSnapshot * { return &text; },
-      [](const ReadOnlySlotSectionSnapshot &)
-          -> const TextSlotSectionSnapshot * { return nullptr; },
-      [](const WritableSlotSectionSnapshot &)
-          -> const TextSlotSectionSnapshot * { return nullptr; },
-      [](const PDataPackedPrefixSectionSnapshot &)
-          -> const TextSlotSectionSnapshot * { return nullptr; },
-      [](const XDataPackedPrefixSectionSnapshot &)
-          -> const TextSlotSectionSnapshot * { return nullptr; });
+      [&](const TextSlotSectionSnapshot &text) -> decltype(auto) {
+        return std::forward<OnTextSection>(onTextSection)(text);
+      },
+      [&](const ReadOnlySlotSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
+      },
+      [&](const WritableSlotSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
+      },
+      [&](const PDataPackedPrefixSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
+      },
+      [&](const XDataPackedPrefixSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
+      });
 }
 
-inline const IncrementalPackedPrefixSectionSnapshot *
-getIncrementalPackedPrefixSectionSnapshot(const IncrementalSectionSnapshot &section) {
+template <class OnPackedSection, class OnOtherSection>
+decltype(auto) matchIncrementalPackedPrefixSectionSnapshot(
+    const IncrementalSectionSnapshot &section,
+    OnPackedSection &&onPackedSection, OnOtherSection &&onOtherSection) {
   return section.match(
-      [](const ExactSectionSnapshot &)
-          -> const IncrementalPackedPrefixSectionSnapshot * { return nullptr; },
-      [](const TextSlotSectionSnapshot &)
-          -> const IncrementalPackedPrefixSectionSnapshot * { return nullptr; },
-      [](const ReadOnlySlotSectionSnapshot &)
-          -> const IncrementalPackedPrefixSectionSnapshot * { return nullptr; },
-      [](const WritableSlotSectionSnapshot &)
-          -> const IncrementalPackedPrefixSectionSnapshot * { return nullptr; },
-      [](const PDataPackedPrefixSectionSnapshot &pdata)
-          -> const IncrementalPackedPrefixSectionSnapshot * {
-        return &pdata.packedSection;
+      [&](const ExactSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
       },
-      [](const XDataPackedPrefixSectionSnapshot &xdata)
-          -> const IncrementalPackedPrefixSectionSnapshot * {
-        return &xdata.packedSection;
+      [&](const TextSlotSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
+      },
+      [&](const ReadOnlySlotSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
+      },
+      [&](const WritableSlotSectionSnapshot &) -> decltype(auto) {
+        return std::forward<OnOtherSection>(onOtherSection)();
+      },
+      [&](const PDataPackedPrefixSectionSnapshot &pdata) -> decltype(auto) {
+        return std::forward<OnPackedSection>(onPackedSection)(
+            pdata.packedSection);
+      },
+      [&](const XDataPackedPrefixSectionSnapshot &xdata) -> decltype(auto) {
+        return std::forward<OnPackedSection>(onPackedSection)(
+            xdata.packedSection);
       });
 }
 
 inline const IncrementalPreservedSlotState &
 getIncrementalPreservedSlotState(const IncrementalPreservedSlot &slot) {
   return slot.match(
-      [](const FreeSlotRecord &freeSlot) -> const IncrementalPreservedSlotState & {
-        return freeSlot.slot;
-      },
+      [](const FreeSlotRecord &freeSlot)
+          -> const IncrementalPreservedSlotState & { return freeSlot.slot; },
       [](const OccupiedSlotRecord &occupied)
           -> const IncrementalPreservedSlotState & { return occupied.slot; });
 }
 
-inline const std::string *
-getIncrementalPreservedSlotOccupant(const IncrementalPreservedSlot &slot) {
+template <class OnFreeSlot, class OnOccupiedSlot>
+decltype(auto)
+matchIncrementalPreservedSlotOccupancy(const IncrementalPreservedSlot &slot,
+                                       OnFreeSlot &&onFreeSlot,
+                                       OnOccupiedSlot &&onOccupiedSlot) {
   return slot.match(
-      [](const FreeSlotRecord &) -> const std::string * { return nullptr; },
-      [](const OccupiedSlotRecord &occupied) -> const std::string * {
-        return &occupied.occupantKey;
+      [&](const FreeSlotRecord &freeSlot) -> decltype(auto) {
+        return std::forward<OnFreeSlot>(onFreeSlot)(freeSlot);
+      },
+      [&](const OccupiedSlotRecord &occupiedSlot) -> decltype(auto) {
+        return std::forward<OnOccupiedSlot>(onOccupiedSlot)(occupiedSlot);
       });
 }
 

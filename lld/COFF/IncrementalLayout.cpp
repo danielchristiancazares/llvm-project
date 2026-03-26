@@ -184,7 +184,8 @@ static const IncrementalSectionSnapshot *
 findSectionSnapshot(const IncrementalBaselineSnapshot &snapshot, StringRef name,
                     uint32_t characteristics) {
   for (const IncrementalSectionSnapshot &section : snapshot.sections) {
-    const IncrementalSectionState &sectionState = getIncrementalSectionState(section);
+    const IncrementalSectionState &sectionState =
+        getIncrementalSectionState(section);
     if (sectionState.name == name &&
         sectionState.characteristics == characteristics)
       return &section;
@@ -207,9 +208,10 @@ static uint64_t getMinFragmentSize(IncrementalSectionLayoutKind layoutKind) {
   llvm_unreachable("unknown incremental section layout");
 }
 
-static bool validateSlotReuseState(
-    COFFLinkerContext &ctx, const IncrementalSlotSectionSnapshot &slotSection,
-    bool isTextSection) {
+static bool
+validateSlotReuseState(COFFLinkerContext &ctx,
+                       const IncrementalSlotSectionSnapshot &slotSection,
+                       bool isTextSection) {
   const IncrementalSectionState &section = slotSection.section;
   if (section.rva > slotSection.activeEndRVA ||
       slotSection.activeEndRVA > slotSection.maxSectionEndRVA ||
@@ -240,18 +242,25 @@ static bool validateSlotReuseState(
       return false;
     }
 
-    if (const std::string *occupant = getIncrementalPreservedSlotOccupant(slot)) {
-      if (occupant->empty()) {
-        installRejectedBaseline(
-            ctx, "occupied slot is missing its preserved occupant");
-        return false;
-      }
-      if (isTextSection && StringRef(*occupant).starts_with("longthunk:")) {
-        installRejectedBaseline(ctx,
-                                "slot table contains stale long thunk state");
-        return false;
-      }
-    }
+    bool hasInvalidOccupant = false;
+    matchIncrementalPreservedSlotOccupancy(
+        slot, [&](const FreeSlotRecord &) {},
+        [&](const OccupiedSlotRecord &occupied) {
+          if (occupied.occupantKey.empty()) {
+            installRejectedBaseline(
+                ctx, "occupied slot is missing its preserved occupant");
+            hasInvalidOccupant = true;
+            return;
+          }
+          if (isTextSection &&
+              StringRef(occupied.occupantKey).starts_with("longthunk:")) {
+            installRejectedBaseline(
+                ctx, "slot table contains stale long thunk state");
+            hasInvalidOccupant = true;
+          }
+        });
+    if (hasInvalidOccupant)
+      return false;
 
     slots.push_back(&slot);
   }
@@ -503,7 +512,8 @@ static bool applyExactSectionLayout(COFFLinkerContext &ctx,
     }
 
     if (baseline.changedInputs.contains(sectionChunk->file) &&
-        computeIncrementalSymbolHash(*sectionChunk) != oldObjChunk->symbolHash) {
+        computeIncrementalSymbolHash(*sectionChunk) !=
+            oldObjChunk->symbolHash) {
       installLayoutRewrite(ctx, "symbol layout changed inside section chunk");
       return false;
     }
@@ -521,19 +531,30 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
   const IncrementalSectionSnapshot *sectionSnapshot =
       findSectionSnapshot(baseline.snapshot, currentSection.name,
                           currentSection.header.Characteristics);
-  const IncrementalSlotSectionSnapshot *slotSection =
-      sectionSnapshot ? getIncrementalSlotSectionSnapshot(*sectionSnapshot)
-                      : nullptr;
-  const TextSlotSectionSnapshot *textSection =
-      sectionSnapshot ? getTextSlotSectionSnapshot(*sectionSnapshot) : nullptr;
+  const IncrementalSlotSectionSnapshot *slotSection = nullptr;
+  const TextSlotSectionSnapshot *textSection = nullptr;
+  if (sectionSnapshot) {
+    matchIncrementalSlotSectionSnapshot(
+        *sectionSnapshot,
+        [&](const IncrementalSlotSectionSnapshot &slotSectionState) {
+          slotSection = &slotSectionState;
+        },
+        [&]() {});
+    matchIncrementalTextSlotSectionSnapshot(
+        *sectionSnapshot,
+        [&](const TextSlotSectionSnapshot &textSectionState) {
+          textSection = &textSectionState;
+        },
+        [&]() {});
+  }
   IncrementalSectionLayoutKind layoutKind = classifyIncrementalSection(
       currentSection.name, currentSection.header.Characteristics);
   if (!slotSection || !isIncrementalFreeSlotLayout(layoutKind)) {
     installRejectedBaseline(ctx, "missing slot envelope in incremental state");
     return false;
   }
-  auto getSlotState = [](const PlannedSlot &slot)
-      -> const IncrementalPreservedSlotState & {
+  auto getSlotState =
+      [](const PlannedSlot &slot) -> const IncrementalPreservedSlotState & {
     return getIncrementalPreservedSlotState(*slot.slot);
   };
 
@@ -556,7 +577,8 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
   }
 
   StringMap<const ExistingSlotChunkPlacement *> placementsByKey;
-  for (const ExistingSlotChunkPlacement &placement : slotSection->preservedChunks)
+  for (const ExistingSlotChunkPlacement &placement :
+       slotSection->preservedChunks)
     placementsByKey[placement.key] = &placement;
 
   StringMap<const IncrementalTextRedirectState *> redirectsByKey;
@@ -569,11 +591,13 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
   for (const IncrementalPreservedSlot &slot : slotSection->slots) {
     PlannedSlot plannedSlot;
     plannedSlot.slot = &slot;
-    const std::string *occupant = getIncrementalPreservedSlotOccupant(*plannedSlot.slot);
-    plannedSlot.availability =
-        !occupant || !currentKeys.contains(*occupant)
-            ? PlannedSlot::Availability::Available
-            : PlannedSlot::Availability::Blocked;
+    plannedSlot.availability = PlannedSlot::Availability::Available;
+    matchIncrementalPreservedSlotOccupancy(
+        *plannedSlot.slot, [&](const FreeSlotRecord &) {},
+        [&](const OccupiedSlotRecord &occupied) {
+          if (currentKeys.contains(occupied.occupantKey))
+            plannedSlot.availability = PlannedSlot::Availability::Blocked;
+        });
     slots.push_back(std::move(plannedSlot));
   }
   llvm::sort(slots, [](const PlannedSlot &lhs, const PlannedSlot &rhs) {
@@ -629,7 +653,8 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
           return false;
         }
         const PlannedSlot &oldSlot = slots[slotIt->second];
-        const IncrementalPreservedSlotState &oldSlotState = getSlotState(oldSlot);
+        const IncrementalPreservedSlotState &oldSlotState =
+            getSlotState(oldSlot);
         if (chunk->getSize() > oldSlotState.capacity &&
             oldSlotState.capacity >= 5) {
           redirectRVA = oldPlacement->startRVA;
@@ -895,8 +920,9 @@ static bool planSlotReuseSection(COFFLinkerContext &ctx,
     if (!appendPadding(slotState.startRVA, slotState.capacity,
                        slotState.fillByte))
       return false;
-    if (getIncrementalPreservedSlotOccupant(*slot.slot))
-      exactLayoutOnly = false;
+    matchIncrementalPreservedSlotOccupancy(
+        *slot.slot, [&](const FreeSlotRecord &) {},
+        [&](const OccupiedSlotRecord &) { exactLayoutOnly = false; });
   }
   for (const FreeRange &range : splitFreeRanges)
     if (!appendPadding(range.startRVA, range.size, range.fillByte))
@@ -965,9 +991,14 @@ static bool planPackedSection(COFFLinkerContext &ctx,
   const IncrementalSectionSnapshot *sectionSnapshot =
       findSectionSnapshot(baseline.snapshot, currentSection.name,
                           currentSection.header.Characteristics);
-  const IncrementalPackedPrefixSectionSnapshot *packedSection =
-      sectionSnapshot ? getIncrementalPackedPrefixSectionSnapshot(*sectionSnapshot)
-                      : nullptr;
+  const IncrementalPackedPrefixSectionSnapshot *packedSection = nullptr;
+  if (sectionSnapshot)
+    matchIncrementalPackedPrefixSectionSnapshot(
+        *sectionSnapshot,
+        [&](const IncrementalPackedPrefixSectionSnapshot &packedSectionState) {
+          packedSection = &packedSectionState;
+        },
+        [&]() {});
   IncrementalSectionLayoutKind layoutKind = classifyIncrementalSection(
       currentSection.name, currentSection.header.Characteristics);
   if (!packedSection || !isIncrementalPackedLayout(layoutKind)) {
@@ -991,9 +1022,9 @@ static bool planPackedSection(COFFLinkerContext &ctx,
     std::string key =
         getIncrementalChunkKey(baseline.currentInputs.inputIndices, *chunk);
     uint64_t startRVA = alignTo(cursor, uint64_t(chunk->getAlignment()));
-    uint64_t maxSectionEndRVA =
-        packedSection->section.rva + packedSection->activePrefixSize +
-        packedSection->reserveSize;
+    uint64_t maxSectionEndRVA = packedSection->section.rva +
+                                packedSection->activePrefixSize +
+                                packedSection->reserveSize;
     if (startRVA > maxSectionEndRVA ||
         maxSectionEndRVA - startRVA < chunk->getSize()) {
       installPackedSectionGrowthFallback(
@@ -1015,10 +1046,11 @@ static bool planPackedSection(COFFLinkerContext &ctx,
   return true;
 }
 
-static void recomputeOutputLayout(COFFLinkerContext &ctx,
-                                  ArrayRef<OutputSection *> activeSections,
-                                  const IncrementalBaselineSnapshot &loadedState,
-                                  IncrementalLayoutResult &result) {
+static void
+recomputeOutputLayout(COFFLinkerContext &ctx,
+                      ArrayRef<OutputSection *> activeSections,
+                      const IncrementalBaselineSnapshot &loadedState,
+                      IncrementalLayoutResult &result) {
   result.sizeOfHeaders = loadedState.sizeOfHeaders;
   uint64_t fileSize = result.sizeOfHeaders;
   uint64_t imageEnd = result.sizeOfHeaders;
@@ -1094,20 +1126,28 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
     if (!isIncrementalFreeSlotLayout(layoutKind))
       continue;
 
-    const IncrementalSectionSnapshot *sectionSnapshot =
-        findSectionSnapshot(baseline.snapshot, section->name,
-                            section->header.Characteristics);
-    const IncrementalSlotSectionSnapshot *slotSection =
-        sectionSnapshot ? getIncrementalSlotSectionSnapshot(*sectionSnapshot)
-                        : nullptr;
+    const IncrementalSectionSnapshot *sectionSnapshot = findSectionSnapshot(
+        baseline.snapshot, section->name, section->header.Characteristics);
+    const IncrementalSlotSectionSnapshot *slotSection = nullptr;
+    bool isTextSection = false;
+    if (sectionSnapshot) {
+      matchIncrementalSlotSectionSnapshot(
+          *sectionSnapshot,
+          [&](const IncrementalSlotSectionSnapshot &slotSectionState) {
+            slotSection = &slotSectionState;
+          },
+          [&]() {});
+      matchIncrementalTextSlotSectionSnapshot(
+          *sectionSnapshot,
+          [&](const TextSlotSectionSnapshot &) { isTextSection = true; },
+          [&]() {});
+    }
     if (!slotSection) {
       installRejectedBaseline(ctx,
                               "missing slot envelope in incremental state");
       return installLayoutFallback();
     }
-    if (!validateSlotReuseState(
-            ctx, *slotSection,
-            getTextSlotSectionSnapshot(*sectionSnapshot) != nullptr))
+    if (!validateSlotReuseState(ctx, *slotSection, isTextSection))
       return installLayoutFallback();
   }
 
@@ -1155,18 +1195,24 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
       buildIncrementalEdgeStates(ctx, baseline.currentInputs.inputIndices);
 
   StringMap<uint64_t> oldPlacementRVAs;
-  for (const IncrementalSectionSnapshot &sectionSnapshot : baseline.snapshot.sections) {
-    if (const IncrementalSlotSectionSnapshot *slotSection =
-            getIncrementalSlotSectionSnapshot(sectionSnapshot)) {
-      for (const ExistingSlotChunkPlacement &placement :
-           slotSection->preservedChunks)
-        oldPlacementRVAs[placement.key] = placement.startRVA;
-    }
-    if (const IncrementalPackedPrefixSectionSnapshot *packedSection =
-            getIncrementalPackedPrefixSectionSnapshot(sectionSnapshot)) {
-      for (const PackedPrefixChunkPlacement &placement : packedSection->members)
-        oldPlacementRVAs[placement.key] = placement.startRVA;
-    }
+  for (const IncrementalSectionSnapshot &sectionSnapshot :
+       baseline.snapshot.sections) {
+    matchIncrementalSlotSectionSnapshot(
+        sectionSnapshot,
+        [&](const IncrementalSlotSectionSnapshot &slotSection) {
+          for (const ExistingSlotChunkPlacement &placement :
+               slotSection.preservedChunks)
+            oldPlacementRVAs[placement.key] = placement.startRVA;
+        },
+        [&]() {});
+    matchIncrementalPackedPrefixSectionSnapshot(
+        sectionSnapshot,
+        [&](const IncrementalPackedPrefixSectionSnapshot &packedSection) {
+          for (const PackedPrefixChunkPlacement &placement :
+               packedSection.members)
+            oldPlacementRVAs[placement.key] = placement.startRVA;
+        },
+        [&]() {});
   }
 
   StringMap<const IncrementalChunkState *> oldChunksByKey;
@@ -1181,9 +1227,8 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
             oldSection.chunkCount)
       continue;
     for (size_t i = 0; i < oldSection.chunkCount; ++i) {
-      const IncrementalChunkState &oldChunk =
-          getIncrementalChunkState(
-              baseline.snapshot.chunks[oldSection.firstChunk + i]);
+      const IncrementalChunkState &oldChunk = getIncrementalChunkState(
+          baseline.snapshot.chunks[oldSection.firstChunk + i]);
       oldChunksByKey[oldChunk.key] = &oldChunk;
       oldSectionsByChunk[&oldChunk] = &oldSection;
     }

@@ -35,11 +35,9 @@ namespace lld::coff {
 
 SectionChunk::SectionChunk(ObjFile *f, const coff_section *h, Kind k)
     : Chunk(k), file(f), header(h), repl(this) {
-  // Initialize relocs.
   if (file)
     setRelocs(file->getCOFFObj()->getRelocations(header));
 
-  // Initialize sectionName.
   StringRef sectionName;
   if (file) {
     if (Expected<StringRef> e = file->getCOFFObj()->getSectionName(header))
@@ -484,12 +482,10 @@ void SectionChunk::writeTo(uint8_t *buf) const {
       return;
     }
   }
-  // Copy section contents from source object file to output file.
   ArrayRef<uint8_t> a = getContents();
   if (!a.empty())
     memcpy(buf, a.data(), a.size());
 
-  // Apply relocations.
   size_t inputSize = getSize();
   for (const coff_relocation &rel : getRelocs()) {
     // Check for an invalid relocation offset. This check isn't perfect, because
@@ -601,7 +597,6 @@ void SectionChunk::addAssociative(SectionChunk *child) {
       break;
   }
 
-  // Insert child between prev and next.
   assert(prev->assocChildren == next);
   prev->assocChildren = child;
   child->assocChildren = next;

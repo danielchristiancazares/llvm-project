@@ -142,7 +142,7 @@ public:
   Timer moduleSymbolTypeRemapTimer;
   Timer moduleSymbolIdTranslateTimer;
 
-  std::optional<PDBStats> pdbStats;
+  PDBSummary pdbSummary;
 
   Configuration config;
   std::unique_ptr<IncrementalCoordinator> incremental;
