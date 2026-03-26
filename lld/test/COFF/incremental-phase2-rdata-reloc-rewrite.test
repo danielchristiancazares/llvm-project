@@ -1,0 +1,38 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.out before.txt after.txt && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main.s -o main.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc data1.s -o data.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj data.obj && \
+# RUN:   llvm-objdump -s --section=.text %t.exe > before.txt && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc data2.s -o data.obj && \
+# RUN:   echo SECOND > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj data.obj >> %t.out 2>&1 && \
+# RUN:   llvm-objdump -s --section=.text %t.exe > after.txt && \
+# RUN:   %python -c "import pathlib,sys; sys.exit(0 if pathlib.Path('before.txt').read_text()!=pathlib.Path('after.txt').read_text() else 1)" && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: SECOND
+# CHECK: incremental: using state
+# CHECK: incremental: byte-reuse layout active
+# CHECK: incremental: allocated tail reserve .rdata
+
+#--- main.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  movq keepdata(%rip), %rax
+  retq
+
+#--- data1.s
+.section .rdata,"dr",one_only,keepdata
+.globl keepdata
+keepdata:
+  .quad 2
+
+#--- data2.s
+.section .rdata,"dr",one_only,keepdata
+.globl keepdata
+keepdata:
+  .quad 2
+  .quad 3

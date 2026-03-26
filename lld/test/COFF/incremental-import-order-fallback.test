@@ -1,0 +1,38 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.out one.lib two.lib && \
+# RUN:   llvm-lib -machine:amd64 -def:one.def -out:one.lib && \
+# RUN:   llvm-lib -machine:amd64 -def:two.def -out:two.lib && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main.s -o main.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj one.lib two.lib && \
+# RUN:   echo REORDER > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj two.lib one.lib >> %t.out 2>&1 && \
+# RUN:   echo REUSE >> %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj two.lib one.lib >> %t.out 2>&1 && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: REORDER
+# CHECK: incremental: fallback: LayoutChanged
+# CHECK: incremental: detail: import topology changed
+# CHECK: REUSE
+# CHECK: incremental: using state
+# CHECK: incremental: exact-layout reuse active
+
+#--- one.def
+NAME one.dll
+EXPORTS
+  data1 DATA
+
+#--- two.def
+NAME two.dll
+EXPORTS
+  data2 DATA
+
+#--- main.s
+.text
+.globl main
+main:
+  movq __imp_data1(%rip), %rax
+  movq __imp_data2(%rip), %rcx
+  xorl %eax, %eax
+  retq
