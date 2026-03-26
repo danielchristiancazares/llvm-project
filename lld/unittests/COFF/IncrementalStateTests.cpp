@@ -1,6 +1,6 @@
-#include "../../COFF/IncrementalState.h"
-#include "../../COFF/Incremental.h"
 #include "../../COFF/Chunks.h"
+#include "../../COFF/Incremental.h"
+#include "../../COFF/IncrementalState.h"
 #include "../../COFF/Symbols.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
@@ -20,7 +20,8 @@ namespace {
 class IncrementalStateTest : public ::testing::Test {
 protected:
   void SetUp() override {
-    ASSERT_FALSE(sys::fs::createUniqueDirectory("lld-incremental-state", testDir));
+    ASSERT_FALSE(
+        sys::fs::createUniqueDirectory("lld-incremental-state", testDir));
   }
 
   void TearDown() override {
@@ -44,33 +45,72 @@ protected:
 };
 
 static std::optional<size_t>
-getSelectedFreeSlotIndex(const IncrementalFreeSlotSelection &selection) {
-  return selection.match(
-      [](const NoFreeSlotFit &) -> std::optional<size_t> { return std::nullopt; },
-      [](const SelectedFreeSlot &selected) -> std::optional<size_t> {
-        return selected.index;
-      });
+getSelectedFreeSlotIndex(ArrayRef<IncrementalPreservedSlot> slots,
+                         uint64_t size, uint32_t alignment) {
+  std::optional<size_t> selectedSlot;
+  matchBestFitIncrementalFreeSlot(
+      slots, size, alignment,
+      [&](size_t slotIndex) { selectedSlot = slotIndex; }, [&]() {});
+  return selectedSlot;
+}
+
+static std::optional<uint64_t> getTailReserveStartRVA(uint64_t tailCursor,
+                                                      uint64_t maxSectionEndRVA,
+                                                      uint64_t size,
+                                                      uint32_t alignment) {
+  std::optional<uint64_t> tailReserveStartRVA;
+  matchIncrementalTailReserve(
+      tailCursor, maxSectionEndRVA, size, alignment,
+      [&](uint64_t startRVA) { tailReserveStartRVA = startRVA; }, [&]() {});
+  return tailReserveStartRVA;
 }
 
 static std::optional<uint64_t>
-getTailReserveStartRVA(const IncrementalTailReserveSelection &selection) {
-  return selection.match(
-      [](const TailReserveUnavailable &) -> std::optional<uint64_t> {
-        return std::nullopt;
-      },
-      [](const TailReserveStart &start) -> std::optional<uint64_t> {
-        return start.rva;
-      });
+getSelectedPoolThunkRVA(uint64_t oldPoolThunkRVA, uint64_t tailCursor,
+                        uint64_t poolCursor, uint64_t poolEndRVA,
+                        ArrayRef<uint64_t> claimedThunkRVAs,
+                        ArrayRef<uint64_t> freedThunkRVAs = {}) {
+  std::optional<uint64_t> selectedPoolThunkRVA;
+  matchIncrementalTextThunkRVA(
+      oldPoolThunkRVA, tailCursor, poolCursor, poolEndRVA, claimedThunkRVAs,
+      [&](uint64_t thunkRVA) { selectedPoolThunkRVA = thunkRVA; }, [&]() {},
+      freedThunkRVAs);
+  return selectedPoolThunkRVA;
 }
 
-static std::optional<uint64_t>
-getSelectedPoolThunkRVA(const IncrementalTextThunkSelection &selection) {
-  return selection.match(
-      [](const PoolThunkUnavailable &) -> std::optional<uint64_t> {
-        return std::nullopt;
+static const TextSlotSectionSnapshot *
+findTextSlotSectionSnapshot(const IncrementalSectionSnapshot &section) {
+  const TextSlotSectionSnapshot *textSection = nullptr;
+  matchIncrementalTextSlotSectionSnapshot(
+      section,
+      [&](const TextSlotSectionSnapshot &matchedSection) {
+        textSection = &matchedSection;
       },
-      [](const SelectedPoolThunkRVA &selected)
-          -> std::optional<uint64_t> { return selected.rva; });
+      [&]() {});
+  return textSection;
+}
+
+static const IncrementalPackedPrefixSectionSnapshot *
+findPackedPrefixSectionSnapshot(const IncrementalSectionSnapshot &section) {
+  const IncrementalPackedPrefixSectionSnapshot *packedSection = nullptr;
+  matchIncrementalPackedPrefixSectionSnapshot(
+      section,
+      [&](const IncrementalPackedPrefixSectionSnapshot &matchedSection) {
+        packedSection = &matchedSection;
+      },
+      [&]() {});
+  return packedSection;
+}
+
+static std::optional<std::string>
+getPreservedSlotOccupant(const IncrementalPreservedSlot &slot) {
+  std::optional<std::string> occupant;
+  matchIncrementalPreservedSlotOccupancy(
+      slot, [&](const FreeSlotRecord &) {},
+      [&](const OccupiedSlotRecord &occupied) {
+        occupant = occupied.occupantKey;
+      });
+  return occupant;
 }
 
 TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
@@ -150,19 +190,15 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
       IncrementalSectionSnapshot::make<PDataPackedPrefixSectionSnapshot>(
           std::move(packedSection)));
 
-  state.chunks.push_back(IncrementalChunkSnapshot::make<ObjSectionChunkSnapshot>(
-      ObjSectionChunkSnapshot{
-          IncrementalChunkState{"obj:0:comdat:main", 0, 0x60000020, 16, 0x1000,
-                                32, 48},
-          0, 1, 0xbbbb, 0xcccc}));
-  state.symbols.push_back(IncrementalResolvedSymbolSnapshot::make<
-                          RegularResolvedSymbol>(RegularResolvedSymbol{
-      "main",
-      IncrementalPersistedInputOwner::make<PersistedInputOwner>(
-          PersistedInputOwner{0}),
-      0,
-      IncrementalPersistedChunkReference::make<PersistedChunkReference>(
-          PersistedChunkReference{"obj:0:comdat:main"})}));
+  state.chunks.push_back(
+      IncrementalChunkSnapshot::make<ObjSectionChunkSnapshot>(
+          ObjSectionChunkSnapshot{IncrementalChunkState{"obj:0:comdat:main", 0,
+                                                        0x60000020, 16, 0x1000,
+                                                        32, 48},
+                                  0, 1, 0xbbbb, 0xcccc}));
+  state.symbols.push_back(
+      IncrementalResolvedSymbolSnapshot::make<ObjFileRegularResolvedSymbol>(
+          ObjFileRegularResolvedSymbol{"main", 0, 0, "obj:0:comdat:main"}));
 
   SmallString<128> path = getPath("state.llilk");
   expectNoError(writeIncrementalState(path, state));
@@ -200,23 +236,19 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
       });
   ASSERT_EQ(loaded->symbols.size(), 1u);
   loaded->symbols[0].match(
-      [&](const RegularResolvedSymbol &symbol) {
+      [&](const ObjFileRegularResolvedSymbol &symbol) {
         EXPECT_EQ(symbol.name, "main");
-        symbol.owner.match(
-            [&](const PersistedInputOwner &owner) { EXPECT_EQ(owner.inputIndex, 0u); },
-            [&](const NoPersistedInputOwner &) {
-              ADD_FAILURE() << "expected a persisted owner";
-            });
-        symbol.chunk.match(
-            [&](const PersistedChunkReference &chunk) {
-              EXPECT_EQ(chunk.chunkKey, "obj:0:comdat:main");
-            },
-            [&](const NoPersistedChunkReference &) {
-              ADD_FAILURE() << "expected a persisted chunk reference";
-            });
+        EXPECT_EQ(symbol.inputIndex, 0u);
+        EXPECT_EQ(symbol.chunkKey, "obj:0:comdat:main");
       },
-      [&](const CommonResolvedSymbol &) {
+      [&](const BitcodeRegularResolvedSymbol &) {
+        ADD_FAILURE() << "unexpected bitcode regular symbol";
+      },
+      [&](const ObjFileCommonResolvedSymbol &) {
         ADD_FAILURE() << "unexpected common symbol";
+      },
+      [&](const BitcodeCommonResolvedSymbol &) {
+        ADD_FAILURE() << "unexpected bitcode common symbol";
       },
       [&](const ImportDataResolvedSymbol &) {
         ADD_FAILURE() << "unexpected import-data symbol";
@@ -230,20 +262,23 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
       [&](const AbsoluteResolvedSymbol &) {
         ADD_FAILURE() << "unexpected absolute symbol";
       },
-      [&](const SyntheticResolvedSymbol &) {
+      [&](const ChunkBackedSyntheticResolvedSymbol &) {
         ADD_FAILURE() << "unexpected synthetic symbol";
+      },
+      [&](const ImageBaseSyntheticResolvedSymbol &) {
+        ADD_FAILURE() << "unexpected __ImageBase synthetic symbol";
       });
   ASSERT_EQ(loaded->sections.size(), 2u);
   const TextSlotSectionSnapshot *loadedText =
-      getTextSlotSectionSnapshot(loaded->sections[0]);
+      findTextSlotSectionSnapshot(loaded->sections[0]);
   ASSERT_NE(loadedText, nullptr);
   EXPECT_EQ(loadedText->slotSection.section.name, ".text");
   EXPECT_EQ(loadedText->slotSection.maxSectionEndRVA, 0x2000u);
   EXPECT_EQ(loadedText->slotSection.activeEndRVA, 0x1200u);
   ASSERT_EQ(loadedText->slotSection.slots.size(), 1u);
-  const std::string *occupant =
-      getIncrementalPreservedSlotOccupant(loadedText->slotSection.slots[0]);
-  ASSERT_NE(occupant, nullptr);
+  std::optional<std::string> occupant =
+      getPreservedSlotOccupant(loadedText->slotSection.slots[0]);
+  ASSERT_TRUE(occupant.has_value());
   EXPECT_EQ(*occupant, "obj:0:comdat:main");
   EXPECT_EQ(getIncrementalPreservedSlotState(loadedText->slotSection.slots[0])
                 .fillByte,
@@ -259,7 +294,7 @@ TEST_F(IncrementalStateTest, RoundTripPreservesExtendedFields) {
   EXPECT_EQ(loadedText->thunkPool.nextFreeRVA, 0x1A00u);
 
   const IncrementalPackedPrefixSectionSnapshot *loadedPacked =
-      getIncrementalPackedPrefixSectionSnapshot(loaded->sections[1]);
+      findPackedPrefixSectionSnapshot(loaded->sections[1]);
   ASSERT_NE(loadedPacked, nullptr);
   EXPECT_EQ(loadedPacked->section.name, ".pdata");
   EXPECT_EQ(loadedPacked->activePrefixSize, 32u);
@@ -290,8 +325,8 @@ TEST_F(IncrementalStateTest, RejectsInvalidMagicAndVersion) {
   state.outputPath = "out.exe";
   expectNoError(writeIncrementalState(path, state));
 
-  auto bufferOrErr =
-      MemoryBuffer::getFile(path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
+  auto bufferOrErr = MemoryBuffer::getFile(path, /*IsText=*/false,
+                                           /*RequiresNullTerminator=*/false);
   ASSERT_TRUE(static_cast<bool>(bufferOrErr));
   std::string bytes = (*bufferOrErr)->getBuffer().str();
   ASSERT_GE(bytes.size(), 12u);
@@ -320,46 +355,38 @@ TEST(IncrementalHelpersTest, BestFitSelectionHonorsCapacityAndAlignment) {
   slots.push_back(IncrementalPreservedSlot::make<FreeSlotRecord>(
       FreeSlotRecord{IncrementalPreservedSlotState{0x1024, 24, 0, 1, 0}}));
 
-  std::optional<size_t> slot =
-      getSelectedFreeSlotIndex(findBestFitIncrementalFreeSlot(slots, 16, 16));
+  std::optional<size_t> slot = getSelectedFreeSlotIndex(slots, 16, 16);
   ASSERT_TRUE(slot.has_value());
   EXPECT_EQ(*slot, 1u);
 
-  slot = getSelectedFreeSlotIndex(findBestFitIncrementalFreeSlot(slots, 16, 32));
+  slot = getSelectedFreeSlotIndex(slots, 16, 32);
   ASSERT_TRUE(slot.has_value());
   EXPECT_EQ(*slot, 0u);
 
-  EXPECT_FALSE(
-      getSelectedFreeSlotIndex(findBestFitIncrementalFreeSlot(slots, 64, 16))
-          .has_value());
+  EXPECT_FALSE(getSelectedFreeSlotIndex(slots, 64, 16).has_value());
 }
 
 TEST(IncrementalHelpersTest, TailReserveAllocationAlignsAndRejectsOverflow) {
-  std::optional<uint64_t> start = getTailReserveStartRVA(
-      allocateIncrementalTailReserve(0x1003, 0x1010, 4, 4));
+  std::optional<uint64_t> start = getTailReserveStartRVA(0x1003, 0x1010, 4, 4);
   ASSERT_TRUE(start.has_value());
   EXPECT_EQ(*start, 0x1004u);
 
-  EXPECT_FALSE(getTailReserveStartRVA(
-                   allocateIncrementalTailReserve(0x100f, 0x1010, 4, 4))
-                   .has_value());
+  EXPECT_FALSE(getTailReserveStartRVA(0x100f, 0x1010, 4, 4).has_value());
 }
 
 TEST(IncrementalHelpersTest, Amd64Rel32RangeHelperChecksBoundaries) {
   uint64_t source = 0x1000;
   uint64_t maxInRange = source + 4 + uint64_t(INT32_MAX);
-  EXPECT_TRUE(
-      isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32, source,
-                                     maxInRange));
-  EXPECT_FALSE(isIncrementalAmd64Rel32InRange(
-      llvm::COFF::IMAGE_REL_AMD64_REL32, source, maxInRange + 1));
+  EXPECT_TRUE(isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32,
+                                             source, maxInRange));
+  EXPECT_FALSE(isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32,
+                                              source, maxInRange + 1));
 
   uint64_t minInRange = source + 4 - uint64_t(0x80000000ULL);
-  EXPECT_TRUE(
-      isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32, source,
-                                     minInRange));
-  EXPECT_FALSE(isIncrementalAmd64Rel32InRange(
-      llvm::COFF::IMAGE_REL_AMD64_REL32, source, minInRange - 1));
+  EXPECT_TRUE(isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32,
+                                             source, minInRange));
+  EXPECT_FALSE(isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32,
+                                              source, minInRange - 1));
 }
 
 TEST(IncrementalHelpersTest, EntryRedirectChunkRangeChecks) {
@@ -418,22 +445,21 @@ TEST(IncrementalHelpersTest, PersistedSlotChunkFilterDropsTextLongThunks) {
       IncrementalSectionLayoutKind::TextFreeSlots, thunk));
   EXPECT_TRUE(isIncrementalPersistedSlotChunk(
       IncrementalSectionLayoutKind::TextFreeSlots, padding));
-  EXPECT_FALSE(
-      isIncrementalPersistedSlotChunk(
-          IncrementalSectionLayoutKind::TextFreeSlots, bodyChunk));
+  EXPECT_FALSE(isIncrementalPersistedSlotChunk(
+      IncrementalSectionLayoutKind::TextFreeSlots, bodyChunk));
 }
 
 TEST(IncrementalHelpersTest, ChooseTextThunkRVAReusesValidExistingSlot) {
-  std::optional<uint64_t> thunkRVA = getSelectedPoolThunkRVA(
-      chooseIncrementalTextThunkRVA(0x2ff0, 0x2400, 0x2fe0, 0x3000, {}));
+  std::optional<uint64_t> thunkRVA =
+      getSelectedPoolThunkRVA(0x2ff0, 0x2400, 0x2fe0, 0x3000, {});
   ASSERT_TRUE(thunkRVA.has_value());
   EXPECT_EQ(*thunkRVA, 0x2ff0u);
 }
 
 TEST(IncrementalHelpersTest,
      ChooseTextThunkRVAAllocatesFreshSlotWhenExistingOneIsInvalid) {
-  std::optional<uint64_t> thunkRVA = getSelectedPoolThunkRVA(
-      chooseIncrementalTextThunkRVA(0x2fe0, 0x2ff8, 0x3010, 0x3020, {}));
+  std::optional<uint64_t> thunkRVA =
+      getSelectedPoolThunkRVA(0x2fe0, 0x2ff8, 0x3010, 0x3020, {});
   ASSERT_TRUE(thunkRVA.has_value());
   EXPECT_EQ(*thunkRVA, 0x3000u);
 }
@@ -441,9 +467,8 @@ TEST(IncrementalHelpersTest,
 TEST(IncrementalHelpersTest,
      ChooseTextThunkRVAReusesFreedSlotBeforeScanningBelowPoolCursor) {
   uint64_t freedThunkRVAs[] = {0x2fd0, 0x2ff0};
-  std::optional<uint64_t> thunkRVA = getSelectedPoolThunkRVA(
-      chooseIncrementalTextThunkRVA(0, 0x2fc0, 0x2fd0, 0x3000, {},
-                                    freedThunkRVAs));
+  std::optional<uint64_t> thunkRVA =
+      getSelectedPoolThunkRVA(0, 0x2fc0, 0x2fd0, 0x3000, {}, freedThunkRVAs);
   ASSERT_TRUE(thunkRVA.has_value());
   EXPECT_EQ(*thunkRVA, 0x2ff0u);
 }
@@ -453,8 +478,7 @@ TEST(IncrementalHelpersTest,
   uint64_t claimedThunkRVAs[] = {0x2ff0};
   uint64_t freedThunkRVAs[] = {0x2fb0, 0x2ff0, 0x2fd0};
   std::optional<uint64_t> thunkRVA = getSelectedPoolThunkRVA(
-      chooseIncrementalTextThunkRVA(0, 0x2fc0, 0x2fd0, 0x3000,
-                                    claimedThunkRVAs, freedThunkRVAs));
+      0, 0x2fc0, 0x2fd0, 0x3000, claimedThunkRVAs, freedThunkRVAs);
   ASSERT_TRUE(thunkRVA.has_value());
   EXPECT_EQ(*thunkRVA, 0x2fd0u);
 }
@@ -479,23 +503,19 @@ TEST(IncrementalHelpersTest,
                                       0x3000, true);
 
   EXPECT_EQ(plans[0].engagement, IncrementalRedirectEngagement::Installed);
-  EXPECT_EQ(plans[0].targeting,
-            IncrementalRedirectTargeting::DirectBodyTarget);
+  EXPECT_EQ(plans[0].targeting, IncrementalRedirectTargeting::DirectBodyTarget);
   EXPECT_EQ(plans[0].poolThunkRVA, 0u);
 
   EXPECT_EQ(plans[1].engagement, IncrementalRedirectEngagement::Installed);
-  EXPECT_EQ(plans[1].targeting,
-            IncrementalRedirectTargeting::PoolThunkTarget);
+  EXPECT_EQ(plans[1].targeting, IncrementalRedirectTargeting::PoolThunkTarget);
   EXPECT_EQ(plans[1].poolThunkRVA, 0x2ff0u);
   EXPECT_EQ(poolCursor, 0x2fd0u);
   EXPECT_EQ(poolStart, 0x2ff0u);
 }
 
 TEST(IncrementalHelpersTest, ChooseTextThunkRVAFailsWhenPoolIsExhausted) {
-  EXPECT_FALSE(getSelectedPoolThunkRVA(
-                   chooseIncrementalTextThunkRVA(0x2ff0, 0x2ff8, 0x3000, 0x3000,
-                                                 {}))
-                   .has_value());
+  EXPECT_FALSE(
+      getSelectedPoolThunkRVA(0x2ff0, 0x2ff8, 0x3000, 0x3000, {}).has_value());
 }
 
 TEST(IncrementalHelpersTest, RedirectStateRoundTripPreservesPoolState) {
@@ -531,7 +551,7 @@ TEST(IncrementalHelpersTest, RedirectStateRoundTripPreservesPoolState) {
   ASSERT_TRUE(static_cast<bool>(loaded)) << toString(loaded.takeError());
   ASSERT_EQ(loaded->sections.size(), 1u);
   const TextSlotSectionSnapshot *loadedText =
-      getTextSlotSectionSnapshot(loaded->sections[0]);
+      findTextSlotSectionSnapshot(loaded->sections[0]);
   ASSERT_NE(loadedText, nullptr);
   ASSERT_EQ(loadedText->redirects.size(), 1u);
   EXPECT_EQ(loadedText->redirects[0].poolThunkRVA, 0x4FF0u);

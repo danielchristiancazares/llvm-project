@@ -970,8 +970,8 @@ void PDBLinker::analyzeSymbolSubsection(
                             storage);
           }
 
-          if (ctx.pdbStats.has_value())
-            ++ctx.pdbStats->globalSymbols;
+          ctx.pdbSummary.withMeasuredStats(
+              [](PDBStats &stats) { ++stats.globalSymbols; });
         }
 
         // Update the module stream offset and record any string table index
@@ -989,8 +989,8 @@ void PDBLinker::analyzeSymbolSubsection(
           }
           moduleSymOffset += alignedSize;
 
-          if (ctx.pdbStats.has_value())
-            ++ctx.pdbStats->moduleSymbols;
+          ctx.pdbSummary.withMeasuredStats(
+              [](PDBStats &stats) { ++stats.moduleSymbols; });
         }
 
         return Error::success();
@@ -1256,15 +1256,15 @@ void PDBLinker::replayCachedSymbolSubsection(
                                    moduleSymOffset, sym);
           });
 
-      if (ctx.pdbStats.has_value())
-        ++ctx.pdbStats->globalSymbols;
+      ctx.pdbSummary.withMeasuredStats(
+          [](PDBStats &stats) { ++stats.globalSymbols; });
     }
 
     if (symbolRoutesToModule(symbolPlan.routing)) {
       moduleSymOffset += symbolPlan.alignedLength;
 
-      if (ctx.pdbStats.has_value())
-        ++ctx.pdbStats->moduleSymbols;
+      ctx.pdbSummary.withMeasuredStats(
+          [](PDBStats &stats) { ++stats.moduleSymbols; });
     }
   }
 }
@@ -2007,12 +2007,12 @@ void PDBLinker::addObjectsToPDB() {
     }
   }
 
-  if (ctx.pdbStats.has_value()) {
+  ctx.pdbSummary.withMeasuredStats([&](PDBStats &stats) {
     for (TpiSource *source : ctx.tpiSourceList) {
-      ctx.pdbStats->nbTypeRecords += source->nbTypeRecords;
-      ctx.pdbStats->nbTypeRecordsBytes += source->nbTypeRecordsBytes;
+      stats.nbTypeRecords += source->nbTypeRecords;
+      stats.nbTypeRecordsBytes += source->nbTypeRecordsBytes;
     }
-  }
+  });
 }
 
 void PDBLinker::addPublicsToPDB() {
@@ -2046,8 +2046,8 @@ void PDBLinker::addPublicsToPDB() {
     }
   });
 
-  if (ctx.pdbStats.has_value())
-    ctx.pdbStats->publicSymbols = publics.size();
+  ctx.pdbSummary.withMeasuredStats(
+      [&](PDBStats &stats) { stats.publicSymbols = publics.size(); });
 
   if (!publics.empty())
     gsiBuilder.addPublicSymbols(std::move(publics));
@@ -2057,9 +2057,11 @@ void PDBLinker::collectStats() {
   if (!ctx.config.showSummary)
     return;
 
-  ctx.pdbStats->nbTPIrecords = builder.getTpiBuilder().getRecordCount();
-  ctx.pdbStats->nbIPIrecords = builder.getIpiBuilder().getRecordCount();
-  ctx.pdbStats->strTabSize = pdbStrTab.size();
+  ctx.pdbSummary.withMeasuredStats([&](PDBStats &stats) {
+    stats.nbTPIrecords = builder.getTpiBuilder().getRecordCount();
+    stats.nbIPIrecords = builder.getIpiBuilder().getRecordCount();
+    stats.strTabSize = pdbStrTab.size();
+  });
 
   SmallString<256> buffer;
   raw_svector_ostream stream(buffer);
@@ -2115,7 +2117,8 @@ void PDBLinker::collectStats() {
     printLargeInputTypeRecs("TPI", tMerger.tpiCounts, tMerger.getTypeTable());
     printLargeInputTypeRecs("IPI", tMerger.ipiCounts, tMerger.getIDTable());
 
-    ctx.pdbStats->largeInputTypeRecs = buffer.str();
+    ctx.pdbSummary.withMeasuredStats(
+        [&](PDBStats &stats) { stats.largeInputTypeRecs = buffer.str(); });
   }
 }
 
@@ -2512,7 +2515,7 @@ void lld::coff::createPDB(COFFLinkerContext &ctx,
     PDBLinker pdb(ctx);
 
     if (ctx.config.showSummary)
-      ctx.pdbStats.emplace();
+      ctx.pdbSummary.enableMeasuredRows();
 
     pdb.initialize(buildId);
     pdb.addObjectsToPDB();

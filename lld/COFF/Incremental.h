@@ -14,10 +14,12 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/Support/MathExtras.h"
 #include <memory>
 #include <string>
 #include <utility>
@@ -120,27 +122,6 @@ struct IncrementalTextThunkPlanState {
   IncrementalRedirectTargeting targeting =
       IncrementalRedirectTargeting::DirectBodyTarget;
 };
-
-struct NoFreeSlotFit final {};
-struct SelectedFreeSlot final {
-  size_t index = 0;
-};
-using IncrementalFreeSlotSelection =
-    lld::Closed<NoFreeSlotFit, SelectedFreeSlot>;
-
-struct TailReserveUnavailable final {};
-struct TailReserveStart final {
-  uint64_t rva = 0;
-};
-using IncrementalTailReserveSelection =
-    lld::Closed<TailReserveUnavailable, TailReserveStart>;
-
-struct PoolThunkUnavailable final {};
-struct SelectedPoolThunkRVA final {
-  uint64_t rva = 0;
-};
-using IncrementalTextThunkSelection =
-    lld::Closed<PoolThunkUnavailable, SelectedPoolThunkRVA>;
 
 struct IncrementalDisabled final {};
 
@@ -351,17 +332,95 @@ bool isIncrementalPackedLayout(IncrementalSectionLayoutKind layoutKind);
 uint8_t getIncrementalFillByte(IncrementalSectionLayoutKind layoutKind);
 bool isIncrementalPersistedSlotChunk(IncrementalSectionLayoutKind layoutKind,
                                      const Chunk &chunk);
-IncrementalFreeSlotSelection
-findBestFitIncrementalFreeSlot(llvm::ArrayRef<IncrementalPreservedSlot> slots,
-                               uint64_t size, uint32_t alignment);
-IncrementalTailReserveSelection
-allocateIncrementalTailReserve(uint64_t tailCursor, uint64_t maxSectionEndRVA,
-                               uint64_t size, uint32_t alignment);
-IncrementalTextThunkSelection
-chooseIncrementalTextThunkRVA(uint64_t oldPoolThunkRVA, uint64_t tailCursor,
-                              uint64_t poolCursor, uint64_t poolEndRVA,
-                              llvm::ArrayRef<uint64_t> claimedThunkRVAs,
-                              llvm::ArrayRef<uint64_t> freedThunkRVAs = {});
+template <class OnSelectedSlot, class OnNoReusableSlot>
+decltype(auto)
+matchBestFitIncrementalFreeSlot(llvm::ArrayRef<IncrementalPreservedSlot> slots,
+                                uint64_t size, uint32_t alignment,
+                                OnSelectedSlot &&onSelectedSlot,
+                                OnNoReusableSlot &&onNoReusableSlot) {
+  size_t bestIndex = 0;
+  bool found = false;
+  for (size_t i = 0; i < slots.size(); ++i) {
+    const IncrementalPreservedSlotState &slot =
+        getIncrementalPreservedSlotState(slots[i]);
+    if (slot.capacity < size || slot.startRVA % alignment != 0)
+      continue;
+    if (!found ||
+        slot.capacity <
+            getIncrementalPreservedSlotState(slots[bestIndex]).capacity ||
+        (slot.capacity ==
+             getIncrementalPreservedSlotState(slots[bestIndex]).capacity &&
+         slot.startRVA <
+             getIncrementalPreservedSlotState(slots[bestIndex]).startRVA)) {
+      bestIndex = i;
+      found = true;
+    }
+  }
+  if (!found)
+    return std::forward<OnNoReusableSlot>(onNoReusableSlot)();
+  return std::forward<OnSelectedSlot>(onSelectedSlot)(bestIndex);
+}
+
+template <class OnAllocatedTailReserve, class OnExhaustedTailReserve>
+decltype(auto)
+matchIncrementalTailReserve(uint64_t tailCursor, uint64_t maxSectionEndRVA,
+                            uint64_t size, uint32_t alignment,
+                            OnAllocatedTailReserve &&onAllocatedTailReserve,
+                            OnExhaustedTailReserve &&onExhaustedTailReserve) {
+  uint64_t startRVA = llvm::alignTo(tailCursor, uint64_t(alignment));
+  if (startRVA > maxSectionEndRVA || maxSectionEndRVA - startRVA < size)
+    return std::forward<OnExhaustedTailReserve>(onExhaustedTailReserve)();
+  return std::forward<OnAllocatedTailReserve>(onAllocatedTailReserve)(startRVA);
+}
+
+template <class OnSelectedPoolThunk, class OnNoPoolThunk>
+decltype(auto) matchIncrementalTextThunkRVA(
+    uint64_t oldPoolThunkRVA, uint64_t tailCursor, uint64_t poolCursor,
+    uint64_t poolEndRVA, llvm::ArrayRef<uint64_t> claimedThunkRVAs,
+    OnSelectedPoolThunk &&onSelectedPoolThunk, OnNoPoolThunk &&onNoPoolThunk,
+    llvm::ArrayRef<uint64_t> freedThunkRVAs = {}) {
+  constexpr uint64_t thunkSize = 16;
+  auto isClaimed = [&](uint64_t rva) {
+    return llvm::is_contained(claimedThunkRVAs, rva);
+  };
+
+  auto canReuse = [&](uint64_t rva) {
+    return rva != 0 && rva % thunkSize == 0 && rva >= tailCursor &&
+           rva >= poolCursor && rva <= poolEndRVA &&
+           poolEndRVA - rva >= thunkSize && !isClaimed(rva);
+  };
+
+  if (canReuse(oldPoolThunkRVA))
+    return std::forward<OnSelectedPoolThunk>(onSelectedPoolThunk)(
+        oldPoolThunkRVA);
+
+  uint64_t bestFreedThunkRVA = 0;
+  bool foundFreedThunk = false;
+  for (uint64_t freedThunkRVA : freedThunkRVAs) {
+    if (!canReuse(freedThunkRVA))
+      continue;
+    if (!foundFreedThunk || freedThunkRVA > bestFreedThunkRVA) {
+      bestFreedThunkRVA = freedThunkRVA;
+      foundFreedThunk = true;
+    }
+  }
+  if (foundFreedThunk)
+    return std::forward<OnSelectedPoolThunk>(onSelectedPoolThunk)(
+        bestFreedThunkRVA);
+
+  uint64_t nextCursor = poolCursor;
+  while (nextCursor > tailCursor && nextCursor - tailCursor >= thunkSize) {
+    uint64_t candidate = (nextCursor - thunkSize) & ~(thunkSize - 1);
+    if (candidate < tailCursor)
+      break;
+    if (candidate <= poolEndRVA && poolEndRVA - candidate >= thunkSize &&
+        !isClaimed(candidate))
+      return std::forward<OnSelectedPoolThunk>(onSelectedPoolThunk)(candidate);
+    nextCursor = candidate;
+  }
+  return std::forward<OnNoPoolThunk>(onNoPoolThunk)();
+}
+
 void planIncrementalTextThunkAssignments(
     llvm::MutableArrayRef<IncrementalTextThunkPlanState> plans,
     uint64_t tailCursor, uint64_t &poolCursor, uint64_t &poolStart,

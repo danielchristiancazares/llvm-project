@@ -9,9 +9,12 @@
 #ifndef LLD_COFF_PDB_H
 #define LLD_COFF_PDB_H
 
+#include "lld/Common/Closed.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include <memory>
 #include <optional>
+#include <utility>
 
 namespace llvm::codeview {
 union DebugInfo;
@@ -41,6 +44,52 @@ struct PDBStats {
   uint64_t nbIPIrecords = 0;
   uint64_t strTabSize = 0;
   std::string largeInputTypeRecs;
+};
+
+struct PrintZeroedPDBSummary final {};
+
+struct PrintMeasuredPDBSummary final {
+  PDBStats stats;
+};
+
+class PDBSummary final {
+public:
+  PDBSummary() : storage(makeZeroedStorage()) {}
+  PDBSummary(const PDBSummary &) = delete;
+  PDBSummary &operator=(const PDBSummary &) = delete;
+  PDBSummary(PDBSummary &&) = delete;
+  PDBSummary &operator=(PDBSummary &&) = delete;
+
+  void enableMeasuredRows() { storage = makeMeasuredStorage(); }
+
+  template <class Fn> void withMeasuredStats(Fn &&fn) {
+    storage->match(
+        [](PrintZeroedPDBSummary &) {},
+        [&](PrintMeasuredPDBSummary &summary) {
+          std::forward<Fn>(fn)(summary.stats);
+        });
+  }
+
+  template <class... Fs> decltype(auto) match(Fs &&...fns) & {
+    return storage->match(std::forward<Fs>(fns)...);
+  }
+
+  template <class... Fs> decltype(auto) match(Fs &&...fns) const & {
+    return storage->match(std::forward<Fs>(fns)...);
+  }
+
+private:
+  using Storage = lld::Closed<PrintZeroedPDBSummary, PrintMeasuredPDBSummary>;
+
+  static std::unique_ptr<Storage> makeZeroedStorage() {
+    return std::make_unique<Storage>(Storage::make<PrintZeroedPDBSummary>());
+  }
+
+  static std::unique_ptr<Storage> makeMeasuredStorage() {
+    return std::make_unique<Storage>(Storage::make<PrintMeasuredPDBSummary>());
+  }
+
+  std::unique_ptr<Storage> storage;
 };
 
 } // namespace coff
