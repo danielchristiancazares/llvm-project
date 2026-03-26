@@ -87,7 +87,10 @@ static void checkAndSetWeakAlias(SymbolTable &symtab, InputFile *f,
         // Weak aliases as produced by GCC are named in the form
         // .weak.<weaksymbol>.<othersymbol>, where <othersymbol> is the name
         // of another symbol emitted near the weak symbol.
-        if (symtab.ctx.config.allowDuplicateWeak) {
+        // Use the definition from the first object file that defined this weak
+        // symbol, except that a nonzero definition supersedes absolute zero.
+        if (symtab.ctx.config.duplicateWeakPolicy ==
+            DuplicateWeakPolicy::KeepFirstDuplicateWeak) {
           auto isAbsZero = [](Symbol *sym) -> bool {
             return isa<DefinedAbsolute>(sym) &&
                    dyn_cast<DefinedAbsolute>(sym)->getVA() == 0;
@@ -516,7 +519,9 @@ SectionChunk *ObjFile::readSection(uint32_t sectionNumber,
     sxDataChunks.push_back(c);
   else if (isArm64EC(getMachineType()) && name == ".hybmp$x")
     hybmpChunks.push_back(c);
-  else if (symtab.ctx.config.tailMerge && sec->NumberOfRelocations == 0 &&
+  else if (symtab.ctx.config.tailMergeMode ==
+               TailMergeMode::TailMergeStringLiterals &&
+           sec->NumberOfRelocations == 0 &&
            name == ".rdata" && leaderName.starts_with("??_C@"))
     // COFF sections that look like string literal sections (i.e. no
     // relocations, in .rdata, leader symbol name matches the MSVC name mangling
@@ -1465,7 +1470,8 @@ BitcodeFile *BitcodeFile::create(COFFLinkerContext &ctx, MemoryBufferRef mb,
                                  StringRef archiveName,
                                  uint64_t offsetInArchive, bool lazy) {
   std::string path = mb.getBufferIdentifier().str();
-  if (ctx.config.thinLTOIndexOnly)
+  if (ctx.config.thinLTOIndexingMode ==
+      ThinLTOIndexingMode::WriteThinLTOIndexes)
     path = replaceThinLTOSuffix(mb.getBufferIdentifier(),
                                 ctx.config.thinLTOObjectSuffixReplace.first,
                                 ctx.config.thinLTOObjectSuffixReplace.second);

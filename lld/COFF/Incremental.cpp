@@ -1246,7 +1246,7 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
     return;
   }
 
-  if (ctx.config.tailMerge) {
+  if (ctx.config.tailMergeMode == TailMergeMode::TailMergeStringLiterals) {
     installIncrementalFullImageBuild(
         ctx, rebuildForTailMerging(),
         IncrementalBaselineEmission::make<SkipNextBaseline>());
