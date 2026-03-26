@@ -37,6 +37,23 @@ class SectionChunk;
 
 using IncrementalInputIndexMap = llvm::DenseMap<const ObjFile *, uint32_t>;
 
+enum class IncrementalSectionLayoutKind : uint8_t {
+  ExactSectionLayout = 1,
+  TextFreeSlots = 2,
+  ReadOnlyDataFreeSlots = 3,
+  WritableDataFreeSlots = 4,
+  PackedPDataPrefix = 5,
+  PackedXDataPrefix = 6,
+};
+
+enum class IncrementalChunkKind : uint8_t {
+  ObjSection = 1,
+  Synthetic = 2,
+  Padding = 3,
+  EntryRedirect = 4,
+  LongThunk = 5,
+};
+
 struct EmitNextBaseline final {};
 struct SkipNextBaseline final {};
 using IncrementalBaselineEmission =
@@ -56,7 +73,7 @@ struct IncrementalCurrentInputs {
 };
 
 struct IncrementalBaselineData {
-  IncrementalStateFile state;
+  IncrementalBaselineSnapshot snapshot;
   std::unique_ptr<llvm::MemoryBuffer> oldImage;
   IncrementalCurrentInputs currentInputs;
   llvm::DenseSet<const ObjFile *> changedInputs;
@@ -335,7 +352,7 @@ uint8_t getIncrementalFillByte(IncrementalSectionLayoutKind layoutKind);
 bool isIncrementalPersistedSlotChunk(IncrementalSectionLayoutKind layoutKind,
                                      const Chunk &chunk);
 IncrementalFreeSlotSelection
-findBestFitIncrementalFreeSlot(llvm::ArrayRef<IncrementalSlotRecordState> slots,
+findBestFitIncrementalFreeSlot(llvm::ArrayRef<IncrementalPreservedSlot> slots,
                                uint64_t size, uint32_t alignment);
 IncrementalTailReserveSelection
 allocateIncrementalTailReserve(uint64_t tailCursor, uint64_t maxSectionEndRVA,

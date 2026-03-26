@@ -1,0 +1,41 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.llpdbcache %t.exe %t.pdb %t.out && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main.s -o main.obj && \
+# RUN:   echo FIRST > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
+# RUN:   %python -c "import pathlib,struct; path=pathlib.Path(r'%t.llpdbcache'); data=bytearray(path.read_bytes()); struct.pack_into('<I', data, 8, 1); path.write_bytes(data)" && \
+# RUN:   echo SECOND >> %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
+# RUN:   echo THIRD >> %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: FIRST
+# CHECK: SECOND
+# CHECK: incremental: using state
+# CHECK: incremental: exact-layout reuse active
+# CHECK: unsupported version
+# CHECK: THIRD
+# CHECK: pdbcache: module hit main.obj
+
+#--- main.s
+	.cv_file	1 "file1.cpp" "EDA15C78BB573E49E685D8549286F33C" 1
+
+        .section        .text,"xr",one_only,main
+.globl main
+main:
+	.cv_func_id 0
+	.cv_loc	0 1 1 0 is_stmt 0
+	.cv_loc	0 1 2 0
+	retq
+.Lfunc_end0:
+
+	.section	.debug$S,"dr",associative,main
+	.long	4
+	.cv_linetable	0, main, .Lfunc_end0
+
+	.section	.debug$S,"dr"
+	.long	4
+	.cv_filechecksums
+	.cv_stringtable

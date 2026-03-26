@@ -31,6 +31,49 @@ namespace lld::coff {
 
 namespace {
 
+enum class WireIncrementalPDBTypeReplayKind : uint8_t {
+  Object = 1,
+  PrecompiledHeader = 2,
+  UsingPrecompiledHeader = 3,
+  TypeServerTpiOnly = 4,
+  TypeServerTpiAndIpi = 5,
+};
+
+enum class WireIncrementalPDBChunkReplayKind : uint8_t {
+  DebugS = 1,
+  DebugF = 2,
+};
+
+static Expected<WireIncrementalPDBTypeReplayKind>
+decodeWireTypeReplayKind(uint8_t kind) {
+  switch (kind) {
+  case uint8_t(WireIncrementalPDBTypeReplayKind::Object):
+    return WireIncrementalPDBTypeReplayKind::Object;
+  case uint8_t(WireIncrementalPDBTypeReplayKind::PrecompiledHeader):
+    return WireIncrementalPDBTypeReplayKind::PrecompiledHeader;
+  case uint8_t(WireIncrementalPDBTypeReplayKind::UsingPrecompiledHeader):
+    return WireIncrementalPDBTypeReplayKind::UsingPrecompiledHeader;
+  case uint8_t(WireIncrementalPDBTypeReplayKind::TypeServerTpiOnly):
+    return WireIncrementalPDBTypeReplayKind::TypeServerTpiOnly;
+  case uint8_t(WireIncrementalPDBTypeReplayKind::TypeServerTpiAndIpi):
+    return WireIncrementalPDBTypeReplayKind::TypeServerTpiAndIpi;
+  }
+  return createStringError(inconvertibleErrorCode(),
+                           "incremental PDB cache type replay kind is invalid");
+}
+
+static Expected<WireIncrementalPDBChunkReplayKind>
+decodeWireChunkReplayKind(uint8_t kind) {
+  switch (kind) {
+  case uint8_t(WireIncrementalPDBChunkReplayKind::DebugS):
+    return WireIncrementalPDBChunkReplayKind::DebugS;
+  case uint8_t(WireIncrementalPDBChunkReplayKind::DebugF):
+    return WireIncrementalPDBChunkReplayKind::DebugF;
+  }
+  return createStringError(inconvertibleErrorCode(),
+                           "incremental PDB cache chunk replay kind is invalid");
+}
+
 struct StringTableBuilder {
   uint64_t add(StringRef value) {
     auto [it, inserted] = offsets.try_emplace(value.str(), data.size());
@@ -121,17 +164,257 @@ static std::string getCompositeKey(StringRef path, StringRef parentPath,
   return std::string(buffer);
 }
 
-static std::string getTypeCompositeKey(const IncrementalPDBTypeCacheEntry &entry) {
+static IncrementalPDBTypeReplayBoundary
+cloneTypeReplayBoundary(const IncrementalPDBTypeReplayBoundary &boundary) {
+  return boundary.match(
+      [&](const ReplayAllTypeRecords &) {
+        return IncrementalPDBTypeReplayBoundary::make<ReplayAllTypeRecords>();
+      },
+      [&](const ReplayTypeRecordsSkippingEndPrecomp &skip) {
+        return IncrementalPDBTypeReplayBoundary::make<
+            ReplayTypeRecordsSkippingEndPrecomp>(skip);
+      });
+}
+
+static uint32_t
+encodeWireEndPrecompIdx(const IncrementalPDBTypeReplayBoundary &boundary) {
+  return boundary.match(
+      [&](const ReplayAllTypeRecords &) { return ~0U; },
+      [&](const ReplayTypeRecordsSkippingEndPrecomp &skip) {
+        return skip.ghashIndex;
+      });
+}
+
+static IncrementalPDBTypeReplayBoundary
+decodeWireEndPrecompIdx(uint32_t endPrecompIdx) {
+  if (endPrecompIdx == ~0U)
+    return IncrementalPDBTypeReplayBoundary::make<ReplayAllTypeRecords>();
+  return IncrementalPDBTypeReplayBoundary::make<
+      ReplayTypeRecordsSkippingEndPrecomp>(
+      ReplayTypeRecordsSkippingEndPrecomp{endPrecompIdx});
+}
+
+static std::string
+getTypeCompositeKey(const IncrementalPDBTypeReplaySnapshot &entry) {
   SmallString<256> buffer;
   raw_svector_ostream os(buffer);
-  os << entry.path << '\n' << entry.parentPath << '\n' << entry.archiveOffset
-     << '\n' << unsigned(entry.kind);
+  entry.match(
+      [&](const ReplayObjectTypes &object) {
+        os << object.path << '\n' << object.parentPath << '\n'
+           << object.archiveOffset << '\n'
+           << unsigned(WireIncrementalPDBTypeReplayKind::Object);
+      },
+      [&](const ReplayPrecompiledHeaderTypes &pch) {
+        os << pch.path << '\n' << pch.parentPath << '\n' << pch.archiveOffset
+           << '\n'
+           << unsigned(WireIncrementalPDBTypeReplayKind::PrecompiledHeader);
+      },
+      [&](const ReplayUsingPrecompiledHeaderTypes &usingPCH) {
+        os << usingPCH.path << '\n' << usingPCH.parentPath << '\n'
+           << usingPCH.archiveOffset << '\n'
+           << unsigned(
+                  WireIncrementalPDBTypeReplayKind::UsingPrecompiledHeader);
+      },
+      [&](const ReplayTypeServerTpiOnly &typeServer) {
+        os << typeServer.path << '\n' << typeServer.parentPath << '\n'
+           << typeServer.archiveOffset << '\n'
+           << unsigned(WireIncrementalPDBTypeReplayKind::TypeServerTpiOnly);
+      },
+      [&](const ReplayTypeServerTpiAndIpi &typeServer) {
+        os << typeServer.path << '\n' << typeServer.parentPath << '\n'
+           << typeServer.archiveOffset << '\n'
+           << unsigned(WireIncrementalPDBTypeReplayKind::TypeServerTpiAndIpi);
+      });
   return std::string(buffer);
 }
 
 static std::string
-getModuleCompositeKey(const IncrementalPDBModuleCacheEntry &entry) {
+getModuleCompositeKey(const CachedModuleReplay &entry) {
   return getCompositeKey(entry.path, entry.parentPath, entry.archiveOffset);
+}
+
+static SymbolReplayRouting cloneSymbolReplayRouting(
+    const SymbolReplayRouting &routing) {
+  return routing.match(
+      [&](const EmitGlobalOnlySymbol &) {
+        return SymbolReplayRouting::make<EmitGlobalOnlySymbol>();
+      },
+      [&](const EmitModuleOnlySymbol &) {
+        return SymbolReplayRouting::make<EmitModuleOnlySymbol>();
+      },
+      [&](const EmitGlobalAndModuleSymbol &) {
+        return SymbolReplayRouting::make<EmitGlobalAndModuleSymbol>();
+      });
+}
+
+static GlobalSymbolReplay cloneGlobalSymbolReplay(
+    const GlobalSymbolReplay &globalReplay) {
+  return globalReplay.match(
+      [&](const OmitGlobalReplay &) {
+        return GlobalSymbolReplay::make<OmitGlobalReplay>();
+      },
+      [&](const ReplayGlobalSymbolBytes &) {
+        return GlobalSymbolReplay::make<ReplayGlobalSymbolBytes>();
+      },
+      [&](const ReplayGlobalProcedureReference &) {
+        return GlobalSymbolReplay::make<ReplayGlobalProcedureReference>();
+      });
+}
+
+static SymbolRewritePlan cloneSymbolRewritePlan(
+    const SymbolRewritePlan &rewrite) {
+  return rewrite.match(
+      [&](const ReplaySymbolWithoutTypeRewrite &) {
+        return SymbolRewritePlan::make<ReplaySymbolWithoutTypeRewrite>();
+      },
+      [&](const ReplayProcIdEndSymbol &) {
+        return SymbolRewritePlan::make<ReplayProcIdEndSymbol>();
+      },
+      [&](const ReplayProcIdWithFixedTypeIndex &) {
+        return SymbolRewritePlan::make<ReplayProcIdWithFixedTypeIndex>();
+      },
+      [&](const ReplaySymbolWithDiscoveredTypeRefs &generic) {
+        return SymbolRewritePlan::make<ReplaySymbolWithDiscoveredTypeRefs>(
+            ReplaySymbolWithDiscoveredTypeRefs{generic.typeRefs});
+      });
+}
+
+static SymbolScopeReplay cloneSymbolScopeReplay(
+    const SymbolScopeReplay &scope) {
+  return scope.match(
+      [&](const ReplayStandaloneSymbol &) {
+        return SymbolScopeReplay::make<ReplayStandaloneSymbol>();
+      },
+      [&](const ReplayScopeOpeningSymbol &) {
+        return SymbolScopeReplay::make<ReplayScopeOpeningSymbol>();
+      },
+      [&](const ReplayScopeClosingSymbol &) {
+        return SymbolScopeReplay::make<ReplayScopeClosingSymbol>();
+      });
+}
+
+static CachedSymbolReplay cloneCachedSymbolReplay(const CachedSymbolReplay &symbol) {
+  return CachedSymbolReplay{symbol.location, symbol.alignedLength,
+                            cloneSymbolReplayRouting(symbol.routing),
+                            cloneGlobalSymbolReplay(symbol.globalReplay),
+                            cloneSymbolRewritePlan(symbol.rewrite),
+                            cloneSymbolScopeReplay(symbol.scope)};
+}
+
+static IncrementalPDBSubsectionReplay
+cloneSubsectionReplay(const IncrementalPDBSubsectionReplay &subsection) {
+  return subsection.match(
+      [&](const ReplayOpaqueSubsection &opaque) {
+        return IncrementalPDBSubsectionReplay::make<ReplayOpaqueSubsection>(
+            opaque);
+      },
+      [&](const ReplaySymbolSubsection &symbols) {
+        ReplaySymbolSubsection cloned;
+        cloned.location = symbols.location;
+        cloned.symbols.reserve(symbols.symbols.size());
+        for (const CachedSymbolReplay &symbol : symbols.symbols)
+          cloned.symbols.push_back(cloneCachedSymbolReplay(symbol));
+        return IncrementalPDBSubsectionReplay::make<ReplaySymbolSubsection>(
+            std::move(cloned));
+      });
+}
+
+static IncrementalPDBChunkReplay
+cloneChunkReplay(const IncrementalPDBChunkReplay &chunk) {
+  return chunk.match(
+      [&](const ReplayDebugSChunk &debugS) {
+        ReplayDebugSChunk cloned;
+        cloned.chunkOrdinal = debugS.chunkOrdinal;
+        cloned.subsections.reserve(debugS.subsections.size());
+        for (const IncrementalPDBSubsectionReplay &subsection :
+             debugS.subsections)
+          cloned.subsections.push_back(cloneSubsectionReplay(subsection));
+        return IncrementalPDBChunkReplay::make<ReplayDebugSChunk>(
+            std::move(cloned));
+      },
+      [&](const ReplayDebugFChunk &debugF) {
+        return IncrementalPDBChunkReplay::make<ReplayDebugFChunk>(debugF);
+      });
+}
+
+static CachedModuleReplay
+cloneCachedModuleReplayImpl(const CachedModuleReplay &entry) {
+  CachedModuleReplay cloned;
+  cloned.path = entry.path;
+  cloned.parentPath = entry.parentPath;
+  cloned.archiveOffset = entry.archiveOffset;
+  cloned.debugSHash = entry.debugSHash;
+  cloned.debugFHash = entry.debugFHash;
+  cloned.relocHash = entry.relocHash;
+  cloned.moduleStreamSize = entry.moduleStreamSize;
+  cloned.stringFixups = entry.stringFixups;
+  cloned.chunks.reserve(entry.chunks.size());
+  for (const IncrementalPDBChunkReplay &chunk : entry.chunks)
+    cloned.chunks.push_back(cloneChunkReplay(chunk));
+  return cloned;
+}
+
+static IncrementalPDBTypeReplaySnapshot
+cloneTypeReplay(const IncrementalPDBTypeReplaySnapshot &entry) {
+  return entry.match(
+      [&](const ReplayObjectTypes &object) {
+        ReplayObjectTypes cloned{object.path,
+                                 object.parentPath,
+                                 object.archiveOffset,
+                                 object.contentHash,
+                                 cloneTypeReplayBoundary(object.boundary),
+                                 object.ghashes,
+                                 object.isItemIndexBits};
+        return IncrementalPDBTypeReplaySnapshot::make<ReplayObjectTypes>(
+            std::move(cloned));
+      },
+      [&](const ReplayPrecompiledHeaderTypes &pch) {
+        ReplayPrecompiledHeaderTypes cloned{
+            pch.path,      pch.parentPath,       pch.archiveOffset,
+            pch.contentHash, pch.pchSignature, cloneTypeReplayBoundary(pch.boundary),
+            pch.ghashes,   pch.isItemIndexBits};
+        return IncrementalPDBTypeReplaySnapshot::make<
+            ReplayPrecompiledHeaderTypes>(std::move(cloned));
+      },
+      [&](const ReplayUsingPrecompiledHeaderTypes &usingPCH) {
+        ReplayUsingPrecompiledHeaderTypes cloned{
+            usingPCH.path,
+            usingPCH.parentPath,
+            usingPCH.archiveOffset,
+            usingPCH.contentHash,
+            usingPCH.dependencyHash,
+            cloneTypeReplayBoundary(usingPCH.boundary),
+            usingPCH.ghashes,
+            usingPCH.isItemIndexBits};
+        return IncrementalPDBTypeReplaySnapshot::make<
+            ReplayUsingPrecompiledHeaderTypes>(std::move(cloned));
+      },
+      [&](const ReplayTypeServerTpiOnly &typeServer) {
+        ReplayTypeServerTpiOnly cloned{
+            typeServer.path,
+            typeServer.parentPath,
+            typeServer.archiveOffset,
+            typeServer.contentHash,
+            cloneTypeReplayBoundary(typeServer.boundary),
+            typeServer.ghashes,
+            typeServer.isItemIndexBits};
+        return IncrementalPDBTypeReplaySnapshot::make<
+            ReplayTypeServerTpiOnly>(std::move(cloned));
+      },
+      [&](const ReplayTypeServerTpiAndIpi &typeServer) {
+        ReplayTypeServerTpiAndIpi cloned{
+            typeServer.path,
+            typeServer.parentPath,
+            typeServer.archiveOffset,
+            typeServer.contentHash,
+            cloneTypeReplayBoundary(typeServer.boundary),
+            typeServer.ghashes,
+            typeServer.isItemIndexBits,
+            typeServer.auxGHashes,
+            typeServer.auxIsItemIndexBits};
+        return IncrementalPDBTypeReplaySnapshot::make<
+            ReplayTypeServerTpiAndIpi>(std::move(cloned));
+      });
 }
 
 static void hashChunkContents(raw_ostream &os, ArrayRef<SectionChunk *> chunks,
@@ -155,6 +438,10 @@ static bool hasBitcodeInputs(const COFFLinkerContext &ctx) {
 }
 
 } // namespace
+
+CachedModuleReplay cloneCachedModuleReplay(const CachedModuleReplay &entry) {
+  return cloneCachedModuleReplayImpl(entry);
+}
 
 SmallString<128> getIncrementalPDBCachePath(const Configuration &config) {
   SmallString<128> path(config.outputFile);
@@ -263,7 +550,7 @@ uint64_t computeIncrementalPDBModuleRelocHash(const ObjFile &file) {
   return xxh3_64bits(buffer);
 }
 
-Expected<IncrementalPDBCacheFile> loadIncrementalPDBCache(StringRef path) {
+Expected<IncrementalPDBCacheSnapshot> loadIncrementalPDBCache(StringRef path) {
   ErrorOr<std::unique_ptr<MemoryBuffer>> buffer = MemoryBuffer::getFile(
       path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
   if (!buffer)
@@ -328,13 +615,12 @@ Expected<IncrementalPDBCacheFile> loadIncrementalPDBCache(StringRef path) {
   if (!stringFixupRecordsOrErr)
     return stringFixupRecordsOrErr.takeError();
 
-  IncrementalPDBCacheFile cache;
+  IncrementalPDBCacheSnapshot cache;
   cache.linkerBuildId = header.linkerBuildId;
   cache.hardConfigHash = header.hardConfigHash;
 
-  cache.typeEntries.reserve(typeRecordsOrErr->size());
+  cache.typeReplays.reserve(typeRecordsOrErr->size());
   for (const IncrementalPDBTypeEntryRecord &record : *typeRecordsOrErr) {
-    IncrementalPDBTypeCacheEntry entry;
     auto pathOrErr = loadString(strings, record.pathOffset);
     if (!pathOrErr)
       return pathOrErr.takeError();
@@ -363,25 +649,77 @@ Expected<IncrementalPDBCacheFile> loadIncrementalPDBCache(StringRef path) {
       return createStringError(inconvertibleErrorCode(),
                                "incremental PDB cache ghash blob is misaligned");
 
-    entry.path = pathOrErr->str();
-    entry.parentPath = parentOrErr->str();
-    entry.archiveOffset = record.archiveOffset;
-    entry.kind = static_cast<IncrementalPDBTypeSourceKind>(uint8_t(record.kind));
-    entry.contentHash = record.contentHash;
-    entry.dependencyHash = record.dependencyHash;
-    entry.endPrecompIdx = record.endPrecompIdx;
-    entry.ghashes.resize(ghashBlobOrErr->size() / sizeof(GloballyHashedType));
-    entry.isItemIndexBits.assign(isItemBlobOrErr->begin(), isItemBlobOrErr->end());
-    entry.auxGHashes.resize(auxGHashBlobOrErr->size() / sizeof(GloballyHashedType));
-    entry.auxIsItemIndexBits.assign(auxIsItemBlobOrErr->begin(),
-                                    auxIsItemBlobOrErr->end());
-    memcpy(entry.ghashes.data(), ghashBlobOrErr->data(), ghashBlobOrErr->size());
-    memcpy(entry.auxGHashes.data(), auxGHashBlobOrErr->data(),
+    std::vector<GloballyHashedType> ghashes(
+        ghashBlobOrErr->size() / sizeof(GloballyHashedType));
+    std::vector<uint8_t> isItemIndexBits(isItemBlobOrErr->begin(),
+                                         isItemBlobOrErr->end());
+    std::vector<GloballyHashedType> auxGHashes(
+        auxGHashBlobOrErr->size() / sizeof(GloballyHashedType));
+    std::vector<uint8_t> auxIsItemIndexBits(auxIsItemBlobOrErr->begin(),
+                                            auxIsItemBlobOrErr->end());
+    memcpy(ghashes.data(), ghashBlobOrErr->data(), ghashBlobOrErr->size());
+    memcpy(auxGHashes.data(), auxGHashBlobOrErr->data(),
            auxGHashBlobOrErr->size());
-    cache.typeEntries.push_back(std::move(entry));
+
+    IncrementalPDBTypeReplayBoundary boundary =
+        decodeWireEndPrecompIdx(record.endPrecompIdx);
+    auto kindOrErr = decodeWireTypeReplayKind(uint8_t(record.kind));
+    if (!kindOrErr)
+      return kindOrErr.takeError();
+    switch (*kindOrErr) {
+    case WireIncrementalPDBTypeReplayKind::Object:
+      cache.typeReplays.push_back(
+          IncrementalPDBTypeReplaySnapshot::make<ReplayObjectTypes>(
+              ReplayObjectTypes{pathOrErr->str(), parentOrErr->str(),
+                                record.archiveOffset, record.contentHash,
+                                std::move(boundary), std::move(ghashes),
+                                std::move(isItemIndexBits)}));
+      break;
+    case WireIncrementalPDBTypeReplayKind::PrecompiledHeader:
+      if (record.dependencyHash > UINT32_MAX)
+        return createStringError(inconvertibleErrorCode(),
+                                 "incremental PDB cache PCH signature is invalid");
+      cache.typeReplays.push_back(
+          IncrementalPDBTypeReplaySnapshot::make<ReplayPrecompiledHeaderTypes>(
+              ReplayPrecompiledHeaderTypes{
+                  pathOrErr->str(), parentOrErr->str(), record.archiveOffset,
+                  record.contentHash, static_cast<uint32_t>(record.dependencyHash),
+                  std::move(boundary), std::move(ghashes),
+                  std::move(isItemIndexBits)}));
+      break;
+    case WireIncrementalPDBTypeReplayKind::UsingPrecompiledHeader:
+      cache.typeReplays.push_back(
+          IncrementalPDBTypeReplaySnapshot::make<
+              ReplayUsingPrecompiledHeaderTypes>(
+              ReplayUsingPrecompiledHeaderTypes{
+                  pathOrErr->str(), parentOrErr->str(), record.archiveOffset,
+                  record.contentHash, record.dependencyHash, std::move(boundary),
+                  std::move(ghashes), std::move(isItemIndexBits)}));
+      break;
+    case WireIncrementalPDBTypeReplayKind::TypeServerTpiOnly:
+      if (!auxGHashes.empty() || !auxIsItemIndexBits.empty())
+        return createStringError(inconvertibleErrorCode(),
+                                 "incremental PDB cache type replay has unexpected IPI data");
+      cache.typeReplays.push_back(
+          IncrementalPDBTypeReplaySnapshot::make<ReplayTypeServerTpiOnly>(
+              ReplayTypeServerTpiOnly{
+                  pathOrErr->str(), parentOrErr->str(), record.archiveOffset,
+                  record.contentHash, std::move(boundary), std::move(ghashes),
+                  std::move(isItemIndexBits)}));
+      break;
+    case WireIncrementalPDBTypeReplayKind::TypeServerTpiAndIpi:
+      cache.typeReplays.push_back(
+          IncrementalPDBTypeReplaySnapshot::make<ReplayTypeServerTpiAndIpi>(
+              ReplayTypeServerTpiAndIpi{
+                  pathOrErr->str(), parentOrErr->str(), record.archiveOffset,
+                  record.contentHash, std::move(boundary), std::move(ghashes),
+                  std::move(isItemIndexBits), std::move(auxGHashes),
+                  std::move(auxIsItemIndexBits)}));
+      break;
+    }
   }
 
-  cache.moduleEntries.reserve(moduleRecordsOrErr->size());
+  cache.moduleReplays.reserve(moduleRecordsOrErr->size());
   for (const IncrementalPDBModuleEntryRecord &record : *moduleRecordsOrErr) {
     if (record.chunkPlanStart > chunkRecordsOrErr->size() ||
         chunkRecordsOrErr->size() - record.chunkPlanStart < record.chunkPlanCount ||
@@ -399,7 +737,7 @@ Expected<IncrementalPDBCacheFile> loadIncrementalPDBCache(StringRef path) {
       return createStringError(inconvertibleErrorCode(),
                                "incremental PDB cache plan range is invalid");
 
-    IncrementalPDBModuleCacheEntry entry;
+    CachedModuleReplay entry;
     auto pathOrErr = loadString(strings, record.pathOffset);
     if (!pathOrErr)
       return pathOrErr.takeError();
@@ -416,52 +754,184 @@ Expected<IncrementalPDBCacheFile> loadIncrementalPDBCache(StringRef path) {
 
     for (const IncrementalPDBChunkPlanRecord &chunkRecord :
          chunkRecordsOrErr->slice(record.chunkPlanStart, record.chunkPlanCount)) {
-      IncrementalPDBChunkPlan plan;
-      plan.chunkOrdinal = chunkRecord.chunkOrdinal;
-      plan.kind =
-          static_cast<IncrementalPDBDebugChunkKind>(uint8_t(chunkRecord.kind));
-      plan.subsectionStart = chunkRecord.subsectionStart;
-      plan.subsectionCount = chunkRecord.subsectionCount;
-      entry.chunkPlans.push_back(plan);
-    }
+      auto chunkKindOrErr = decodeWireChunkReplayKind(uint8_t(chunkRecord.kind));
+      if (!chunkKindOrErr)
+        return chunkKindOrErr.takeError();
+      switch (*chunkKindOrErr) {
+      case WireIncrementalPDBChunkReplayKind::DebugS: {
+        if (chunkRecord.subsectionStart > subsectionRecordsOrErr->size() ||
+            subsectionRecordsOrErr->size() - chunkRecord.subsectionStart <
+                chunkRecord.subsectionCount)
+          return createStringError(
+              inconvertibleErrorCode(),
+              "incremental PDB cache debug chunk subsection range is invalid");
 
-    for (const IncrementalPDBSubsectionPlanRecord &subsectionRecord :
-         subsectionRecordsOrErr->slice(record.subsectionPlanStart,
-                                       record.subsectionPlanCount)) {
-      IncrementalPDBSubsectionPlan plan;
-      plan.kind = static_cast<DebugSubsectionKind>(uint16_t(subsectionRecord.kind));
-      plan.recordOffset = subsectionRecord.recordOffset;
-      plan.recordLength = subsectionRecord.recordLength;
-      plan.relocIndex = subsectionRecord.relocIndex;
-      plan.symbolPlanStart = subsectionRecord.symbolPlanStart;
-      plan.symbolPlanCount = subsectionRecord.symbolPlanCount;
-      entry.subsectionPlans.push_back(plan);
-    }
+        ReplayDebugSChunk chunk;
+        chunk.chunkOrdinal = chunkRecord.chunkOrdinal;
+        for (const IncrementalPDBSubsectionPlanRecord &subsectionRecord :
+             subsectionRecordsOrErr->slice(chunkRecord.subsectionStart,
+                                           chunkRecord.subsectionCount)) {
+          IncrementalPDBRecordLocation location{subsectionRecord.recordOffset,
+                                                subsectionRecord.recordLength,
+                                                subsectionRecord.relocIndex};
+          if (subsectionRecord.kind != uint16_t(DebugSubsectionKind::Symbols)) {
+            if (subsectionRecord.symbolPlanCount != 0)
+              return createStringError(
+                  inconvertibleErrorCode(),
+                  "incremental PDB cache opaque subsection unexpectedly carries symbol plans");
+            chunk.subsections.push_back(
+                IncrementalPDBSubsectionReplay::make<ReplayOpaqueSubsection>(
+                    ReplayOpaqueSubsection{
+                        static_cast<DebugSubsectionKind>(
+                            uint16_t(subsectionRecord.kind)),
+                        location}));
+            continue;
+          }
 
-    for (const IncrementalPDBSymbolPlanRecord &symbolRecord :
-         symbolRecordsOrErr->slice(record.symbolPlanStart, record.symbolPlanCount)) {
-      IncrementalPDBSymbolPlan plan;
-      plan.recordOffset = symbolRecord.recordOffset;
-      plan.recordLength = symbolRecord.recordLength;
-      plan.alignedLength = symbolRecord.alignedLength;
-      plan.relocIndex = symbolRecord.relocIndex;
-      plan.typeRefStart = symbolRecord.typeRefStart;
-      plan.typeRefCount = symbolRecord.typeRefCount;
-      plan.destMask = symbolRecord.destMask;
-      plan.flags = symbolRecord.flags;
-      plan.rewriteKind = symbolRecord.rewriteKind;
-      plan.scopeAction =
-          static_cast<IncrementalPDBScopeAction>(uint8_t(symbolRecord.scopeAction));
-      entry.symbolPlans.push_back(plan);
-    }
+          if (subsectionRecord.symbolPlanStart > symbolRecordsOrErr->size() ||
+              symbolRecordsOrErr->size() - subsectionRecord.symbolPlanStart <
+                  subsectionRecord.symbolPlanCount)
+            return createStringError(
+                inconvertibleErrorCode(),
+                "incremental PDB cache symbol replay range is invalid");
 
-    for (const IncrementalPDBTypeRefRecord &typeRefRecord :
-         typeRefRecordsOrErr->slice(record.typeRefStart, record.typeRefCount)) {
-      IncrementalPDBTypeRef ref;
-      ref.kind = static_cast<TiRefKind>(uint8_t(typeRefRecord.kind));
-      ref.offset = typeRefRecord.offset;
-      ref.count = typeRefRecord.count;
-      entry.typeRefs.push_back(ref);
+          ReplaySymbolSubsection subsection;
+          subsection.location = location;
+          subsection.symbols.reserve(subsectionRecord.symbolPlanCount);
+          for (const IncrementalPDBSymbolPlanRecord &symbolRecord :
+               symbolRecordsOrErr->slice(subsectionRecord.symbolPlanStart,
+                                         subsectionRecord.symbolPlanCount)) {
+            if (symbolRecord.typeRefStart > typeRefRecordsOrErr->size() ||
+                typeRefRecordsOrErr->size() - symbolRecord.typeRefStart <
+                    symbolRecord.typeRefCount)
+              return createStringError(
+                  inconvertibleErrorCode(),
+                  "incremental PDB cache symbol type-ref range is invalid");
+
+            auto routingOrErr = [&]() -> Expected<SymbolReplayRouting> {
+              switch (symbolRecord.destMask) {
+              case 1:
+                return SymbolReplayRouting::make<EmitGlobalOnlySymbol>();
+              case 2:
+                return SymbolReplayRouting::make<EmitModuleOnlySymbol>();
+              case 3:
+                return SymbolReplayRouting::make<EmitGlobalAndModuleSymbol>();
+              default:
+                return createStringError(
+                    inconvertibleErrorCode(),
+                    "incremental PDB cache symbol routing is invalid");
+              }
+            }();
+            if (!routingOrErr)
+              return routingOrErr.takeError();
+
+            auto globalReplayOrErr = [&]() -> Expected<GlobalSymbolReplay> {
+              if (symbolRecord.flags & ~uint8_t(1))
+                return createStringError(
+                    inconvertibleErrorCode(),
+                    "incremental PDB cache symbol flags are invalid");
+              if (!(symbolRecord.destMask & 1)) {
+                if (symbolRecord.flags != 0)
+                  return createStringError(
+                      inconvertibleErrorCode(),
+                      "incremental PDB cache symbol proc-ref flag without global routing");
+                return GlobalSymbolReplay::make<OmitGlobalReplay>();
+              }
+              if (symbolRecord.flags == 0)
+                return GlobalSymbolReplay::make<ReplayGlobalSymbolBytes>();
+              return GlobalSymbolReplay::make<ReplayGlobalProcedureReference>();
+            }();
+            if (!globalReplayOrErr)
+              return globalReplayOrErr.takeError();
+
+            auto rewriteOrErr = [&]() -> Expected<SymbolRewritePlan> {
+              switch (symbolRecord.rewriteKind) {
+              case 0:
+                if (symbolRecord.typeRefCount != 0)
+                  return createStringError(
+                      inconvertibleErrorCode(),
+                      "incremental PDB cache type refs without rewrite plan");
+                return SymbolRewritePlan::make<
+                    ReplaySymbolWithoutTypeRewrite>();
+              case 1:
+                if (symbolRecord.typeRefCount != 0)
+                  return createStringError(
+                      inconvertibleErrorCode(),
+                      "incremental PDB cache proc-id-end replay carries type refs");
+                return SymbolRewritePlan::make<ReplayProcIdEndSymbol>();
+              case 2:
+                if (symbolRecord.typeRefCount != 0)
+                  return createStringError(
+                      inconvertibleErrorCode(),
+                      "incremental PDB cache fixed-index replay carries type refs");
+                return SymbolRewritePlan::make<
+                    ReplayProcIdWithFixedTypeIndex>();
+              case 3: {
+                std::vector<IncrementalPDBTypeRef> refs;
+                refs.reserve(symbolRecord.typeRefCount);
+                for (const IncrementalPDBTypeRefRecord &typeRefRecord :
+                     typeRefRecordsOrErr->slice(symbolRecord.typeRefStart,
+                                               symbolRecord.typeRefCount))
+                  refs.push_back({static_cast<TiRefKind>(uint8_t(typeRefRecord.kind)),
+                                  typeRefRecord.offset, typeRefRecord.count});
+                return SymbolRewritePlan::make<
+                    ReplaySymbolWithDiscoveredTypeRefs>(
+                    ReplaySymbolWithDiscoveredTypeRefs{std::move(refs)});
+              }
+              default:
+                return createStringError(
+                    inconvertibleErrorCode(),
+                    "incremental PDB cache symbol rewrite kind is invalid");
+              }
+            }();
+            if (!rewriteOrErr)
+              return rewriteOrErr.takeError();
+
+            auto scopeOrErr = [&]() -> Expected<SymbolScopeReplay> {
+              switch (symbolRecord.scopeAction) {
+              case 0:
+                return SymbolScopeReplay::make<ReplayStandaloneSymbol>();
+              case 1:
+                return SymbolScopeReplay::make<ReplayScopeOpeningSymbol>();
+              case 2:
+                return SymbolScopeReplay::make<ReplayScopeClosingSymbol>();
+              default:
+                return createStringError(
+                    inconvertibleErrorCode(),
+                    "incremental PDB cache symbol scope action is invalid");
+              }
+            }();
+            if (!scopeOrErr)
+              return scopeOrErr.takeError();
+
+            subsection.symbols.push_back(CachedSymbolReplay{
+                {symbolRecord.recordOffset, symbolRecord.recordLength,
+                 symbolRecord.relocIndex},
+                symbolRecord.alignedLength, std::move(*routingOrErr),
+                std::move(*globalReplayOrErr), std::move(*rewriteOrErr),
+                std::move(*scopeOrErr)});
+          }
+
+          chunk.subsections.push_back(
+              IncrementalPDBSubsectionReplay::make<ReplaySymbolSubsection>(
+                  std::move(subsection)));
+        }
+
+        entry.chunks.push_back(
+            IncrementalPDBChunkReplay::make<ReplayDebugSChunk>(
+                std::move(chunk)));
+        break;
+      }
+      case WireIncrementalPDBChunkReplayKind::DebugF:
+        if (chunkRecord.subsectionCount != 0)
+          return createStringError(
+              inconvertibleErrorCode(),
+              "incremental PDB cache debug$F replay unexpectedly carries subsections");
+        entry.chunks.push_back(
+            IncrementalPDBChunkReplay::make<ReplayDebugFChunk>(
+                ReplayDebugFChunk{chunkRecord.chunkOrdinal}));
+        break;
+      }
     }
 
     for (const IncrementalPDBStringFixupRecord &fixupRecord :
@@ -473,14 +943,14 @@ Expected<IncrementalPDBCacheFile> loadIncrementalPDBCache(StringRef path) {
       entry.stringFixups.push_back(fixup);
     }
 
-    cache.moduleEntries.push_back(std::move(entry));
+    cache.moduleReplays.push_back(std::move(entry));
   }
 
   return cache;
 }
 
 Error writeIncrementalPDBCache(StringRef path,
-                               const IncrementalPDBCacheFile &cache) {
+                               const IncrementalPDBCacheSnapshot &cache) {
   IncrementalPDBCacheHeader header = {};
   memcpy(header.magic, incrementalPDBCacheMagic, sizeof(incrementalPDBCacheMagic));
   header.version = incrementalPDBCacheVersion;
@@ -500,26 +970,80 @@ Error writeIncrementalPDBCache(StringRef path,
   std::vector<IncrementalPDBStringFixupRecord> stringFixupRecords;
   std::vector<char> blobArena;
 
-  typeRecords.reserve(cache.typeEntries.size());
-  for (const IncrementalPDBTypeCacheEntry &entry : cache.typeEntries) {
+  typeRecords.reserve(cache.typeReplays.size());
+  for (const IncrementalPDBTypeReplaySnapshot &entry : cache.typeReplays) {
     IncrementalPDBTypeEntryRecord record = {};
-    record.pathOffset = strings.add(entry.path);
-    record.parentPathOffset = strings.add(entry.parentPath);
-    record.archiveOffset = entry.archiveOffset;
-    record.kind = uint8_t(entry.kind);
-    record.contentHash = entry.contentHash;
-    record.dependencyHash = entry.dependencyHash;
-    record.endPrecompIdx = entry.endPrecompIdx;
-    record.ghashes = appendBlob(blobArena, ArrayRef(entry.ghashes));
-    record.isItemIndexBits = appendBlob(blobArena, ArrayRef(entry.isItemIndexBits));
-    record.auxGHashes = appendBlob(blobArena, ArrayRef(entry.auxGHashes));
-    record.auxIsItemIndexBits =
-        appendBlob(blobArena, ArrayRef(entry.auxIsItemIndexBits));
+    entry.match(
+        [&](const ReplayObjectTypes &object) {
+          record.pathOffset = strings.add(object.path);
+          record.parentPathOffset = strings.add(object.parentPath);
+          record.archiveOffset = object.archiveOffset;
+          record.kind = uint8_t(WireIncrementalPDBTypeReplayKind::Object);
+          record.contentHash = object.contentHash;
+          record.endPrecompIdx = encodeWireEndPrecompIdx(object.boundary);
+          record.ghashes = appendBlob(blobArena, ArrayRef(object.ghashes));
+          record.isItemIndexBits =
+              appendBlob(blobArena, ArrayRef(object.isItemIndexBits));
+        },
+        [&](const ReplayPrecompiledHeaderTypes &pch) {
+          record.pathOffset = strings.add(pch.path);
+          record.parentPathOffset = strings.add(pch.parentPath);
+          record.archiveOffset = pch.archiveOffset;
+          record.kind =
+              uint8_t(WireIncrementalPDBTypeReplayKind::PrecompiledHeader);
+          record.contentHash = pch.contentHash;
+          record.dependencyHash = pch.pchSignature;
+          record.endPrecompIdx = encodeWireEndPrecompIdx(pch.boundary);
+          record.ghashes = appendBlob(blobArena, ArrayRef(pch.ghashes));
+          record.isItemIndexBits =
+              appendBlob(blobArena, ArrayRef(pch.isItemIndexBits));
+        },
+        [&](const ReplayUsingPrecompiledHeaderTypes &usingPCH) {
+          record.pathOffset = strings.add(usingPCH.path);
+          record.parentPathOffset = strings.add(usingPCH.parentPath);
+          record.archiveOffset = usingPCH.archiveOffset;
+          record.kind = uint8_t(
+              WireIncrementalPDBTypeReplayKind::UsingPrecompiledHeader);
+          record.contentHash = usingPCH.contentHash;
+          record.dependencyHash = usingPCH.dependencyHash;
+          record.endPrecompIdx = encodeWireEndPrecompIdx(usingPCH.boundary);
+          record.ghashes = appendBlob(blobArena, ArrayRef(usingPCH.ghashes));
+          record.isItemIndexBits =
+              appendBlob(blobArena, ArrayRef(usingPCH.isItemIndexBits));
+        },
+        [&](const ReplayTypeServerTpiOnly &typeServer) {
+          record.pathOffset = strings.add(typeServer.path);
+          record.parentPathOffset = strings.add(typeServer.parentPath);
+          record.archiveOffset = typeServer.archiveOffset;
+          record.kind =
+              uint8_t(WireIncrementalPDBTypeReplayKind::TypeServerTpiOnly);
+          record.contentHash = typeServer.contentHash;
+          record.endPrecompIdx = encodeWireEndPrecompIdx(typeServer.boundary);
+          record.ghashes = appendBlob(blobArena, ArrayRef(typeServer.ghashes));
+          record.isItemIndexBits =
+              appendBlob(blobArena, ArrayRef(typeServer.isItemIndexBits));
+        },
+        [&](const ReplayTypeServerTpiAndIpi &typeServer) {
+          record.pathOffset = strings.add(typeServer.path);
+          record.parentPathOffset = strings.add(typeServer.parentPath);
+          record.archiveOffset = typeServer.archiveOffset;
+          record.kind =
+              uint8_t(WireIncrementalPDBTypeReplayKind::TypeServerTpiAndIpi);
+          record.contentHash = typeServer.contentHash;
+          record.endPrecompIdx = encodeWireEndPrecompIdx(typeServer.boundary);
+          record.ghashes = appendBlob(blobArena, ArrayRef(typeServer.ghashes));
+          record.isItemIndexBits =
+              appendBlob(blobArena, ArrayRef(typeServer.isItemIndexBits));
+          record.auxGHashes =
+              appendBlob(blobArena, ArrayRef(typeServer.auxGHashes));
+          record.auxIsItemIndexBits =
+              appendBlob(blobArena, ArrayRef(typeServer.auxIsItemIndexBits));
+        });
     typeRecords.push_back(record);
   }
 
-  moduleRecords.reserve(cache.moduleEntries.size());
-  for (const IncrementalPDBModuleCacheEntry &entry : cache.moduleEntries) {
+  moduleRecords.reserve(cache.moduleReplays.size());
+  for (const CachedModuleReplay &entry : cache.moduleReplays) {
     IncrementalPDBModuleEntryRecord record = {};
     record.pathOffset = strings.add(entry.path);
     record.parentPathOffset = strings.add(entry.parentPath);
@@ -530,55 +1054,128 @@ Error writeIncrementalPDBCache(StringRef path,
     record.moduleStreamSize = entry.moduleStreamSize;
 
     record.chunkPlanStart = chunkRecords.size();
-    record.chunkPlanCount = entry.chunkPlans.size();
-    for (const IncrementalPDBChunkPlan &plan : entry.chunkPlans) {
-      IncrementalPDBChunkPlanRecord chunkRecord = {};
-      chunkRecord.chunkOrdinal = plan.chunkOrdinal;
-      chunkRecord.kind = uint8_t(plan.kind);
-      chunkRecord.subsectionStart = plan.subsectionStart;
-      chunkRecord.subsectionCount = plan.subsectionCount;
-      chunkRecords.push_back(chunkRecord);
-    }
-
     record.subsectionPlanStart = subsectionRecords.size();
-    record.subsectionPlanCount = entry.subsectionPlans.size();
-    for (const IncrementalPDBSubsectionPlan &plan : entry.subsectionPlans) {
-      IncrementalPDBSubsectionPlanRecord subsectionRecord = {};
-      subsectionRecord.kind = uint16_t(plan.kind);
-      subsectionRecord.recordOffset = plan.recordOffset;
-      subsectionRecord.recordLength = plan.recordLength;
-      subsectionRecord.relocIndex = plan.relocIndex;
-      subsectionRecord.symbolPlanStart = plan.symbolPlanStart;
-      subsectionRecord.symbolPlanCount = plan.symbolPlanCount;
-      subsectionRecords.push_back(subsectionRecord);
-    }
-
     record.symbolPlanStart = symbolRecords.size();
-    record.symbolPlanCount = entry.symbolPlans.size();
-    for (const IncrementalPDBSymbolPlan &plan : entry.symbolPlans) {
-      IncrementalPDBSymbolPlanRecord symbolRecord = {};
-      symbolRecord.recordOffset = plan.recordOffset;
-      symbolRecord.recordLength = plan.recordLength;
-      symbolRecord.alignedLength = plan.alignedLength;
-      symbolRecord.relocIndex = plan.relocIndex;
-      symbolRecord.typeRefStart = plan.typeRefStart;
-      symbolRecord.typeRefCount = plan.typeRefCount;
-      symbolRecord.destMask = plan.destMask;
-      symbolRecord.flags = plan.flags;
-      symbolRecord.rewriteKind = plan.rewriteKind;
-      symbolRecord.scopeAction = uint8_t(plan.scopeAction);
-      symbolRecords.push_back(symbolRecord);
-    }
-
     record.typeRefStart = typeRefRecords.size();
-    record.typeRefCount = entry.typeRefs.size();
-    for (const IncrementalPDBTypeRef &ref : entry.typeRefs) {
-      IncrementalPDBTypeRefRecord typeRefRecord = {};
-      typeRefRecord.kind = uint8_t(ref.kind);
-      typeRefRecord.offset = ref.offset;
-      typeRefRecord.count = ref.count;
-      typeRefRecords.push_back(typeRefRecord);
+    for (const IncrementalPDBChunkReplay &chunk : entry.chunks) {
+      chunk.match(
+          [&](const ReplayDebugSChunk &debugS) {
+            IncrementalPDBChunkPlanRecord chunkRecord = {};
+            chunkRecord.chunkOrdinal = debugS.chunkOrdinal;
+            chunkRecord.kind =
+                uint8_t(WireIncrementalPDBChunkReplayKind::DebugS);
+            chunkRecord.subsectionStart = subsectionRecords.size();
+            for (const IncrementalPDBSubsectionReplay &subsection :
+                 debugS.subsections) {
+              subsection.match(
+                  [&](const ReplayOpaqueSubsection &opaque) {
+                    IncrementalPDBSubsectionPlanRecord subsectionRecord = {};
+                    subsectionRecord.kind = uint16_t(opaque.kind);
+                    subsectionRecord.recordOffset =
+                        opaque.location.recordOffset;
+                    subsectionRecord.recordLength =
+                        opaque.location.recordLength;
+                    subsectionRecord.relocIndex = opaque.location.relocIndex;
+                    subsectionRecord.symbolPlanStart = symbolRecords.size();
+                    subsectionRecord.symbolPlanCount = 0;
+                    subsectionRecords.push_back(subsectionRecord);
+                  },
+                  [&](const ReplaySymbolSubsection &symbols) {
+                    IncrementalPDBSubsectionPlanRecord subsectionRecord = {};
+                    subsectionRecord.kind =
+                        uint16_t(DebugSubsectionKind::Symbols);
+                    subsectionRecord.recordOffset =
+                        symbols.location.recordOffset;
+                    subsectionRecord.recordLength =
+                        symbols.location.recordLength;
+                    subsectionRecord.relocIndex = symbols.location.relocIndex;
+                    subsectionRecord.symbolPlanStart = symbolRecords.size();
+                    for (const CachedSymbolReplay &symbol : symbols.symbols) {
+                      IncrementalPDBSymbolPlanRecord symbolRecord = {};
+                      symbolRecord.recordOffset = symbol.location.recordOffset;
+                      symbolRecord.recordLength = symbol.location.recordLength;
+                      symbolRecord.alignedLength = symbol.alignedLength;
+                      symbolRecord.relocIndex = symbol.location.relocIndex;
+                      symbolRecord.typeRefStart = typeRefRecords.size();
+                      symbol.routing.match(
+                          [&](const EmitGlobalOnlySymbol &) {
+                            symbolRecord.destMask = 1;
+                          },
+                          [&](const EmitModuleOnlySymbol &) {
+                            symbolRecord.destMask = 2;
+                          },
+                          [&](const EmitGlobalAndModuleSymbol &) {
+                            symbolRecord.destMask = 3;
+                          });
+                      symbol.globalReplay.match(
+                          [&](const OmitGlobalReplay &) {
+                            symbolRecord.flags = 0;
+                          },
+                          [&](const ReplayGlobalSymbolBytes &) {
+                            symbolRecord.flags = 0;
+                          },
+                          [&](const ReplayGlobalProcedureReference &) {
+                            symbolRecord.flags = 1;
+                          });
+                      symbol.scope.match(
+                          [&](const ReplayStandaloneSymbol &) {
+                            symbolRecord.scopeAction = 0;
+                          },
+                          [&](const ReplayScopeOpeningSymbol &) {
+                            symbolRecord.scopeAction = 1;
+                          },
+                          [&](const ReplayScopeClosingSymbol &) {
+                            symbolRecord.scopeAction = 2;
+                          });
+                      symbol.rewrite.match(
+                          [&](const ReplaySymbolWithoutTypeRewrite &) {
+                            symbolRecord.rewriteKind = 0;
+                          },
+                          [&](const ReplayProcIdEndSymbol &) {
+                            symbolRecord.rewriteKind = 1;
+                          },
+                          [&](const ReplayProcIdWithFixedTypeIndex &) {
+                            symbolRecord.rewriteKind = 2;
+                          },
+                          [&](const ReplaySymbolWithDiscoveredTypeRefs &generic) {
+                            symbolRecord.rewriteKind = 3;
+                            for (const IncrementalPDBTypeRef &ref :
+                                 generic.typeRefs) {
+                              IncrementalPDBTypeRefRecord typeRefRecord = {};
+                              typeRefRecord.kind = uint8_t(ref.kind);
+                              typeRefRecord.offset = ref.offset;
+                              typeRefRecord.count = ref.count;
+                              typeRefRecords.push_back(typeRefRecord);
+                            }
+                          });
+                      symbolRecord.typeRefCount =
+                          typeRefRecords.size() - symbolRecord.typeRefStart;
+                      symbolRecords.push_back(symbolRecord);
+                    }
+                    subsectionRecord.symbolPlanCount =
+                        symbolRecords.size() - subsectionRecord.symbolPlanStart;
+                    subsectionRecords.push_back(subsectionRecord);
+                  });
+            }
+            chunkRecord.subsectionCount =
+                subsectionRecords.size() - chunkRecord.subsectionStart;
+            chunkRecords.push_back(chunkRecord);
+          },
+          [&](const ReplayDebugFChunk &debugF) {
+            IncrementalPDBChunkPlanRecord chunkRecord = {};
+            chunkRecord.chunkOrdinal = debugF.chunkOrdinal;
+            chunkRecord.kind =
+                uint8_t(WireIncrementalPDBChunkReplayKind::DebugF);
+            chunkRecord.subsectionStart = subsectionRecords.size();
+            chunkRecord.subsectionCount = 0;
+            chunkRecords.push_back(chunkRecord);
+          });
     }
+    record.chunkPlanCount = chunkRecords.size() - record.chunkPlanStart;
+    record.subsectionPlanCount =
+        subsectionRecords.size() - record.subsectionPlanStart;
+    record.symbolPlanCount = symbolRecords.size() - record.symbolPlanStart;
+    record.typeRefCount = typeRefRecords.size() - record.typeRefStart;
 
     record.stringFixupStart = stringFixupRecords.size();
     record.stringFixupCount = entry.stringFixups.size();
@@ -688,7 +1285,7 @@ IncrementalPDBCacheSession::create(COFFLinkerContext &ctx) {
   }
 
   ScopedTimer loadTimer(ctx.pdbCacheLoadTimer);
-  Expected<IncrementalPDBCacheFile> cacheOrErr =
+  Expected<IncrementalPDBCacheSnapshot> cacheOrErr =
       loadIncrementalPDBCache(session->cachePath);
   if (!cacheOrErr) {
     if (ctx.config.verbose)
@@ -718,31 +1315,31 @@ IncrementalPDBCacheSession::create(COFFLinkerContext &ctx) {
   }
 
   session->loadedCache = std::move(*cacheOrErr);
-  for (const IncrementalPDBTypeCacheEntry &entry : session->loadedCache.typeEntries)
+  for (const IncrementalPDBTypeReplaySnapshot &entry :
+       session->loadedCache.typeReplays)
     session->loadedTypesByKey[getTypeCompositeKey(entry)] = &entry;
-  for (const IncrementalPDBModuleCacheEntry &entry :
-       session->loadedCache.moduleEntries)
+  for (const CachedModuleReplay &entry : session->loadedCache.moduleReplays)
     session->loadedModulesByKey[getModuleCompositeKey(entry)] = &entry;
   return session;
 }
 
-const IncrementalPDBTypeCacheEntry *
-IncrementalPDBCacheSession::findLoadedTypeEntry(StringRef key,
-                                                const TpiSource &source) const {
+const IncrementalPDBTypeReplaySnapshot *
+IncrementalPDBCacheSession::findLoadedTypeReplay(StringRef key,
+                                                 const TpiSource &source) const {
   auto it = loadedTypesByKey.find(key);
   if (it == loadedTypesByKey.end())
     return nullptr;
-  const IncrementalPDBTypeCacheEntry *entry = it->second;
-  return matchesIncrementalPDBTypeCacheEntry(source, *entry) ? entry : nullptr;
+  const IncrementalPDBTypeReplaySnapshot *entry = it->second;
+  return matchesIncrementalPDBTypeReplay(source, *entry) ? entry : nullptr;
 }
 
-const IncrementalPDBModuleCacheEntry *
-IncrementalPDBCacheSession::findLoadedModuleEntry(StringRef key,
-                                                  const ObjFile &file) const {
+const CachedModuleReplay *
+IncrementalPDBCacheSession::findLoadedModuleReplay(StringRef key,
+                                                   const ObjFile &file) const {
   auto it = loadedModulesByKey.find(key);
   if (it == loadedModulesByKey.end())
     return nullptr;
-  const IncrementalPDBModuleCacheEntry *entry = it->second;
+  const CachedModuleReplay *entry = it->second;
   if (entry->debugSHash != computeIncrementalPDBModuleDebugSHash(file) ||
       entry->debugFHash != computeIncrementalPDBModuleDebugFHash(file) ||
       entry->relocHash != computeIncrementalPDBModuleRelocHash(file))
@@ -750,56 +1347,61 @@ IncrementalPDBCacheSession::findLoadedModuleEntry(StringRef key,
   return entry;
 }
 
-const IncrementalPDBTypeCacheEntry *
-IncrementalPDBCacheSession::findTypeEntry(const TpiSource &source) {
+IncrementalPDBTypeReplayLookup
+IncrementalPDBCacheSession::lookupTypeReplay(const TpiSource &source) {
   switch (mode) {
   case IncrementalPDBCacheRuntimeMode::ReplayOnlyCache:
   case IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache:
     break;
   case IncrementalPDBCacheRuntimeMode::BypassCache:
   case IncrementalPDBCacheRuntimeMode::RecordOnlyCache:
-    return nullptr;
+    return IncrementalPDBTypeReplayLookup::make<RebuildTypeFromCurrentInput>();
   }
   ScopedTimer validateTimer(ctx.pdbCacheValidateTimer);
   std::string key = getIncrementalPDBTypeCacheKey(source);
   if (key.empty())
-    return nullptr;
-  const IncrementalPDBTypeCacheEntry *entry = findLoadedTypeEntry(key, source);
+    return IncrementalPDBTypeReplayLookup::make<RebuildTypeFromCurrentInput>();
+  const IncrementalPDBTypeReplaySnapshot *entry =
+      findLoadedTypeReplay(key, source);
   if (entry) {
     ++typeCacheHits;
     if (ctx.config.verbose)
       Log(ctx) << "pdbcache: type hit " << key;
-    return entry;
+    return IncrementalPDBTypeReplayLookup::make<ReplayTypeFromCache>(
+        ReplayTypeFromCache{std::cref(*entry)});
   }
   ++typeCacheMisses;
   if (ctx.config.verbose)
     Log(ctx) << "pdbcache: type miss " << key;
-  return nullptr;
+  return IncrementalPDBTypeReplayLookup::make<RebuildTypeFromCurrentInput>();
 }
 
-const IncrementalPDBModuleCacheEntry *
-IncrementalPDBCacheSession::findModuleEntry(const ObjFile &file) {
+IncrementalPDBModuleReplayLookup
+IncrementalPDBCacheSession::lookupModuleReplay(const ObjFile &file) {
   switch (mode) {
   case IncrementalPDBCacheRuntimeMode::ReplayOnlyCache:
   case IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache:
     break;
   case IncrementalPDBCacheRuntimeMode::BypassCache:
   case IncrementalPDBCacheRuntimeMode::RecordOnlyCache:
-    return nullptr;
+    return IncrementalPDBModuleReplayLookup::make<
+        RebuildModuleFromCurrentInput>();
   }
   ScopedTimer validateTimer(ctx.pdbCacheValidateTimer);
-  const IncrementalPDBModuleCacheEntry *entry =
-      findLoadedModuleEntry(getIncrementalPDBCacheObjectKey(file), file);
+  const CachedModuleReplay *entry =
+      findLoadedModuleReplay(getIncrementalPDBCacheObjectKey(file), file);
   if (entry) {
     ++moduleCacheHits;
     if (ctx.config.verbose)
       Log(ctx) << "pdbcache: module hit " << file.getName();
-    return entry;
+    return IncrementalPDBModuleReplayLookup::make<ReplayModuleFromCache>(
+        ReplayModuleFromCache{std::cref(*entry)});
   }
   ++moduleCacheMisses;
   if (ctx.config.verbose)
     Log(ctx) << "pdbcache: module miss " << file.getName();
-  return nullptr;
+  return IncrementalPDBModuleReplayLookup::make<
+      RebuildModuleFromCurrentInput>();
 }
 
 void IncrementalPDBCacheSession::recordTypeEntries(ArrayRef<TpiSource *> sources) {
@@ -811,16 +1413,18 @@ void IncrementalPDBCacheSession::recordTypeEntries(ArrayRef<TpiSource *> sources
   case IncrementalPDBCacheRuntimeMode::ReplayOnlyCache:
     return;
   }
-  recordedTypeEntries.clear();
+  recordedTypeReplays.clear();
   for (TpiSource *source : sources) {
-    IncrementalPDBTypeCacheEntry entry;
-    if (buildIncrementalPDBTypeCacheEntry(*source, entry))
-      recordedTypeEntries.push_back(std::move(entry));
+    buildIncrementalPDBTypeReplay(*source).match(
+        [&](const SkipRecordedTypeReplay &) {},
+        [&](RecordTypeReplay replay) {
+          recordedTypeReplays.push_back(std::move(replay.replay));
+        });
   }
 }
 
 Error IncrementalPDBCacheSession::writeCache(
-    const DenseMap<const ObjFile *, IncrementalPDBModuleCacheEntry> &modulePlans) const {
+    const DenseMap<const ObjFile *, CachedModuleReplay> &modulePlans) const {
   switch (mode) {
   case IncrementalPDBCacheRuntimeMode::RecordOnlyCache:
   case IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache:
@@ -831,13 +1435,15 @@ Error IncrementalPDBCacheSession::writeCache(
   }
 
   ScopedTimer storeTimer(ctx.pdbCacheStoreTimer);
-  IncrementalPDBCacheFile cache;
+  IncrementalPDBCacheSnapshot cache;
   cache.linkerBuildId = computeIncrementalPDBCacheBuildId();
   cache.hardConfigHash = computeIncrementalPDBCacheHardConfigHash(ctx.config);
-  cache.typeEntries = recordedTypeEntries;
-  cache.moduleEntries.reserve(modulePlans.size());
+  cache.typeReplays.reserve(recordedTypeReplays.size());
+  for (const IncrementalPDBTypeReplaySnapshot &entry : recordedTypeReplays)
+    cache.typeReplays.push_back(cloneTypeReplay(entry));
+  cache.moduleReplays.reserve(modulePlans.size());
   for (const auto &it : modulePlans)
-    cache.moduleEntries.push_back(it.second);
+    cache.moduleReplays.push_back(cloneCachedModuleReplay(it.second));
   return writeIncrementalPDBCache(cachePath, cache);
 }
 

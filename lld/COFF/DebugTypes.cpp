@@ -31,6 +31,7 @@
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
+#include <new>
 
 using namespace llvm;
 using namespace llvm::codeview;
@@ -312,24 +313,6 @@ getHashesFromDebugH(ArrayRef<uint8_t> debugH) {
   return {reinterpret_cast<const GloballyHashedType *>(debugH.data()), count};
 }
 
-static std::optional<IncrementalPDBTypeSourceKind>
-getIncrementalPDBTypeSourceKind(const TpiSource &source) {
-  switch (source.kind) {
-  case TpiSource::Regular:
-    return IncrementalPDBTypeSourceKind::Regular;
-  case TpiSource::PCH:
-    return IncrementalPDBTypeSourceKind::PCH;
-  case TpiSource::UsingPCH:
-    return IncrementalPDBTypeSourceKind::UsingPCH;
-  case TpiSource::PDB:
-    return IncrementalPDBTypeSourceKind::PDB;
-  case TpiSource::PDBIpi:
-  case TpiSource::UsingPDB:
-    return std::nullopt;
-  }
-  llvm_unreachable("unhandled type source kind");
-}
-
 static void appendHashBytes(raw_ostream &os, ArrayRef<uint8_t> bytes) {
   os << bytes.size() << '\n';
   os.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
@@ -404,26 +387,57 @@ static void restoreCachedGHashes(TpiSource &source,
   source.ownedGHashes = true;
 }
 
-std::string lld::coff::getIncrementalPDBTypeCacheKey(const TpiSource &source) {
-  std::optional<IncrementalPDBTypeSourceKind> kind =
-      getIncrementalPDBTypeSourceKind(source);
-  if (!kind)
-    return {};
+static IncrementalPDBTypeReplayBoundary
+cloneTypeReplayBoundary(const IncrementalPDBTypeReplayBoundary &boundary) {
+  return boundary.match(
+      [&](const ReplayAllTypeRecords &) {
+        return IncrementalPDBTypeReplayBoundary::make<ReplayAllTypeRecords>();
+      },
+      [&](const ReplayTypeRecordsSkippingEndPrecomp &skip) {
+        return IncrementalPDBTypeReplayBoundary::make<
+            ReplayTypeRecordsSkippingEndPrecomp>(skip);
+      });
+}
 
+static void
+setTypeReplayBoundary(TpiSource &source,
+                      IncrementalPDBTypeReplayBoundary newBoundary) {
+  source.replayBoundary.~IncrementalPDBTypeReplayBoundary();
+  new (&source.replayBoundary)
+      IncrementalPDBTypeReplayBoundary(std::move(newBoundary));
+}
+
+static bool getPCHSignature(const TpiSource &source, uint32_t &signature) {
+  if (!source.file || !source.file->pchSignature)
+    return false;
+  signature = *source.file->pchSignature;
+  return true;
+}
+
+static bool typeServerHasCachedIpi(const TypeServerSource &source) {
+  return source.ipiSrc != nullptr && !source.ipiSrc->ghashes.empty();
+}
+
+std::string lld::coff::getIncrementalPDBTypeCacheKey(const TpiSource &source) {
   SmallString<256> buffer;
   raw_svector_ostream os(buffer);
+  uint8_t kindTag = 0;
   switch (source.kind) {
   case TpiSource::Regular:
   case TpiSource::PCH:
   case TpiSource::UsingPCH:
     assert(source.file != nullptr);
+    kindTag = source.kind == TpiSource::Regular
+                  ? 1
+                  : (source.kind == TpiSource::PCH ? 2 : 3);
     os << source.file->getName() << '\n' << source.file->archiveName << '\n'
-       << source.file->archiveOffset << '\n' << unsigned(*kind);
+       << source.file->archiveOffset << '\n' << unsigned(kindTag);
     break;
   case TpiSource::PDB: {
     auto &ts = static_cast<const TypeServerSource &>(source);
+    kindTag = typeServerHasCachedIpi(ts) ? 5 : 4;
     os << ts.pdbInputFile->getName() << '\n' << '\n' << 0 << '\n'
-       << unsigned(*kind);
+       << unsigned(kindTag);
     break;
   }
   case TpiSource::PDBIpi:
@@ -433,126 +447,190 @@ std::string lld::coff::getIncrementalPDBTypeCacheKey(const TpiSource &source) {
   return std::string(buffer);
 }
 
-bool lld::coff::matchesIncrementalPDBTypeCacheEntry(
-    const TpiSource &source, const IncrementalPDBTypeCacheEntry &entry) {
-  std::optional<IncrementalPDBTypeSourceKind> kind =
-      getIncrementalPDBTypeSourceKind(source);
-  if (!kind || *kind != entry.kind)
-    return false;
-
-  switch (source.kind) {
-  case TpiSource::Regular:
-    return entry.contentHash == hashObjectTypeSource(*source.file) &&
-           entry.dependencyHash == 0;
-  case TpiSource::PCH:
-    return entry.contentHash == hashObjectTypeSource(*source.file) &&
-           entry.dependencyHash ==
-               uint64_t(source.file->pchSignature.value_or(0));
-  case TpiSource::UsingPCH: {
-    auto &usePCH = static_cast<const UsePrecompSource &>(source);
-    return entry.contentHash == hashObjectTypeSource(*source.file) &&
-           entry.dependencyHash == hashPrecompDependency(usePCH.precompDependency);
-  }
-  case TpiSource::PDB: {
-    auto &ts = static_cast<const TypeServerSource &>(source);
-    bool hasIpi = ts.ipiSrc != nullptr;
-    return entry.contentHash == hashPDBTypeSource(*ts.pdbInputFile) &&
-           entry.dependencyHash == 0 &&
-           hasIpi == !entry.auxGHashes.empty();
-  }
-  case TpiSource::PDBIpi:
-  case TpiSource::UsingPDB:
-    return false;
-  }
-
-  llvm_unreachable("unhandled type source kind");
+bool lld::coff::matchesIncrementalPDBTypeReplay(
+    const TpiSource &source, const IncrementalPDBTypeReplaySnapshot &entry) {
+  return entry.match(
+      [&](const ReplayObjectTypes &object) {
+        return source.kind == TpiSource::Regular && source.file != nullptr &&
+               object.contentHash == hashObjectTypeSource(*source.file);
+      },
+      [&](const ReplayPrecompiledHeaderTypes &pch) {
+        uint32_t signature = 0;
+        return source.kind == TpiSource::PCH && source.file != nullptr &&
+               getPCHSignature(source, signature) &&
+               pch.contentHash == hashObjectTypeSource(*source.file) &&
+               pch.pchSignature == signature;
+      },
+      [&](const ReplayUsingPrecompiledHeaderTypes &usingPCH) {
+        if (source.kind != TpiSource::UsingPCH || source.file == nullptr)
+          return false;
+        auto &usePCH = static_cast<const UsePrecompSource &>(source);
+        return usingPCH.contentHash == hashObjectTypeSource(*source.file) &&
+               usingPCH.dependencyHash ==
+                   hashPrecompDependency(usePCH.precompDependency);
+      },
+      [&](const ReplayTypeServerTpiOnly &typeServer) {
+        if (source.kind != TpiSource::PDB)
+          return false;
+        auto &ts = static_cast<const TypeServerSource &>(source);
+        return !typeServerHasCachedIpi(ts) &&
+               typeServer.contentHash == hashPDBTypeSource(*ts.pdbInputFile);
+      },
+      [&](const ReplayTypeServerTpiAndIpi &typeServer) {
+        if (source.kind != TpiSource::PDB)
+          return false;
+        auto &ts = static_cast<const TypeServerSource &>(source);
+        return typeServerHasCachedIpi(ts) &&
+               typeServer.contentHash == hashPDBTypeSource(*ts.pdbInputFile);
+      });
 }
 
-bool lld::coff::buildIncrementalPDBTypeCacheEntry(
-    const TpiSource &source, IncrementalPDBTypeCacheEntry &entry) {
-  std::optional<IncrementalPDBTypeSourceKind> kind =
-      getIncrementalPDBTypeSourceKind(source);
-  if (!kind || source.ghashes.empty())
-    return false;
+IncrementalPDBTypeReplayBuild
+lld::coff::buildIncrementalPDBTypeReplay(const TpiSource &source) {
+  if (source.ghashes.empty())
+    return IncrementalPDBTypeReplayBuild::make<SkipRecordedTypeReplay>();
 
-  entry = {};
-  entry.kind = *kind;
-  entry.endPrecompIdx = source.endPrecompIdx;
-  entry.ghashes.assign(source.ghashes.begin(), source.ghashes.end());
-  entry.isItemIndexBits = serializeBitVector(source.isItemIndex);
+  std::vector<GloballyHashedType> ghashes(source.ghashes.begin(),
+                                          source.ghashes.end());
+  std::vector<uint8_t> isItemIndexBits = serializeBitVector(source.isItemIndex);
+  IncrementalPDBTypeReplayBoundary boundary =
+      cloneTypeReplayBoundary(source.replayBoundary);
 
   switch (source.kind) {
-  case TpiSource::Regular:
-    entry.path = source.file->getName().str();
-    entry.parentPath = source.file->archiveName.str();
-    entry.archiveOffset = source.file->archiveOffset;
-    entry.contentHash = hashObjectTypeSource(*source.file);
-    break;
-  case TpiSource::PCH:
-    entry.path = source.file->getName().str();
-    entry.parentPath = source.file->archiveName.str();
-    entry.archiveOffset = source.file->archiveOffset;
-    entry.contentHash = hashObjectTypeSource(*source.file);
-    entry.dependencyHash = uint64_t(source.file->pchSignature.value_or(0));
-    break;
+  case TpiSource::Regular: {
+    ReplayObjectTypes entry{
+        source.file->getName().str(), source.file->archiveName.str(),
+        source.file->archiveOffset, hashObjectTypeSource(*source.file),
+        std::move(boundary), std::move(ghashes), std::move(isItemIndexBits)};
+    return IncrementalPDBTypeReplayBuild::make<RecordTypeReplay>(
+        RecordTypeReplay{IncrementalPDBTypeReplaySnapshot::make<ReplayObjectTypes>(
+            std::move(entry))});
+  }
+  case TpiSource::PCH: {
+    uint32_t pchSignature = 0;
+    if (!getPCHSignature(source, pchSignature))
+      return IncrementalPDBTypeReplayBuild::make<SkipRecordedTypeReplay>();
+    ReplayPrecompiledHeaderTypes entry{
+        source.file->getName().str(),
+        source.file->archiveName.str(),
+        source.file->archiveOffset,
+        hashObjectTypeSource(*source.file),
+        pchSignature,
+        std::move(boundary),
+        std::move(ghashes),
+        std::move(isItemIndexBits)};
+    return IncrementalPDBTypeReplayBuild::make<RecordTypeReplay>(RecordTypeReplay{
+        IncrementalPDBTypeReplaySnapshot::make<ReplayPrecompiledHeaderTypes>(
+            std::move(entry))});
+  }
   case TpiSource::UsingPCH: {
     auto &usePCH = static_cast<const UsePrecompSource &>(source);
-    entry.path = source.file->getName().str();
-    entry.parentPath = source.file->archiveName.str();
-    entry.archiveOffset = source.file->archiveOffset;
-    entry.contentHash = hashObjectTypeSource(*source.file);
-    entry.dependencyHash = hashPrecompDependency(usePCH.precompDependency);
-    break;
+    ReplayUsingPrecompiledHeaderTypes entry{
+        source.file->getName().str(),
+        source.file->archiveName.str(),
+        source.file->archiveOffset,
+        hashObjectTypeSource(*source.file),
+        hashPrecompDependency(usePCH.precompDependency),
+        std::move(boundary),
+        std::move(ghashes),
+        std::move(isItemIndexBits)};
+    return IncrementalPDBTypeReplayBuild::make<RecordTypeReplay>(RecordTypeReplay{
+        IncrementalPDBTypeReplaySnapshot::make<
+            ReplayUsingPrecompiledHeaderTypes>(std::move(entry))});
   }
   case TpiSource::PDB: {
     auto &ts = static_cast<const TypeServerSource &>(source);
-    entry.path = ts.pdbInputFile->getName().str();
-    entry.contentHash = hashPDBTypeSource(*ts.pdbInputFile);
-    if (ts.ipiSrc && !ts.ipiSrc->ghashes.empty()) {
-      entry.auxGHashes.assign(ts.ipiSrc->ghashes.begin(), ts.ipiSrc->ghashes.end());
-      entry.auxIsItemIndexBits = serializeBitVector(ts.ipiSrc->isItemIndex);
+    if (typeServerHasCachedIpi(ts)) {
+      ReplayTypeServerTpiAndIpi entry{
+          ts.pdbInputFile->getName().str(),
+          "",
+          0,
+          hashPDBTypeSource(*ts.pdbInputFile),
+          std::move(boundary),
+          std::move(ghashes),
+          std::move(isItemIndexBits),
+          std::vector<GloballyHashedType>(ts.ipiSrc->ghashes.begin(),
+                                          ts.ipiSrc->ghashes.end()),
+          serializeBitVector(ts.ipiSrc->isItemIndex)};
+      return IncrementalPDBTypeReplayBuild::make<RecordTypeReplay>(
+          RecordTypeReplay{
+              IncrementalPDBTypeReplaySnapshot::make<
+                  ReplayTypeServerTpiAndIpi>(std::move(entry))});
     }
-    break;
+
+    ReplayTypeServerTpiOnly entry{
+        ts.pdbInputFile->getName().str(),
+        "",
+        0,
+        hashPDBTypeSource(*ts.pdbInputFile),
+        std::move(boundary),
+        std::move(ghashes),
+        std::move(isItemIndexBits)};
+    return IncrementalPDBTypeReplayBuild::make<RecordTypeReplay>(RecordTypeReplay{
+        IncrementalPDBTypeReplaySnapshot::make<ReplayTypeServerTpiOnly>(
+            std::move(entry))});
   }
   case TpiSource::PDBIpi:
   case TpiSource::UsingPDB:
-    return false;
-  }
-
-  return true;
-}
-
-bool lld::coff::restoreIncrementalPDBTypeCacheEntry(
-    const IncrementalPDBTypeCacheEntry &entry, TpiSource &source) {
-  std::optional<IncrementalPDBTypeSourceKind> kind =
-      getIncrementalPDBTypeSourceKind(source);
-  if (!kind || *kind != entry.kind)
-    return false;
-
-  source.endPrecompIdx = entry.endPrecompIdx;
-  restoreCachedGHashes(source, entry.ghashes, entry.isItemIndexBits);
-
-  switch (source.kind) {
-  case TpiSource::Regular:
-  case TpiSource::UsingPCH:
-    return true;
-  case TpiSource::PCH:
-    if (source.file && entry.dependencyHash <= UINT32_MAX)
-      source.file->pchSignature = static_cast<uint32_t>(entry.dependencyHash);
-    return true;
-  case TpiSource::PDB: {
-    auto &ts = static_cast<TypeServerSource &>(source);
-    if (ts.ipiSrc)
-      restoreCachedGHashes(*ts.ipiSrc, entry.auxGHashes,
-                           entry.auxIsItemIndexBits);
-    return true;
-  }
-  case TpiSource::PDBIpi:
-  case TpiSource::UsingPDB:
-    return false;
+    return IncrementalPDBTypeReplayBuild::make<SkipRecordedTypeReplay>();
   }
 
   llvm_unreachable("unhandled type source kind");
+}
+
+bool lld::coff::restoreIncrementalPDBTypeReplay(
+    const IncrementalPDBTypeReplaySnapshot &entry, TpiSource &source) {
+  return entry.match(
+      [&](const ReplayObjectTypes &object) {
+        if (source.kind != TpiSource::Regular)
+          return false;
+        setTypeReplayBoundary(source, cloneTypeReplayBoundary(object.boundary));
+        restoreCachedGHashes(source, object.ghashes, object.isItemIndexBits);
+        return true;
+      },
+      [&](const ReplayPrecompiledHeaderTypes &pch) {
+        if (source.kind != TpiSource::PCH || source.file == nullptr)
+          return false;
+        setTypeReplayBoundary(source, cloneTypeReplayBoundary(pch.boundary));
+        restoreCachedGHashes(source, pch.ghashes, pch.isItemIndexBits);
+        source.file->pchSignature = pch.pchSignature;
+        return true;
+      },
+      [&](const ReplayUsingPrecompiledHeaderTypes &usingPCH) {
+        if (source.kind != TpiSource::UsingPCH)
+          return false;
+        setTypeReplayBoundary(source,
+                              cloneTypeReplayBoundary(usingPCH.boundary));
+        restoreCachedGHashes(source, usingPCH.ghashes,
+                             usingPCH.isItemIndexBits);
+        return true;
+      },
+      [&](const ReplayTypeServerTpiOnly &typeServer) {
+        if (source.kind != TpiSource::PDB)
+          return false;
+        auto &ts = static_cast<TypeServerSource &>(source);
+        setTypeReplayBoundary(source,
+                              cloneTypeReplayBoundary(typeServer.boundary));
+        restoreCachedGHashes(source, typeServer.ghashes,
+                             typeServer.isItemIndexBits);
+        if (ts.ipiSrc)
+          clearRestoredGHashes(*ts.ipiSrc);
+        return true;
+      },
+      [&](const ReplayTypeServerTpiAndIpi &typeServer) {
+        if (source.kind != TpiSource::PDB)
+          return false;
+        auto &ts = static_cast<TypeServerSource &>(source);
+        if (!ts.ipiSrc)
+          return false;
+        setTypeReplayBoundary(source,
+                              cloneTypeReplayBoundary(typeServer.boundary));
+        restoreCachedGHashes(source, typeServer.ghashes,
+                             typeServer.isItemIndexBits);
+        restoreCachedGHashes(*ts.ipiSrc, typeServer.auxGHashes,
+                             typeServer.auxIsItemIndexBits);
+        return true;
+      });
 }
 
 // Merge .debug$T for a generic object file.
@@ -574,7 +652,11 @@ Error TpiSource::mergeDebugT(TypeMerger *m) {
                << toString(std::move(err));
   if (pchInfo) {
     file->pchSignature = pchInfo->PCHSignature;
-    endPrecompIdx = pchInfo->EndPrecompIndex;
+    setTypeReplayBoundary(
+        *this,
+        IncrementalPDBTypeReplayBoundary::make<
+            ReplayTypeRecordsSkippingEndPrecomp>(
+            ReplayTypeRecordsSkippingEndPrecomp{pchInfo->EndPrecompIndex}));
   }
 
   // In an object, there is only one mapping for both types and items.
@@ -765,7 +847,11 @@ Expected<PrecompSource *> UsePrecompSource::findPrecompMap(ObjFile *file,
   // and the OBJ that uses it. However we do validate here that the
   // LF_ENDPRECOMP record index lines up with the number of type records
   // LF_PRECOMP is expecting.
-  if (precomp->endPrecompIdx != pr.getTypesCount())
+  if (!precomp->replayBoundary.match(
+          [&](const ReplayAllTypeRecords &) { return false; },
+          [&](const ReplayTypeRecordsSkippingEndPrecomp &boundary) {
+            return boundary.ghashIndex == pr.getTypesCount();
+          }))
     return createFileError(
         toString(file),
         make_error<pdb::PDBError>(pdb::pdb_error_code::no_matching_pch));
@@ -1111,7 +1197,11 @@ void PrecompSource::loadGHashes() {
           const_cast<CVType &>(ty), endPrecomp));
       file->pchSignature = endPrecomp.getSignature();
       registerMapping();
-      endPrecompIdx = ghashIdx;
+      setTypeReplayBoundary(
+          *this,
+          IncrementalPDBTypeReplayBoundary::make<
+              ReplayTypeRecordsSkippingEndPrecomp>(
+              ReplayTypeRecordsSkippingEndPrecomp{ghashIdx}));
     }
 
     hashVec.push_back(GloballyHashedType::hashType(ty, hashVec, hashVec));
@@ -1330,12 +1420,18 @@ void TypeMerger::mergeTypesWithGHash() {
   if (ctx.pdbCacheSession) {
     ScopedTimer t(ctx.pdbTypeCacheReplayTimer);
     for (TpiSource *source : dependencySources) {
-      if (const auto *entry = ctx.pdbCacheSession->findTypeEntry(*source))
-        restoreIncrementalPDBTypeCacheEntry(*entry, *source);
+      ctx.pdbCacheSession->lookupTypeReplay(*source).match(
+          [&](const ReplayTypeFromCache &cached) {
+            restoreIncrementalPDBTypeReplay(cached.replay.get(), *source);
+          },
+          [&](const RebuildTypeFromCurrentInput &) {});
     }
     for (TpiSource *source : objectSources) {
-      if (const auto *entry = ctx.pdbCacheSession->findTypeEntry(*source))
-        restoreIncrementalPDBTypeCacheEntry(*entry, *source);
+      ctx.pdbCacheSession->lookupTypeReplay(*source).match(
+          [&](const ReplayTypeFromCache &cached) {
+            restoreIncrementalPDBTypeReplay(cached.replay.get(), *source);
+          },
+          [&](const RebuildTypeFromCurrentInput &) {});
     }
   }
 

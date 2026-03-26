@@ -17,7 +17,51 @@ namespace lld::coff {
 namespace {
 
 constexpr char stateMagic[8] = {'L', 'L', 'I', 'L', 'K', '6', '4', '\0'};
-constexpr uint32_t currentStateVersion = 6;
+constexpr uint32_t currentStateVersion = 7;
+
+enum class WireIncrementalLayoutMode : uint16_t {
+  Exact = 1,
+  Slotted = 2,
+};
+
+enum class WireIncrementalChunkKind : uint16_t {
+  ObjSection = 1,
+  Synthetic = 2,
+  Padding = 3,
+  EntryRedirect = 4,
+  LongThunk = 5,
+};
+
+enum class WireIncrementalSymbolKind : uint16_t {
+  Regular = 1,
+  Common = 2,
+  ImportData = 3,
+  ImportThunk = 4,
+  LocalImport = 5,
+  Absolute = 6,
+  Synthetic = 7,
+};
+
+enum class WireIncrementalSectionLayoutKind : uint16_t {
+  ExactSectionLayout = 1,
+  TextFreeSlots = 2,
+  ReadOnlyDataFreeSlots = 3,
+  WritableDataFreeSlots = 4,
+  PackedPDataPrefix = 5,
+  PackedXDataPrefix = 6,
+};
+
+enum class WireIncrementalSlotState : uint16_t {
+  Occupied = 1,
+  Free = 2,
+};
+
+enum class WireIncrementalPlacementKind : uint16_t {
+  ExistingSlot = 1,
+  ReusedFreeSlot = 2,
+  TailReserve = 3,
+  PackedPrefix = 4,
+};
 
 struct FileHeaderV5 {
   char magic[8];
@@ -228,29 +272,700 @@ private:
   StringMap<uint64_t> offsets;
 };
 
-static bool isValidIncrementalSectionLayoutKind(uint16_t rawKind) {
-  switch (static_cast<IncrementalSectionLayoutKind>(rawKind)) {
-  case IncrementalSectionLayoutKind::ExactSectionLayout:
-  case IncrementalSectionLayoutKind::TextFreeSlots:
-  case IncrementalSectionLayoutKind::ReadOnlyDataFreeSlots:
-  case IncrementalSectionLayoutKind::WritableDataFreeSlots:
-  case IncrementalSectionLayoutKind::PackedPDataPrefix:
-  case IncrementalSectionLayoutKind::PackedXDataPrefix:
-    return true;
-  }
-  return false;
-}
-
 template <typename T> void appendObject(std::vector<char> &out, const T &obj) {
   size_t oldSize = out.size();
   out.resize(oldSize + sizeof(T));
   memcpy(out.data() + oldSize, &obj, sizeof(T));
 }
 
-template <typename HeaderT>
-Expected<IncrementalStateFile>
-loadCommonState(ArrayRef<uint8_t> bytes, const HeaderT &header,
-                IncrementalLayoutMode layoutMode) {
+static bool isValidWireChunkKind(uint16_t rawKind) {
+  switch (static_cast<WireIncrementalChunkKind>(rawKind)) {
+  case WireIncrementalChunkKind::ObjSection:
+  case WireIncrementalChunkKind::Synthetic:
+  case WireIncrementalChunkKind::Padding:
+  case WireIncrementalChunkKind::EntryRedirect:
+  case WireIncrementalChunkKind::LongThunk:
+    return true;
+  }
+  return false;
+}
+
+static bool isValidWireSymbolKind(uint16_t rawKind) {
+  switch (static_cast<WireIncrementalSymbolKind>(rawKind)) {
+  case WireIncrementalSymbolKind::Regular:
+  case WireIncrementalSymbolKind::Common:
+  case WireIncrementalSymbolKind::ImportData:
+  case WireIncrementalSymbolKind::ImportThunk:
+  case WireIncrementalSymbolKind::LocalImport:
+  case WireIncrementalSymbolKind::Absolute:
+  case WireIncrementalSymbolKind::Synthetic:
+    return true;
+  }
+  return false;
+}
+
+static bool isValidWireSectionLayoutKind(uint16_t rawKind) {
+  switch (static_cast<WireIncrementalSectionLayoutKind>(rawKind)) {
+  case WireIncrementalSectionLayoutKind::ExactSectionLayout:
+  case WireIncrementalSectionLayoutKind::TextFreeSlots:
+  case WireIncrementalSectionLayoutKind::ReadOnlyDataFreeSlots:
+  case WireIncrementalSectionLayoutKind::WritableDataFreeSlots:
+  case WireIncrementalSectionLayoutKind::PackedPDataPrefix:
+  case WireIncrementalSectionLayoutKind::PackedXDataPrefix:
+    return true;
+  }
+  return false;
+}
+
+static bool isValidWireSlotState(uint16_t rawState) {
+  switch (static_cast<WireIncrementalSlotState>(rawState)) {
+  case WireIncrementalSlotState::Occupied:
+  case WireIncrementalSlotState::Free:
+    return true;
+  }
+  return false;
+}
+
+static bool isValidWirePlacementKind(uint16_t rawKind) {
+  switch (static_cast<WireIncrementalPlacementKind>(rawKind)) {
+  case WireIncrementalPlacementKind::ExistingSlot:
+  case WireIncrementalPlacementKind::ReusedFreeSlot:
+  case WireIncrementalPlacementKind::TailReserve:
+  case WireIncrementalPlacementKind::PackedPrefix:
+    return true;
+  }
+  return false;
+}
+
+static IncrementalPersistedInputOwner
+decodePersistedInputOwner(uint32_t inputIndex) {
+  if (inputIndex == UINT32_MAX)
+    return IncrementalPersistedInputOwner::make<NoPersistedInputOwner>();
+  return IncrementalPersistedInputOwner::make<PersistedInputOwner>(
+      PersistedInputOwner{inputIndex});
+}
+
+static uint32_t
+encodePersistedInputOwner(const IncrementalPersistedInputOwner &owner) {
+  return owner.match([](const PersistedInputOwner &inputOwner) {
+                       return inputOwner.inputIndex;
+                     },
+                     [](const NoPersistedInputOwner &) { return UINT32_MAX; });
+}
+
+static IncrementalPersistedChunkReference
+decodePersistedChunkReference(StringRef chunkKey) {
+  if (chunkKey.empty())
+    return IncrementalPersistedChunkReference::make<NoPersistedChunkReference>();
+  return IncrementalPersistedChunkReference::make<PersistedChunkReference>(
+      PersistedChunkReference{chunkKey.str()});
+}
+
+static std::string
+encodePersistedChunkReference(const IncrementalPersistedChunkReference &chunk) {
+  return chunk.match(
+      [](const PersistedChunkReference &reference) {
+        return reference.chunkKey;
+      },
+      [](const NoPersistedChunkReference &) { return std::string(); });
+}
+
+static Expected<uint32_t> parseAlignment(StringRef auxiliaryKey,
+                                         StringRef context) {
+  uint32_t alignment = 0;
+  if (!to_integer(auxiliaryKey, alignment))
+    return createStringError(inconvertibleErrorCode(),
+                             "incremental state " + context +
+                                 " alignment is malformed");
+  return alignment;
+}
+
+static Expected<ImportDataResolvedSymbol>
+decodeImportDataSymbol(StringRef name, StringRef auxiliaryKey, uint64_t value) {
+  SmallVector<StringRef, 4> parts;
+  auxiliaryKey.split(parts, '\n');
+  if (parts.size() != 3)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "incremental state import-data symbol payload is malformed");
+  unsigned typeInfo = 0;
+  if (!to_integer(parts[2], typeInfo) || typeInfo > UINT16_MAX)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "incremental state import-data type info is malformed");
+  ImportDataResolvedSymbol symbol;
+  symbol.name = name.str();
+  symbol.ordinal = value;
+  symbol.dllName = parts[0].str();
+  symbol.externalName = parts[1].str();
+  symbol.typeInfo = static_cast<uint16_t>(typeInfo);
+  return symbol;
+}
+
+static std::string encodeImportDataSymbol(const ImportDataResolvedSymbol &symbol) {
+  SmallString<128> buffer;
+  raw_svector_ostream os(buffer);
+  os << symbol.dllName << '\n' << symbol.externalName << '\n'
+     << symbol.typeInfo;
+  return std::string(buffer);
+}
+
+static Expected<IncrementalResolvedSymbolSnapshot>
+decodeResolvedSymbol(const SymbolRecord &record, StringRef name,
+                     StringRef auxiliaryKey) {
+  if (!isValidWireSymbolKind(uint16_t(record.kind)))
+    return createStringError(inconvertibleErrorCode(),
+                             "incremental state file has an invalid symbol kind");
+
+  switch (static_cast<WireIncrementalSymbolKind>(uint16_t(record.kind))) {
+  case WireIncrementalSymbolKind::Regular: {
+    RegularResolvedSymbol symbol{name.str(),
+                                 decodePersistedInputOwner(record.inputIndex),
+                                 record.value,
+                                 decodePersistedChunkReference(auxiliaryKey)};
+    return IncrementalResolvedSymbolSnapshot::make<RegularResolvedSymbol>(
+        std::move(symbol));
+  }
+  case WireIncrementalSymbolKind::Common: {
+    Expected<uint32_t> alignmentOrErr =
+        parseAlignment(auxiliaryKey, "common-symbol");
+    if (!alignmentOrErr)
+      return alignmentOrErr.takeError();
+    CommonResolvedSymbol symbol{name.str(),
+                                decodePersistedInputOwner(record.inputIndex),
+                                record.value, *alignmentOrErr};
+    return IncrementalResolvedSymbolSnapshot::make<CommonResolvedSymbol>(
+        std::move(symbol));
+  }
+  case WireIncrementalSymbolKind::ImportData: {
+    Expected<ImportDataResolvedSymbol> symbolOrErr =
+        decodeImportDataSymbol(name, auxiliaryKey, record.value);
+    if (!symbolOrErr)
+      return symbolOrErr.takeError();
+    return IncrementalResolvedSymbolSnapshot::make<ImportDataResolvedSymbol>(
+        std::move(*symbolOrErr));
+  }
+  case WireIncrementalSymbolKind::ImportThunk: {
+    ImportThunkResolvedSymbol symbol;
+    symbol.name = name.str();
+    symbol.wrappedSymbolName = auxiliaryKey.str();
+    return IncrementalResolvedSymbolSnapshot::make<ImportThunkResolvedSymbol>(
+        std::move(symbol));
+  }
+  case WireIncrementalSymbolKind::LocalImport: {
+    LocalImportResolvedSymbol symbol{name.str(),
+                                     decodePersistedChunkReference(auxiliaryKey)};
+    return IncrementalResolvedSymbolSnapshot::make<LocalImportResolvedSymbol>(
+        std::move(symbol));
+  }
+  case WireIncrementalSymbolKind::Absolute: {
+    AbsoluteResolvedSymbol symbol;
+    symbol.name = name.str();
+    symbol.value = record.value;
+    return IncrementalResolvedSymbolSnapshot::make<AbsoluteResolvedSymbol>(
+        std::move(symbol));
+  }
+  case WireIncrementalSymbolKind::Synthetic: {
+    SyntheticResolvedSymbol symbol{name.str(),
+                                   decodePersistedChunkReference(auxiliaryKey)};
+    return IncrementalResolvedSymbolSnapshot::make<SyntheticResolvedSymbol>(
+        std::move(symbol));
+  }
+  }
+  llvm_unreachable("invalid wire symbol kind");
+}
+
+static void encodeResolvedSymbol(const IncrementalResolvedSymbolSnapshot &symbol,
+                                 SymbolRecord &record,
+                                 StringTableBuilder &strings) {
+  symbol.match(
+      [&](const RegularResolvedSymbol &regular) {
+        record.nameOffset = strings.add(regular.name);
+        record.auxiliaryKeyOffset =
+            strings.add(encodePersistedChunkReference(regular.chunk));
+        record.inputIndex = encodePersistedInputOwner(regular.owner);
+        record.kind = static_cast<uint16_t>(WireIncrementalSymbolKind::Regular);
+        record.value = regular.value;
+      },
+      [&](const CommonResolvedSymbol &common) {
+        record.nameOffset = strings.add(common.name);
+        record.auxiliaryKeyOffset =
+            strings.add(std::to_string(common.alignment));
+        record.inputIndex = encodePersistedInputOwner(common.owner);
+        record.kind = static_cast<uint16_t>(WireIncrementalSymbolKind::Common);
+        record.value = common.size;
+      },
+      [&](const ImportDataResolvedSymbol &importData) {
+        record.nameOffset = strings.add(importData.name);
+        record.auxiliaryKeyOffset = strings.add(encodeImportDataSymbol(importData));
+        record.inputIndex = UINT32_MAX;
+        record.kind = static_cast<uint16_t>(WireIncrementalSymbolKind::ImportData);
+        record.value = importData.ordinal;
+      },
+      [&](const ImportThunkResolvedSymbol &importThunk) {
+        record.nameOffset = strings.add(importThunk.name);
+        record.auxiliaryKeyOffset = strings.add(importThunk.wrappedSymbolName);
+        record.inputIndex = UINT32_MAX;
+        record.kind = static_cast<uint16_t>(WireIncrementalSymbolKind::ImportThunk);
+        record.value = 0;
+      },
+      [&](const LocalImportResolvedSymbol &localImport) {
+        record.nameOffset = strings.add(localImport.name);
+        record.auxiliaryKeyOffset =
+            strings.add(encodePersistedChunkReference(localImport.chunk));
+        record.inputIndex = UINT32_MAX;
+        record.kind = static_cast<uint16_t>(WireIncrementalSymbolKind::LocalImport);
+        record.value = 0;
+      },
+      [&](const AbsoluteResolvedSymbol &absolute) {
+        record.nameOffset = strings.add(absolute.name);
+        record.auxiliaryKeyOffset = 0;
+        record.inputIndex = UINT32_MAX;
+        record.kind = static_cast<uint16_t>(WireIncrementalSymbolKind::Absolute);
+        record.value = absolute.value;
+      },
+      [&](const SyntheticResolvedSymbol &synthetic) {
+        record.nameOffset = strings.add(synthetic.name);
+        record.auxiliaryKeyOffset =
+            strings.add(encodePersistedChunkReference(synthetic.chunk));
+        record.inputIndex = UINT32_MAX;
+        record.kind = static_cast<uint16_t>(WireIncrementalSymbolKind::Synthetic);
+        record.value = 0;
+      });
+}
+
+static Expected<IncrementalChunkSnapshot>
+decodeChunkSnapshot(const ChunkRecord &record, StringRef key) {
+  if (!isValidWireChunkKind(uint16_t(record.kind)))
+    return createStringError(inconvertibleErrorCode(),
+                             "incremental state file has an invalid chunk kind");
+
+  IncrementalChunkState chunk;
+  chunk.key = key.str();
+  chunk.sectionIndex = record.sectionIndex;
+  chunk.outputCharacteristics = record.outputCharacteristics;
+  chunk.alignment = record.alignment;
+  chunk.rva = record.rva;
+  chunk.size = record.size;
+  chunk.slotCapacity = record.slotCapacity;
+
+  switch (static_cast<WireIncrementalChunkKind>(uint16_t(record.kind))) {
+  case WireIncrementalChunkKind::ObjSection: {
+    if (record.inputIndex == UINT32_MAX)
+      return createStringError(
+          inconvertibleErrorCode(),
+          "incremental state obj-section chunk is missing its input index");
+    ObjSectionChunkSnapshot obj;
+    obj.chunk = std::move(chunk);
+    obj.inputIndex = record.inputIndex;
+    obj.sectionNumber = record.sectionNumber;
+    obj.contentHash = record.contentHash;
+    obj.symbolHash = record.symbolHash;
+    return IncrementalChunkSnapshot::make<ObjSectionChunkSnapshot>(
+        std::move(obj));
+  }
+  case WireIncrementalChunkKind::Synthetic:
+    return IncrementalChunkSnapshot::make<SyntheticChunkSnapshot>(
+        SyntheticChunkSnapshot{std::move(chunk)});
+  case WireIncrementalChunkKind::Padding:
+    return IncrementalChunkSnapshot::make<PaddingChunkSnapshot>(
+        PaddingChunkSnapshot{std::move(chunk)});
+  case WireIncrementalChunkKind::EntryRedirect:
+    return IncrementalChunkSnapshot::make<EntryRedirectChunkSnapshot>(
+        EntryRedirectChunkSnapshot{std::move(chunk)});
+  case WireIncrementalChunkKind::LongThunk:
+    return IncrementalChunkSnapshot::make<LongThunkChunkSnapshot>(
+        LongThunkChunkSnapshot{std::move(chunk)});
+  }
+  llvm_unreachable("invalid wire chunk kind");
+}
+
+static void encodeChunkSnapshot(const IncrementalChunkSnapshot &chunk,
+                                ChunkRecord &record,
+                                StringTableBuilder &strings) {
+  const IncrementalChunkState &common = getIncrementalChunkState(chunk);
+  record.keyOffset = strings.add(common.key);
+  record.sectionIndex = common.sectionIndex;
+  record.inputIndex = UINT32_MAX;
+  record.outputCharacteristics = common.outputCharacteristics;
+  record.sectionNumber = 0;
+  record.alignment = common.alignment;
+  record.rva = common.rva;
+  record.size = common.size;
+  record.slotCapacity = common.slotCapacity;
+  record.contentHash = 0;
+  record.symbolHash = 0;
+
+  chunk.match(
+      [&](const ObjSectionChunkSnapshot &obj) {
+        record.kind = static_cast<uint16_t>(WireIncrementalChunkKind::ObjSection);
+        record.inputIndex = obj.inputIndex;
+        record.sectionNumber = obj.sectionNumber;
+        record.contentHash = obj.contentHash;
+        record.symbolHash = obj.symbolHash;
+      },
+      [&](const SyntheticChunkSnapshot &) {
+        record.kind = static_cast<uint16_t>(WireIncrementalChunkKind::Synthetic);
+      },
+      [&](const PaddingChunkSnapshot &) {
+        record.kind = static_cast<uint16_t>(WireIncrementalChunkKind::Padding);
+      },
+      [&](const EntryRedirectChunkSnapshot &) {
+        record.kind =
+            static_cast<uint16_t>(WireIncrementalChunkKind::EntryRedirect);
+      },
+      [&](const LongThunkChunkSnapshot &) {
+        record.kind = static_cast<uint16_t>(WireIncrementalChunkKind::LongThunk);
+      });
+}
+
+struct RawEnvelopeData {
+  IncrementalSectionState section;
+  WireIncrementalSectionLayoutKind layoutKind;
+  uint64_t maxSectionEndRVA = 0;
+  uint64_t activeEndRVA = 0;
+};
+
+static Expected<std::vector<IncrementalInputState>>
+decodeInputs(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header,
+             ArrayRef<uint8_t> strings) {
+  Expected<std::vector<InputRecord>> inputsOrErr =
+      readTable<InputRecord>(bytes, header.inputTableOffset, header.inputCount);
+  if (!inputsOrErr)
+    return inputsOrErr.takeError();
+
+  std::vector<IncrementalInputState> inputs;
+  inputs.reserve(inputsOrErr->size());
+  for (const InputRecord &record : *inputsOrErr) {
+    IncrementalInputState input;
+    Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
+    if (!nameOrErr)
+      return nameOrErr.takeError();
+    Expected<StringRef> parentOrErr = loadString(strings, record.parentOffset);
+    if (!parentOrErr)
+      return parentOrErr.takeError();
+    input.name = nameOrErr->str();
+    input.parentName = parentOrErr->str();
+    input.archiveOffset = record.archiveOffset;
+    input.contentHash = record.contentHash;
+    input.size = record.size;
+    inputs.push_back(std::move(input));
+  }
+  return inputs;
+}
+
+static Expected<std::vector<IncrementalSectionState>>
+decodeSectionRecords(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header,
+                     ArrayRef<uint8_t> strings) {
+  Expected<std::vector<SectionRecord>> sectionsOrErr = readTable<SectionRecord>(
+      bytes, header.sectionTableOffset, header.sectionCount);
+  if (!sectionsOrErr)
+    return sectionsOrErr.takeError();
+
+  std::vector<IncrementalSectionState> sections;
+  sections.reserve(sectionsOrErr->size());
+  for (const SectionRecord &record : *sectionsOrErr) {
+    IncrementalSectionState section;
+    Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
+    if (!nameOrErr)
+      return nameOrErr.takeError();
+    section.name = nameOrErr->str();
+    section.characteristics = record.characteristics;
+    section.rva = record.rva;
+    section.fileOffset = record.fileOffset;
+    section.virtualSize = record.virtualSize;
+    section.rawSize = record.rawSize;
+    section.firstChunk = record.firstChunk;
+    section.chunkCount = record.chunkCount;
+    sections.push_back(std::move(section));
+  }
+  return sections;
+}
+
+static Expected<std::vector<IncrementalChunkSnapshot>>
+decodeChunkRecords(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header,
+                   ArrayRef<uint8_t> strings) {
+  Expected<std::vector<ChunkRecord>> chunksOrErr =
+      readTable<ChunkRecord>(bytes, header.chunkTableOffset, header.chunkCount);
+  if (!chunksOrErr)
+    return chunksOrErr.takeError();
+
+  std::vector<IncrementalChunkSnapshot> chunks;
+  chunks.reserve(chunksOrErr->size());
+  for (const ChunkRecord &record : *chunksOrErr) {
+    Expected<StringRef> keyOrErr = loadString(strings, record.keyOffset);
+    if (!keyOrErr)
+      return keyOrErr.takeError();
+    Expected<IncrementalChunkSnapshot> chunkOrErr =
+        decodeChunkSnapshot(record, *keyOrErr);
+    if (!chunkOrErr)
+      return chunkOrErr.takeError();
+    chunks.push_back(std::move(*chunkOrErr));
+  }
+  return chunks;
+}
+
+static Expected<std::vector<IncrementalResolvedSymbolSnapshot>>
+decodeSymbolRecords(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header,
+                    ArrayRef<uint8_t> strings) {
+  Expected<std::vector<SymbolRecord>> symbolsOrErr =
+      readTable<SymbolRecord>(bytes, header.symbolTableOffset,
+                              header.symbolCount);
+  if (!symbolsOrErr)
+    return symbolsOrErr.takeError();
+
+  std::vector<IncrementalResolvedSymbolSnapshot> symbols;
+  symbols.reserve(symbolsOrErr->size());
+  for (const SymbolRecord &record : *symbolsOrErr) {
+    Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
+    if (!nameOrErr)
+      return nameOrErr.takeError();
+    Expected<StringRef> auxiliaryKeyOrErr =
+        loadString(strings, record.auxiliaryKeyOffset);
+    if (!auxiliaryKeyOrErr)
+      return auxiliaryKeyOrErr.takeError();
+    Expected<IncrementalResolvedSymbolSnapshot> symbolOrErr =
+        decodeResolvedSymbol(record, *nameOrErr, *auxiliaryKeyOrErr);
+    if (!symbolOrErr)
+      return symbolOrErr.takeError();
+    symbols.push_back(std::move(*symbolOrErr));
+  }
+  return symbols;
+}
+
+static Expected<std::vector<RawEnvelopeData>>
+decodeEnvelopeRecords(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header,
+                      ArrayRef<uint8_t> strings) {
+  Expected<std::vector<EnvelopeRecord>> envelopesOrErr =
+      readTable<EnvelopeRecord>(bytes, header.envelopeTableOffset,
+                                header.envelopeCount);
+  if (!envelopesOrErr)
+    return envelopesOrErr.takeError();
+
+  std::vector<RawEnvelopeData> envelopes;
+  envelopes.reserve(envelopesOrErr->size());
+  for (const EnvelopeRecord &record : *envelopesOrErr) {
+    if (!isValidWireSectionLayoutKind(uint16_t(record.layoutKind)))
+      return createStringError(
+          inconvertibleErrorCode(),
+          "incremental state file has an invalid section layout kind");
+    Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
+    if (!nameOrErr)
+      return nameOrErr.takeError();
+    RawEnvelopeData envelope;
+    envelope.section.name = nameOrErr->str();
+    envelope.section.characteristics = record.characteristics;
+    envelope.section.rva = record.sectionRVA;
+    envelope.layoutKind =
+        static_cast<WireIncrementalSectionLayoutKind>(uint16_t(record.layoutKind));
+    envelope.maxSectionEndRVA = record.maxSectionEndRVA;
+    envelope.activeEndRVA = record.activeEndRVA;
+    envelopes.push_back(std::move(envelope));
+  }
+  return envelopes;
+}
+
+static Error
+decodeSlotRecords(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header,
+                  ArrayRef<uint8_t> strings,
+                  SmallVectorImpl<std::vector<IncrementalPreservedSlot>>
+                      &slotsByEnvelope) {
+  Expected<std::vector<SlotRecord>> slotsOrErr =
+      readTable<SlotRecord>(bytes, header.slotTableOffset, header.slotCount);
+  if (!slotsOrErr)
+    return slotsOrErr.takeError();
+
+  for (const SlotRecord &record : *slotsOrErr) {
+    if (!isValidWireSlotState(uint16_t(record.state)))
+      return createStringError(inconvertibleErrorCode(),
+                               "incremental state file has an invalid slot state");
+    if (record.envelopeIndex >= slotsByEnvelope.size())
+      return createStringError(inconvertibleErrorCode(),
+                               "incremental state slot envelope index is invalid");
+
+    Expected<StringRef> occupantKeyOrErr =
+        loadString(strings, record.occupantKeyOffset);
+    if (!occupantKeyOrErr)
+      return occupantKeyOrErr.takeError();
+
+    IncrementalPreservedSlotState slotState;
+    slotState.startRVA = record.startRVA;
+    slotState.capacity = record.capacity;
+    slotState.committedSize = record.committedSize;
+    slotState.minAlignment = record.minAlignment;
+    slotState.fillByte = record.fillByte;
+
+    if (static_cast<WireIncrementalSlotState>(uint16_t(record.state)) ==
+        WireIncrementalSlotState::Free) {
+      slotsByEnvelope[record.envelopeIndex].push_back(
+          IncrementalPreservedSlot::make<FreeSlotRecord>(
+              FreeSlotRecord{slotState}));
+    } else {
+      slotsByEnvelope[record.envelopeIndex].push_back(
+          IncrementalPreservedSlot::make<OccupiedSlotRecord>(
+              OccupiedSlotRecord{slotState, occupantKeyOrErr->str()}));
+    }
+  }
+  return Error::success();
+}
+
+static Error
+decodePackedSections(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header,
+                     ArrayRef<uint8_t> strings,
+                     SmallVectorImpl<std::vector<PackedPrefixChunkPlacement>>
+                         &packedPlacementsByEnvelope,
+                     SmallVectorImpl<uint64_t> &activePrefixSizes,
+                     SmallVectorImpl<uint64_t> &reserveSizes) {
+  Expected<std::vector<PackedKeyRecord>> packedKeysOrErr =
+      readTable<PackedKeyRecord>(bytes, header.packedKeyTableOffset,
+                                 header.packedKeyCount);
+  if (!packedKeysOrErr)
+    return packedKeysOrErr.takeError();
+
+  SmallVector<StringRef, 32> packedKeys;
+  packedKeys.reserve(packedKeysOrErr->size());
+  for (const PackedKeyRecord &record : *packedKeysOrErr) {
+    Expected<StringRef> keyOrErr = loadString(strings, record.keyOffset);
+    if (!keyOrErr)
+      return keyOrErr.takeError();
+    packedKeys.push_back(*keyOrErr);
+  }
+
+  Expected<std::vector<PackedSectionRecord>> packedSectionsOrErr =
+      readTable<PackedSectionRecord>(bytes, header.packedSectionTableOffset,
+                                     header.packedSectionCount);
+  if (!packedSectionsOrErr)
+    return packedSectionsOrErr.takeError();
+
+  for (const PackedSectionRecord &record : *packedSectionsOrErr) {
+    if (record.envelopeIndex >= packedPlacementsByEnvelope.size())
+      return createStringError(
+          inconvertibleErrorCode(),
+          "incremental state packed-section envelope index is invalid");
+    if (record.firstRecordKey > packedKeys.size() ||
+        packedKeys.size() - record.firstRecordKey < record.recordKeyCount)
+      return createStringError(inconvertibleErrorCode(),
+                               "incremental packed section key range is invalid");
+
+    activePrefixSizes[record.envelopeIndex] = record.activePrefixSize;
+    reserveSizes[record.envelopeIndex] = record.reserveSize;
+    for (StringRef key :
+         ArrayRef<StringRef>(packedKeys).slice(record.firstRecordKey,
+                                               record.recordKeyCount)) {
+      packedPlacementsByEnvelope[record.envelopeIndex].push_back(
+          PackedPrefixChunkPlacement{key.str(), 0, 0, 1});
+    }
+  }
+  return Error::success();
+}
+
+static Error
+decodePlacementRecords(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header,
+                       ArrayRef<uint8_t> strings,
+                       SmallVectorImpl<std::vector<ExistingSlotChunkPlacement>>
+                           &slotPlacementsByEnvelope,
+                       SmallVectorImpl<std::vector<PackedPrefixChunkPlacement>>
+                           &packedPlacementsByEnvelope) {
+  Expected<std::vector<PlacementRecord>> placementsOrErr =
+      readTable<PlacementRecord>(bytes, header.placementTableOffset,
+                                 header.placementCount);
+  if (!placementsOrErr)
+    return placementsOrErr.takeError();
+
+  for (const PlacementRecord &record : *placementsOrErr) {
+    if (!isValidWirePlacementKind(uint16_t(record.kind)))
+      return createStringError(
+          inconvertibleErrorCode(),
+          "incremental state file has an invalid placement kind");
+    if (record.envelopeIndex >= slotPlacementsByEnvelope.size() ||
+        record.envelopeIndex >= packedPlacementsByEnvelope.size())
+      return createStringError(inconvertibleErrorCode(),
+                               "incremental state placement envelope index is invalid");
+
+    Expected<StringRef> keyOrErr = loadString(strings, record.keyOffset);
+    if (!keyOrErr)
+      return keyOrErr.takeError();
+
+    switch (static_cast<WireIncrementalPlacementKind>(uint16_t(record.kind))) {
+    case WireIncrementalPlacementKind::ExistingSlot:
+      slotPlacementsByEnvelope[record.envelopeIndex].push_back(
+          ExistingSlotChunkPlacement{keyOrErr->str(), record.startRVA, record.size,
+                                     record.alignment});
+      break;
+    case WireIncrementalPlacementKind::PackedPrefix: {
+      auto &packedPlacements = packedPlacementsByEnvelope[record.envelopeIndex];
+      auto it = llvm::find_if(packedPlacements, [&](const auto &placement) {
+        return placement.key == *keyOrErr;
+      });
+      if (it == packedPlacements.end())
+        packedPlacements.push_back(PackedPrefixChunkPlacement{
+            keyOrErr->str(), record.startRVA, record.size, record.alignment});
+      else {
+        it->startRVA = record.startRVA;
+        it->size = record.size;
+        it->alignment = record.alignment;
+      }
+      break;
+    }
+    case WireIncrementalPlacementKind::ReusedFreeSlot:
+    case WireIncrementalPlacementKind::TailReserve:
+      return createStringError(
+          inconvertibleErrorCode(),
+          "incremental state file contains unsupported persisted placement");
+    }
+  }
+  return Error::success();
+}
+
+static Expected<std::vector<IncrementalTextRedirectState>>
+decodeRedirectRecords(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header,
+                      ArrayRef<uint8_t> strings) {
+  Expected<std::vector<RedirectRecord>> redirectsOrErr =
+      readTable<RedirectRecord>(bytes, header.redirectTableOffset,
+                                header.redirectCount);
+  if (!redirectsOrErr)
+    return redirectsOrErr.takeError();
+
+  std::vector<IncrementalTextRedirectState> redirects;
+  redirects.reserve(redirectsOrErr->size());
+  for (const RedirectRecord &record : *redirectsOrErr) {
+    Expected<StringRef> keyOrErr = loadString(strings, record.targetKeyOffset);
+    if (!keyOrErr)
+      return keyOrErr.takeError();
+    Expected<StringRef> symbolOrErr =
+        loadString(strings, record.canonicalSymbolOffset);
+    if (!symbolOrErr)
+      return symbolOrErr.takeError();
+    redirects.push_back(IncrementalTextRedirectState{
+        keyOrErr->str(),         symbolOrErr->str(), record.redirectRVA,
+        record.redirectCapacity, record.bodyRVA,     record.poolThunkRVA});
+  }
+  return redirects;
+}
+
+static Expected<IncrementalTextThunkPoolState>
+decodeThunkPool(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header) {
+  IncrementalTextThunkPoolState pool;
+  Expected<std::vector<PoolStateRecord>> poolOrErr =
+      readTable<PoolStateRecord>(bytes, header.poolStateOffset,
+                                 header.poolStateCount);
+  if (!poolOrErr)
+    return poolOrErr.takeError();
+  if (!poolOrErr->empty()) {
+    pool.poolStartRVA = (*poolOrErr)[0].poolStartRVA;
+    pool.poolEndRVA = (*poolOrErr)[0].poolEndRVA;
+    pool.nextFreeRVA = (*poolOrErr)[0].nextFreeRVA;
+  }
+  return pool;
+}
+
+static Expected<IncrementalBaselineSnapshot>
+loadIncrementalStateCurrent(ArrayRef<uint8_t> bytes, const FileHeaderV5 &header) {
+  if (static_cast<WireIncrementalLayoutMode>(uint16_t(header.layoutMode)) !=
+      WireIncrementalLayoutMode::Slotted)
+    return createStringError(inconvertibleErrorCode(),
+                             "incremental state file is not slotted");
+
   if (header.stringTableOffset > bytes.size() ||
       header.stringTableSize > bytes.size() - header.stringTableOffset)
     return createStringError(inconvertibleErrorCode(),
@@ -258,9 +973,7 @@ loadCommonState(ArrayRef<uint8_t> bytes, const HeaderT &header,
   ArrayRef<uint8_t> strings =
       bytes.slice(header.stringTableOffset, header.stringTableSize);
 
-  IncrementalStateFile state;
-  state.version = header.version;
-  state.layoutMode = layoutMode;
+  IncrementalBaselineSnapshot state;
   state.machine =
       static_cast<llvm::COFF::MachineTypes>(uint16_t(header.machine));
   state.outputHash = header.outputHash;
@@ -279,267 +992,181 @@ loadCommonState(ArrayRef<uint8_t> bytes, const HeaderT &header,
     return outputPathOrErr.takeError();
   state.outputPath = outputPathOrErr->str();
 
-  Expected<std::vector<InputRecord>> inputsOrErr =
-      readTable<InputRecord>(bytes, header.inputTableOffset, header.inputCount);
+  Expected<std::vector<IncrementalInputState>> inputsOrErr =
+      decodeInputs(bytes, header, strings);
   if (!inputsOrErr)
     return inputsOrErr.takeError();
-  state.inputs.reserve(inputsOrErr->size());
-  for (const InputRecord &record : *inputsOrErr) {
-    IncrementalInputState input;
-    Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
-    if (!nameOrErr)
-      return nameOrErr.takeError();
-    Expected<StringRef> parentOrErr = loadString(strings, record.parentOffset);
-    if (!parentOrErr)
-      return parentOrErr.takeError();
-    input.name = nameOrErr->str();
-    input.parentName = parentOrErr->str();
-    input.archiveOffset = record.archiveOffset;
-    input.contentHash = record.contentHash;
-    input.size = record.size;
-    state.inputs.push_back(std::move(input));
-  }
+  state.inputs = std::move(*inputsOrErr);
 
-  Expected<std::vector<SectionRecord>> sectionsOrErr = readTable<SectionRecord>(
-      bytes, header.sectionTableOffset, header.sectionCount);
-  if (!sectionsOrErr)
-    return sectionsOrErr.takeError();
-  state.sections.reserve(sectionsOrErr->size());
-  for (const SectionRecord &record : *sectionsOrErr) {
-    IncrementalSectionState section;
-    Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
-    if (!nameOrErr)
-      return nameOrErr.takeError();
-    section.name = nameOrErr->str();
-    section.characteristics = record.characteristics;
-    section.rva = record.rva;
-    section.fileOffset = record.fileOffset;
-    section.virtualSize = record.virtualSize;
-    section.rawSize = record.rawSize;
-    section.firstChunk = record.firstChunk;
-    section.chunkCount = record.chunkCount;
-    state.sections.push_back(std::move(section));
-  }
+  Expected<std::vector<IncrementalSectionState>> sectionStatesOrErr =
+      decodeSectionRecords(bytes, header, strings);
+  if (!sectionStatesOrErr)
+    return sectionStatesOrErr.takeError();
 
-  Expected<std::vector<ChunkRecord>> chunksOrErr =
-      readTable<ChunkRecord>(bytes, header.chunkTableOffset, header.chunkCount);
+  Expected<std::vector<IncrementalChunkSnapshot>> chunksOrErr =
+      decodeChunkRecords(bytes, header, strings);
   if (!chunksOrErr)
     return chunksOrErr.takeError();
-  state.chunks.reserve(chunksOrErr->size());
-  for (const ChunkRecord &record : *chunksOrErr) {
-    IncrementalChunkState chunk;
-    Expected<StringRef> keyOrErr = loadString(strings, record.keyOffset);
-    if (!keyOrErr)
-      return keyOrErr.takeError();
-    chunk.kind = static_cast<IncrementalChunkKind>(uint16_t(record.kind));
-    chunk.key = keyOrErr->str();
-    chunk.sectionIndex = record.sectionIndex;
-    chunk.inputIndex = record.inputIndex;
-    chunk.outputCharacteristics = record.outputCharacteristics;
-    chunk.sectionNumber = record.sectionNumber;
-    chunk.alignment = record.alignment;
-    chunk.rva = record.rva;
-    chunk.size = record.size;
-    chunk.slotCapacity = record.slotCapacity;
-    chunk.contentHash = record.contentHash;
-    chunk.symbolHash = record.symbolHash;
-    state.chunks.push_back(std::move(chunk));
-  }
+  state.chunks = std::move(*chunksOrErr);
 
-  Expected<std::vector<SymbolRecord>> symbolsOrErr =
-      readTable<SymbolRecord>(bytes, header.symbolTableOffset,
-                              header.symbolCount);
+  Expected<std::vector<IncrementalResolvedSymbolSnapshot>> symbolsOrErr =
+      decodeSymbolRecords(bytes, header, strings);
   if (!symbolsOrErr)
     return symbolsOrErr.takeError();
-  state.symbols.reserve(symbolsOrErr->size());
-  for (const SymbolRecord &record : *symbolsOrErr) {
-    IncrementalSymbolState symbol;
-    Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
-    if (!nameOrErr)
-      return nameOrErr.takeError();
-    Expected<StringRef> keyOrErr =
-        loadString(strings, record.auxiliaryKeyOffset);
-    if (!keyOrErr)
-      return keyOrErr.takeError();
-    symbol.name = nameOrErr->str();
-    symbol.auxiliaryKey = keyOrErr->str();
-    symbol.kind = static_cast<IncrementalSymbolKind>(uint16_t(record.kind));
-    symbol.inputIndex = record.inputIndex;
-    symbol.value = record.value;
-    state.symbols.push_back(std::move(symbol));
-  }
+  state.symbols = std::move(*symbolsOrErr);
 
-  return state;
-}
+  Expected<std::vector<RawEnvelopeData>> envelopesOrErr =
+      decodeEnvelopeRecords(bytes, header, strings);
+  if (!envelopesOrErr)
+    return envelopesOrErr.takeError();
+  const std::vector<RawEnvelopeData> &envelopes = *envelopesOrErr;
 
-Expected<IncrementalStateFile> loadIncrementalStateCurrent(
-    ArrayRef<uint8_t> bytes, const FileHeaderV5 &header) {
-  Expected<IncrementalStateFile> stateOrErr =
-      loadCommonState(bytes, header,
-                      static_cast<IncrementalLayoutMode>(
-                          uint16_t(header.layoutMode)));
-  if (!stateOrErr)
-    return stateOrErr.takeError();
+  SmallVector<std::vector<IncrementalPreservedSlot>, 8> slotsByEnvelope(
+      envelopes.size());
+  if (Error err = decodeSlotRecords(bytes, header, strings, slotsByEnvelope))
+    return std::move(err);
 
-  IncrementalStateFile state = std::move(*stateOrErr);
-  if (state.layoutMode != IncrementalLayoutMode::Exact &&
-      state.layoutMode != IncrementalLayoutMode::Slotted)
-    return createStringError(inconvertibleErrorCode(),
-                             "incremental state file has an invalid layout mode");
+  SmallVector<std::vector<ExistingSlotChunkPlacement>, 8> slotPlacementsByEnvelope(
+      envelopes.size());
+  SmallVector<std::vector<PackedPrefixChunkPlacement>, 8>
+      packedPlacementsByEnvelope(envelopes.size());
+  SmallVector<uint64_t, 8> activePrefixSizes(envelopes.size(), 0);
+  SmallVector<uint64_t, 8> reserveSizes(envelopes.size(), 0);
+  if (Error err = decodePackedSections(bytes, header, strings,
+                                       packedPlacementsByEnvelope,
+                                       activePrefixSizes, reserveSizes))
+    return std::move(err);
+  if (Error err = decodePlacementRecords(bytes, header, strings,
+                                         slotPlacementsByEnvelope,
+                                         packedPlacementsByEnvelope))
+    return std::move(err);
 
-  ArrayRef<uint8_t> strings =
-      bytes.slice(header.stringTableOffset, header.stringTableSize);
+  Expected<std::vector<IncrementalTextRedirectState>> redirectsOrErr =
+      decodeRedirectRecords(bytes, header, strings);
+  if (!redirectsOrErr)
+    return redirectsOrErr.takeError();
+  Expected<IncrementalTextThunkPoolState> thunkPoolOrErr =
+      decodeThunkPool(bytes, header);
+  if (!thunkPoolOrErr)
+    return thunkPoolOrErr.takeError();
 
-  if (header.envelopeCount != 0) {
-    Expected<std::vector<EnvelopeRecord>> envelopesOrErr =
-        readTable<EnvelopeRecord>(bytes, header.envelopeTableOffset,
-                                  header.envelopeCount);
-    if (!envelopesOrErr)
-      return envelopesOrErr.takeError();
-    state.sectionEnvelopes.reserve(envelopesOrErr->size());
-    for (const EnvelopeRecord &record : *envelopesOrErr) {
-      if (!isValidIncrementalSectionLayoutKind(uint16_t(record.layoutKind)))
-        return createStringError(
-            inconvertibleErrorCode(),
-            "incremental state file has an invalid section layout kind");
+  SmallVector<bool, 8> usedEnvelopes(envelopes.size(), false);
+  bool assignedTextRedirectState = false;
+  state.sections.reserve(sectionStatesOrErr->size());
+  for (const IncrementalSectionState &sectionState : *sectionStatesOrErr) {
+    ssize_t matchedEnvelopeIndex = -1;
+    for (size_t i = 0; i < envelopes.size(); ++i) {
+      if (usedEnvelopes[i])
+        continue;
+      if (envelopes[i].section.name == sectionState.name &&
+          envelopes[i].section.characteristics == sectionState.characteristics) {
+        matchedEnvelopeIndex = static_cast<ssize_t>(i);
+        break;
+      }
+    }
 
-      IncrementalSectionEnvelopeState envelope;
-      Expected<StringRef> nameOrErr = loadString(strings, record.nameOffset);
-      if (!nameOrErr)
-        return nameOrErr.takeError();
-      envelope.name = nameOrErr->str();
-      envelope.characteristics = record.characteristics;
-      envelope.sectionRVA = record.sectionRVA;
-      envelope.maxSectionEndRVA = record.maxSectionEndRVA;
-      envelope.activeEndRVA = record.activeEndRVA;
-      envelope.layoutKind =
-          static_cast<IncrementalSectionLayoutKind>(uint16_t(record.layoutKind));
-      state.sectionEnvelopes.push_back(std::move(envelope));
+    if (matchedEnvelopeIndex < 0) {
+      state.sections.push_back(
+          IncrementalSectionSnapshot::make<ExactSectionSnapshot>(
+              ExactSectionSnapshot{sectionState}));
+      continue;
+    }
+
+    const RawEnvelopeData &envelope = envelopes[matchedEnvelopeIndex];
+    usedEnvelopes[matchedEnvelopeIndex] = true;
+    switch (envelope.layoutKind) {
+    case WireIncrementalSectionLayoutKind::ExactSectionLayout:
+      state.sections.push_back(
+          IncrementalSectionSnapshot::make<ExactSectionSnapshot>(
+              ExactSectionSnapshot{sectionState}));
+      break;
+    case WireIncrementalSectionLayoutKind::TextFreeSlots: {
+      TextSlotSectionSnapshot text;
+      text.slotSection.section = sectionState;
+      text.slotSection.maxSectionEndRVA = envelope.maxSectionEndRVA;
+      text.slotSection.activeEndRVA = envelope.activeEndRVA;
+      text.slotSection.slots = std::move(slotsByEnvelope[matchedEnvelopeIndex]);
+      text.slotSection.preservedChunks =
+          std::move(slotPlacementsByEnvelope[matchedEnvelopeIndex]);
+      text.redirects = std::move(*redirectsOrErr);
+      text.thunkPool = *thunkPoolOrErr;
+      assignedTextRedirectState = true;
+      state.sections.push_back(
+          IncrementalSectionSnapshot::make<TextSlotSectionSnapshot>(
+              std::move(text)));
+      break;
+    }
+    case WireIncrementalSectionLayoutKind::ReadOnlyDataFreeSlots: {
+      ReadOnlySlotSectionSnapshot rdata;
+      rdata.slotSection.section = sectionState;
+      rdata.slotSection.maxSectionEndRVA = envelope.maxSectionEndRVA;
+      rdata.slotSection.activeEndRVA = envelope.activeEndRVA;
+      rdata.slotSection.slots = std::move(slotsByEnvelope[matchedEnvelopeIndex]);
+      rdata.slotSection.preservedChunks =
+          std::move(slotPlacementsByEnvelope[matchedEnvelopeIndex]);
+      state.sections.push_back(
+          IncrementalSectionSnapshot::make<ReadOnlySlotSectionSnapshot>(
+              std::move(rdata)));
+      break;
+    }
+    case WireIncrementalSectionLayoutKind::WritableDataFreeSlots: {
+      WritableSlotSectionSnapshot data;
+      data.slotSection.section = sectionState;
+      data.slotSection.maxSectionEndRVA = envelope.maxSectionEndRVA;
+      data.slotSection.activeEndRVA = envelope.activeEndRVA;
+      data.slotSection.slots = std::move(slotsByEnvelope[matchedEnvelopeIndex]);
+      data.slotSection.preservedChunks =
+          std::move(slotPlacementsByEnvelope[matchedEnvelopeIndex]);
+      state.sections.push_back(
+          IncrementalSectionSnapshot::make<WritableSlotSectionSnapshot>(
+              std::move(data)));
+      break;
+    }
+    case WireIncrementalSectionLayoutKind::PackedPDataPrefix: {
+      PDataPackedPrefixSectionSnapshot pdata;
+      pdata.packedSection.section = sectionState;
+      pdata.packedSection.activePrefixSize =
+          activePrefixSizes[matchedEnvelopeIndex];
+      pdata.packedSection.reserveSize = reserveSizes[matchedEnvelopeIndex];
+      pdata.packedSection.members =
+          std::move(packedPlacementsByEnvelope[matchedEnvelopeIndex]);
+      state.sections.push_back(
+          IncrementalSectionSnapshot::make<PDataPackedPrefixSectionSnapshot>(
+              std::move(pdata)));
+      break;
+    }
+    case WireIncrementalSectionLayoutKind::PackedXDataPrefix: {
+      XDataPackedPrefixSectionSnapshot xdata;
+      xdata.packedSection.section = sectionState;
+      xdata.packedSection.activePrefixSize =
+          activePrefixSizes[matchedEnvelopeIndex];
+      xdata.packedSection.reserveSize = reserveSizes[matchedEnvelopeIndex];
+      xdata.packedSection.members =
+          std::move(packedPlacementsByEnvelope[matchedEnvelopeIndex]);
+      state.sections.push_back(
+          IncrementalSectionSnapshot::make<XDataPackedPrefixSectionSnapshot>(
+              std::move(xdata)));
+      break;
+    }
     }
   }
 
-  if (header.slotCount != 0) {
-    Expected<std::vector<SlotRecord>> slotsOrErr =
-        readTable<SlotRecord>(bytes, header.slotTableOffset, header.slotCount);
-    if (!slotsOrErr)
-      return slotsOrErr.takeError();
-    state.slotRecords.reserve(slotsOrErr->size());
-    for (const SlotRecord &record : *slotsOrErr) {
-      IncrementalSlotRecordState slot;
-      Expected<StringRef> keyOrErr =
-          loadString(strings, record.occupantKeyOffset);
-      if (!keyOrErr)
-        return keyOrErr.takeError();
-      slot.envelopeIndex = record.envelopeIndex;
-      slot.startRVA = record.startRVA;
-      slot.capacity = record.capacity;
-      slot.committedSize = record.committedSize;
-      slot.minAlignment = record.minAlignment;
-      slot.fillByte = record.fillByte;
-      slot.state = static_cast<IncrementalSlotState>(uint16_t(record.state));
-      slot.occupantKey = keyOrErr->str();
-      state.slotRecords.push_back(std::move(slot));
-    }
-  }
+  if (!redirectsOrErr->empty() && !assignedTextRedirectState)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "incremental state redirect table does not have a text slot section");
+  if ((thunkPoolOrErr->poolStartRVA != 0 || thunkPoolOrErr->poolEndRVA != 0 ||
+       thunkPoolOrErr->nextFreeRVA != 0) &&
+      !assignedTextRedirectState)
+    return createStringError(
+        inconvertibleErrorCode(),
+        "incremental state thunk pool does not have a text slot section");
 
-  SmallVector<StringRef, 32> packedKeys;
-  if (header.packedKeyCount != 0) {
-    Expected<std::vector<PackedKeyRecord>> packedKeysOrErr =
-        readTable<PackedKeyRecord>(bytes, header.packedKeyTableOffset,
-                                   header.packedKeyCount);
-    if (!packedKeysOrErr)
-      return packedKeysOrErr.takeError();
-    packedKeys.reserve(packedKeysOrErr->size());
-    for (const PackedKeyRecord &record : *packedKeysOrErr) {
-      Expected<StringRef> keyOrErr = loadString(strings, record.keyOffset);
-      if (!keyOrErr)
-        return keyOrErr.takeError();
-      packedKeys.push_back(*keyOrErr);
-    }
-  }
-
-  if (header.packedSectionCount != 0) {
-    Expected<std::vector<PackedSectionRecord>> packedSectionsOrErr =
-        readTable<PackedSectionRecord>(bytes, header.packedSectionTableOffset,
-                                       header.packedSectionCount);
-    if (!packedSectionsOrErr)
-      return packedSectionsOrErr.takeError();
-    state.packedSections.reserve(packedSectionsOrErr->size());
-    for (const PackedSectionRecord &record : *packedSectionsOrErr) {
-      if (record.firstRecordKey > packedKeys.size() ||
-          packedKeys.size() - record.firstRecordKey < record.recordKeyCount)
-        return createStringError(inconvertibleErrorCode(),
-                                 "incremental packed section key range is invalid");
-      IncrementalPackedSectionState packedSection;
-      packedSection.envelopeIndex = record.envelopeIndex;
-      packedSection.activePrefixSize = record.activePrefixSize;
-      packedSection.reserveSize = record.reserveSize;
-      packedSection.recordKeys.reserve(record.recordKeyCount);
-      for (StringRef key : ArrayRef<StringRef>(packedKeys).slice(
-               record.firstRecordKey, record.recordKeyCount))
-        packedSection.recordKeys.push_back(key.str());
-      state.packedSections.push_back(std::move(packedSection));
-    }
-  }
-
-  if (header.placementCount != 0) {
-    Expected<std::vector<PlacementRecord>> placementsOrErr =
-        readTable<PlacementRecord>(bytes, header.placementTableOffset,
-                                   header.placementCount);
-    if (!placementsOrErr)
-      return placementsOrErr.takeError();
-    state.placements.reserve(placementsOrErr->size());
-    for (const PlacementRecord &record : *placementsOrErr) {
-      IncrementalPlacementState placement;
-      Expected<StringRef> keyOrErr = loadString(strings, record.keyOffset);
-      if (!keyOrErr)
-        return keyOrErr.takeError();
-      placement.key = keyOrErr->str();
-      placement.envelopeIndex = record.envelopeIndex;
-      placement.kind =
-          static_cast<IncrementalPlacementKind>(uint16_t(record.kind));
-      placement.startRVA = record.startRVA;
-      placement.size = record.size;
-      placement.alignment = record.alignment;
-      state.placements.push_back(std::move(placement));
-    }
-  }
-
-  if (header.redirectCount != 0) {
-    Expected<std::vector<RedirectRecord>> redirectsOrErr = readTable<RedirectRecord>(
-        bytes, header.redirectTableOffset, header.redirectCount);
-    if (!redirectsOrErr)
-      return redirectsOrErr.takeError();
-    state.textRedirects.reserve(redirectsOrErr->size());
-    for (const RedirectRecord &record : *redirectsOrErr) {
-      IncrementalTextRedirectState redirect;
-      Expected<StringRef> keyOrErr = loadString(strings, record.targetKeyOffset);
-      if (!keyOrErr)
-        return keyOrErr.takeError();
-      Expected<StringRef> symbolOrErr =
-          loadString(strings, record.canonicalSymbolOffset);
-      if (!symbolOrErr)
-        return symbolOrErr.takeError();
-      redirect.targetKey = keyOrErr->str();
-      redirect.canonicalSymbol = symbolOrErr->str();
-      redirect.redirectRVA = record.redirectRVA;
-      redirect.redirectCapacity = record.redirectCapacity;
-      redirect.bodyRVA = record.bodyRVA;
-      redirect.poolThunkRVA = record.poolThunkRVA;
-      state.textRedirects.push_back(std::move(redirect));
-    }
-  }
-
-  if (header.poolStateCount != 0) {
-    Expected<std::vector<PoolStateRecord>> poolOrErr = readTable<PoolStateRecord>(
-        bytes, header.poolStateOffset, header.poolStateCount);
-    if (!poolOrErr)
-      return poolOrErr.takeError();
-    if (!poolOrErr->empty()) {
-      state.textThunkPool.poolStartRVA = (*poolOrErr)[0].poolStartRVA;
-      state.textThunkPool.poolEndRVA = (*poolOrErr)[0].poolEndRVA;
-      state.textThunkPool.nextFreeRVA = (*poolOrErr)[0].nextFreeRVA;
-    }
+  for (size_t i = 0; i < envelopes.size(); ++i) {
+    if (!usedEnvelopes[i])
+      return createStringError(
+          inconvertibleErrorCode(),
+          "incremental state contains an orphan section envelope");
   }
 
   return state;
@@ -547,7 +1174,7 @@ Expected<IncrementalStateFile> loadIncrementalStateCurrent(
 
 } // namespace
 
-Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
+Expected<IncrementalBaselineSnapshot> loadIncrementalState(StringRef path) {
   ErrorOr<std::unique_ptr<MemoryBuffer>> buffer = MemoryBuffer::getFile(
       path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
   if (!buffer)
@@ -563,20 +1190,20 @@ Expected<IncrementalStateFile> loadIncrementalState(StringRef path) {
   if (memcmp(headerOrErr->magic, stateMagic, sizeof(stateMagic)) != 0)
     return createStringError(inconvertibleErrorCode(),
                              "incremental state file has an invalid magic");
-
   if (uint32_t(headerOrErr->version) != currentStateVersion)
     return createStringError(inconvertibleErrorCode(),
                              "incremental state file has an unsupported version");
   return loadIncrementalStateCurrent(bytes, *headerOrErr);
 }
 
-Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
+Error writeIncrementalState(StringRef path,
+                            const IncrementalBaselineSnapshot &state) {
   FileHeaderV5 header = {};
   memcpy(header.magic, stateMagic, sizeof(stateMagic));
   header.version = currentStateVersion;
   header.machine = state.machine;
   header.flags = 0;
-  header.layoutMode = static_cast<uint16_t>(state.layoutMode);
+  header.layoutMode = static_cast<uint16_t>(WireIncrementalLayoutMode::Slotted);
   header.outputHash = state.outputHash;
   header.outputSize = state.outputSize;
   header.hardConfigHash = state.hardConfigHash;
@@ -614,121 +1241,290 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
   }
 
   sectionRecords.reserve(state.sections.size());
-  for (const IncrementalSectionState &section : state.sections) {
-    SectionRecord record = {};
-    record.nameOffset = strings.add(section.name);
-    record.characteristics = section.characteristics;
-    record.rva = section.rva;
-    record.fileOffset = section.fileOffset;
-    record.virtualSize = section.virtualSize;
-    record.rawSize = section.rawSize;
-    record.firstChunk = section.firstChunk;
-    record.chunkCount = section.chunkCount;
-    sectionRecords.push_back(record);
+  bool sawTextThunkPool = false;
+  for (const IncrementalSectionSnapshot &section : state.sections) {
+    SectionRecord sectionRecord = {};
+    const IncrementalSectionState &common = getIncrementalSectionState(section);
+    sectionRecord.nameOffset = strings.add(common.name);
+    sectionRecord.characteristics = common.characteristics;
+    sectionRecord.rva = common.rva;
+    sectionRecord.fileOffset = common.fileOffset;
+    sectionRecord.virtualSize = common.virtualSize;
+    sectionRecord.rawSize = common.rawSize;
+    sectionRecord.firstChunk = common.firstChunk;
+    sectionRecord.chunkCount = common.chunkCount;
+    sectionRecords.push_back(sectionRecord);
+
+    section.match(
+        [&](const ExactSectionSnapshot &) {},
+        [&](const TextSlotSectionSnapshot &text) {
+          EnvelopeRecord envelope = {};
+          envelope.nameOffset = strings.add(common.name);
+          envelope.characteristics = common.characteristics;
+          envelope.layoutKind =
+              static_cast<uint16_t>(WireIncrementalSectionLayoutKind::TextFreeSlots);
+          envelope.sectionRVA = common.rva;
+          envelope.maxSectionEndRVA = text.slotSection.maxSectionEndRVA;
+          envelope.activeEndRVA = text.slotSection.activeEndRVA;
+          uint32_t envelopeIndex = envelopeRecords.size();
+          envelopeRecords.push_back(envelope);
+
+          for (const IncrementalPreservedSlot &slot : text.slotSection.slots) {
+            SlotRecord slotRecord = {};
+            const IncrementalPreservedSlotState &slotState =
+                getIncrementalPreservedSlotState(slot);
+            slotRecord.occupantKeyOffset = strings.add(slot.match(
+                [](const FreeSlotRecord &) { return std::string(); },
+                [](const OccupiedSlotRecord &occupied) {
+                  return occupied.occupantKey;
+                }));
+            slotRecord.envelopeIndex = envelopeIndex;
+            slotRecord.minAlignment = slotState.minAlignment;
+            slotRecord.state = slot.match(
+                [](const FreeSlotRecord &) {
+                  return static_cast<uint16_t>(WireIncrementalSlotState::Free);
+                },
+                [](const OccupiedSlotRecord &) {
+                  return static_cast<uint16_t>(
+                      WireIncrementalSlotState::Occupied);
+                });
+            slotRecord.fillByte = slotState.fillByte;
+            slotRecord.startRVA = slotState.startRVA;
+            slotRecord.capacity = slotState.capacity;
+            slotRecord.committedSize = slotState.committedSize;
+            slotRecords.push_back(slotRecord);
+          }
+
+          for (const ExistingSlotChunkPlacement &placement :
+               text.slotSection.preservedChunks) {
+            PlacementRecord placementRecord = {};
+            placementRecord.keyOffset = strings.add(placement.key);
+            placementRecord.envelopeIndex = envelopeIndex;
+            placementRecord.alignment = placement.alignment;
+            placementRecord.kind = static_cast<uint16_t>(
+                WireIncrementalPlacementKind::ExistingSlot);
+            placementRecord.startRVA = placement.startRVA;
+            placementRecord.size = placement.size;
+            placementRecords.push_back(placementRecord);
+          }
+
+          for (const IncrementalTextRedirectState &redirect : text.redirects) {
+            RedirectRecord redirectRecord = {};
+            redirectRecord.targetKeyOffset = strings.add(redirect.targetKey);
+            redirectRecord.canonicalSymbolOffset =
+                strings.add(redirect.canonicalSymbol);
+            redirectRecord.redirectRVA = redirect.redirectRVA;
+            redirectRecord.redirectCapacity = redirect.redirectCapacity;
+            redirectRecord.bodyRVA = redirect.bodyRVA;
+            redirectRecord.poolThunkRVA = redirect.poolThunkRVA;
+            redirectRecords.push_back(redirectRecord);
+          }
+
+          if (text.thunkPool.poolStartRVA != 0 || text.thunkPool.poolEndRVA != 0 ||
+              text.thunkPool.nextFreeRVA != 0) {
+            if (sawTextThunkPool)
+              report_fatal_error(
+                  "incremental state snapshot contains multiple text thunk pools");
+            sawTextThunkPool = true;
+            PoolStateRecord poolRecord = {};
+            poolRecord.poolStartRVA = text.thunkPool.poolStartRVA;
+            poolRecord.poolEndRVA = text.thunkPool.poolEndRVA;
+            poolRecord.nextFreeRVA = text.thunkPool.nextFreeRVA;
+            poolStateRecords.push_back(poolRecord);
+          }
+        },
+        [&](const ReadOnlySlotSectionSnapshot &rdata) {
+          EnvelopeRecord envelope = {};
+          envelope.nameOffset = strings.add(common.name);
+          envelope.characteristics = common.characteristics;
+          envelope.layoutKind = static_cast<uint16_t>(
+              WireIncrementalSectionLayoutKind::ReadOnlyDataFreeSlots);
+          envelope.sectionRVA = common.rva;
+          envelope.maxSectionEndRVA = rdata.slotSection.maxSectionEndRVA;
+          envelope.activeEndRVA = rdata.slotSection.activeEndRVA;
+          uint32_t envelopeIndex = envelopeRecords.size();
+          envelopeRecords.push_back(envelope);
+
+          for (const IncrementalPreservedSlot &slot : rdata.slotSection.slots) {
+            SlotRecord slotRecord = {};
+            const IncrementalPreservedSlotState &slotState =
+                getIncrementalPreservedSlotState(slot);
+            slotRecord.occupantKeyOffset = strings.add(slot.match(
+                [](const FreeSlotRecord &) { return std::string(); },
+                [](const OccupiedSlotRecord &occupied) {
+                  return occupied.occupantKey;
+                }));
+            slotRecord.envelopeIndex = envelopeIndex;
+            slotRecord.minAlignment = slotState.minAlignment;
+            slotRecord.state = slot.match(
+                [](const FreeSlotRecord &) {
+                  return static_cast<uint16_t>(WireIncrementalSlotState::Free);
+                },
+                [](const OccupiedSlotRecord &) {
+                  return static_cast<uint16_t>(
+                      WireIncrementalSlotState::Occupied);
+                });
+            slotRecord.fillByte = slotState.fillByte;
+            slotRecord.startRVA = slotState.startRVA;
+            slotRecord.capacity = slotState.capacity;
+            slotRecord.committedSize = slotState.committedSize;
+            slotRecords.push_back(slotRecord);
+          }
+
+          for (const ExistingSlotChunkPlacement &placement :
+               rdata.slotSection.preservedChunks) {
+            PlacementRecord placementRecord = {};
+            placementRecord.keyOffset = strings.add(placement.key);
+            placementRecord.envelopeIndex = envelopeIndex;
+            placementRecord.alignment = placement.alignment;
+            placementRecord.kind = static_cast<uint16_t>(
+                WireIncrementalPlacementKind::ExistingSlot);
+            placementRecord.startRVA = placement.startRVA;
+            placementRecord.size = placement.size;
+            placementRecords.push_back(placementRecord);
+          }
+        },
+        [&](const WritableSlotSectionSnapshot &data) {
+          EnvelopeRecord envelope = {};
+          envelope.nameOffset = strings.add(common.name);
+          envelope.characteristics = common.characteristics;
+          envelope.layoutKind = static_cast<uint16_t>(
+              WireIncrementalSectionLayoutKind::WritableDataFreeSlots);
+          envelope.sectionRVA = common.rva;
+          envelope.maxSectionEndRVA = data.slotSection.maxSectionEndRVA;
+          envelope.activeEndRVA = data.slotSection.activeEndRVA;
+          uint32_t envelopeIndex = envelopeRecords.size();
+          envelopeRecords.push_back(envelope);
+
+          for (const IncrementalPreservedSlot &slot : data.slotSection.slots) {
+            SlotRecord slotRecord = {};
+            const IncrementalPreservedSlotState &slotState =
+                getIncrementalPreservedSlotState(slot);
+            slotRecord.occupantKeyOffset = strings.add(slot.match(
+                [](const FreeSlotRecord &) { return std::string(); },
+                [](const OccupiedSlotRecord &occupied) {
+                  return occupied.occupantKey;
+                }));
+            slotRecord.envelopeIndex = envelopeIndex;
+            slotRecord.minAlignment = slotState.minAlignment;
+            slotRecord.state = slot.match(
+                [](const FreeSlotRecord &) {
+                  return static_cast<uint16_t>(WireIncrementalSlotState::Free);
+                },
+                [](const OccupiedSlotRecord &) {
+                  return static_cast<uint16_t>(
+                      WireIncrementalSlotState::Occupied);
+                });
+            slotRecord.fillByte = slotState.fillByte;
+            slotRecord.startRVA = slotState.startRVA;
+            slotRecord.capacity = slotState.capacity;
+            slotRecord.committedSize = slotState.committedSize;
+            slotRecords.push_back(slotRecord);
+          }
+
+          for (const ExistingSlotChunkPlacement &placement :
+               data.slotSection.preservedChunks) {
+            PlacementRecord placementRecord = {};
+            placementRecord.keyOffset = strings.add(placement.key);
+            placementRecord.envelopeIndex = envelopeIndex;
+            placementRecord.alignment = placement.alignment;
+            placementRecord.kind = static_cast<uint16_t>(
+                WireIncrementalPlacementKind::ExistingSlot);
+            placementRecord.startRVA = placement.startRVA;
+            placementRecord.size = placement.size;
+            placementRecords.push_back(placementRecord);
+          }
+        },
+        [&](const PDataPackedPrefixSectionSnapshot &pdata) {
+          EnvelopeRecord envelope = {};
+          envelope.nameOffset = strings.add(common.name);
+          envelope.characteristics = common.characteristics;
+          envelope.layoutKind = static_cast<uint16_t>(
+              WireIncrementalSectionLayoutKind::PackedPDataPrefix);
+          envelope.sectionRVA = common.rva;
+          envelope.maxSectionEndRVA =
+              common.rva + pdata.packedSection.activePrefixSize +
+              pdata.packedSection.reserveSize;
+          envelope.activeEndRVA = common.rva + pdata.packedSection.activePrefixSize;
+          uint32_t envelopeIndex = envelopeRecords.size();
+          envelopeRecords.push_back(envelope);
+
+          PackedSectionRecord packedRecord = {};
+          packedRecord.envelopeIndex = envelopeIndex;
+          packedRecord.firstRecordKey = packedKeyRecords.size();
+          packedRecord.recordKeyCount = pdata.packedSection.members.size();
+          packedRecord.activePrefixSize = pdata.packedSection.activePrefixSize;
+          packedRecord.reserveSize = pdata.packedSection.reserveSize;
+          for (const PackedPrefixChunkPlacement &placement :
+               pdata.packedSection.members) {
+            PackedKeyRecord keyRecord = {};
+            keyRecord.keyOffset = strings.add(placement.key);
+            packedKeyRecords.push_back(keyRecord);
+
+            PlacementRecord placementRecord = {};
+            placementRecord.keyOffset = strings.add(placement.key);
+            placementRecord.envelopeIndex = envelopeIndex;
+            placementRecord.alignment = placement.alignment;
+            placementRecord.kind = static_cast<uint16_t>(
+                WireIncrementalPlacementKind::PackedPrefix);
+            placementRecord.startRVA = placement.startRVA;
+            placementRecord.size = placement.size;
+            placementRecords.push_back(placementRecord);
+          }
+          packedSectionRecords.push_back(packedRecord);
+        },
+        [&](const XDataPackedPrefixSectionSnapshot &xdata) {
+          EnvelopeRecord envelope = {};
+          envelope.nameOffset = strings.add(common.name);
+          envelope.characteristics = common.characteristics;
+          envelope.layoutKind = static_cast<uint16_t>(
+              WireIncrementalSectionLayoutKind::PackedXDataPrefix);
+          envelope.sectionRVA = common.rva;
+          envelope.maxSectionEndRVA =
+              common.rva + xdata.packedSection.activePrefixSize +
+              xdata.packedSection.reserveSize;
+          envelope.activeEndRVA = common.rva + xdata.packedSection.activePrefixSize;
+          uint32_t envelopeIndex = envelopeRecords.size();
+          envelopeRecords.push_back(envelope);
+
+          PackedSectionRecord packedRecord = {};
+          packedRecord.envelopeIndex = envelopeIndex;
+          packedRecord.firstRecordKey = packedKeyRecords.size();
+          packedRecord.recordKeyCount = xdata.packedSection.members.size();
+          packedRecord.activePrefixSize = xdata.packedSection.activePrefixSize;
+          packedRecord.reserveSize = xdata.packedSection.reserveSize;
+          for (const PackedPrefixChunkPlacement &placement :
+               xdata.packedSection.members) {
+            PackedKeyRecord keyRecord = {};
+            keyRecord.keyOffset = strings.add(placement.key);
+            packedKeyRecords.push_back(keyRecord);
+
+            PlacementRecord placementRecord = {};
+            placementRecord.keyOffset = strings.add(placement.key);
+            placementRecord.envelopeIndex = envelopeIndex;
+            placementRecord.alignment = placement.alignment;
+            placementRecord.kind = static_cast<uint16_t>(
+                WireIncrementalPlacementKind::PackedPrefix);
+            placementRecord.startRVA = placement.startRVA;
+            placementRecord.size = placement.size;
+            placementRecords.push_back(placementRecord);
+          }
+          packedSectionRecords.push_back(packedRecord);
+        });
   }
 
   chunkRecords.reserve(state.chunks.size());
-  for (const IncrementalChunkState &chunk : state.chunks) {
+  for (const IncrementalChunkSnapshot &chunk : state.chunks) {
     ChunkRecord record = {};
-    record.keyOffset = strings.add(chunk.key);
-    record.sectionIndex = chunk.sectionIndex;
-    record.inputIndex = chunk.inputIndex;
-    record.outputCharacteristics = chunk.outputCharacteristics;
-    record.sectionNumber = chunk.sectionNumber;
-    record.alignment = chunk.alignment;
-    record.kind = static_cast<uint16_t>(chunk.kind);
-    record.rva = chunk.rva;
-    record.size = chunk.size;
-    record.slotCapacity = chunk.slotCapacity;
-    record.contentHash = chunk.contentHash;
-    record.symbolHash = chunk.symbolHash;
+    encodeChunkSnapshot(chunk, record, strings);
     chunkRecords.push_back(record);
   }
 
   symbolRecords.reserve(state.symbols.size());
-  for (const IncrementalSymbolState &symbol : state.symbols) {
+  for (const IncrementalResolvedSymbolSnapshot &symbol : state.symbols) {
     SymbolRecord record = {};
-    record.nameOffset = strings.add(symbol.name);
-    record.auxiliaryKeyOffset = strings.add(symbol.auxiliaryKey);
-    record.inputIndex = symbol.inputIndex;
-    record.kind = static_cast<uint16_t>(symbol.kind);
-    record.value = symbol.value;
+    encodeResolvedSymbol(symbol, record, strings);
     symbolRecords.push_back(record);
-  }
-
-  envelopeRecords.reserve(state.sectionEnvelopes.size());
-  for (const IncrementalSectionEnvelopeState &envelope : state.sectionEnvelopes) {
-    EnvelopeRecord record = {};
-    record.nameOffset = strings.add(envelope.name);
-    record.characteristics = envelope.characteristics;
-    record.layoutKind = static_cast<uint16_t>(envelope.layoutKind);
-    record.sectionRVA = envelope.sectionRVA;
-    record.maxSectionEndRVA = envelope.maxSectionEndRVA;
-    record.activeEndRVA = envelope.activeEndRVA;
-    envelopeRecords.push_back(record);
-  }
-
-  slotRecords.reserve(state.slotRecords.size());
-  for (const IncrementalSlotRecordState &slot : state.slotRecords) {
-    SlotRecord record = {};
-    record.occupantKeyOffset = strings.add(slot.occupantKey);
-    record.envelopeIndex = slot.envelopeIndex;
-    record.minAlignment = slot.minAlignment;
-    record.state = static_cast<uint16_t>(slot.state);
-    record.fillByte = slot.fillByte;
-    record.startRVA = slot.startRVA;
-    record.capacity = slot.capacity;
-    record.committedSize = slot.committedSize;
-    slotRecords.push_back(record);
-  }
-
-  packedSectionRecords.reserve(state.packedSections.size());
-  for (const IncrementalPackedSectionState &packedSection : state.packedSections) {
-    PackedSectionRecord record = {};
-    record.envelopeIndex = packedSection.envelopeIndex;
-    record.firstRecordKey = packedKeyRecords.size();
-    record.recordKeyCount = packedSection.recordKeys.size();
-    record.activePrefixSize = packedSection.activePrefixSize;
-    record.reserveSize = packedSection.reserveSize;
-    for (StringRef key : packedSection.recordKeys) {
-      PackedKeyRecord keyRecord = {};
-      keyRecord.keyOffset = strings.add(key);
-      packedKeyRecords.push_back(keyRecord);
-    }
-    packedSectionRecords.push_back(record);
-  }
-
-  placementRecords.reserve(state.placements.size());
-  for (const IncrementalPlacementState &placement : state.placements) {
-    PlacementRecord record = {};
-    record.keyOffset = strings.add(placement.key);
-    record.envelopeIndex = placement.envelopeIndex;
-    record.alignment = placement.alignment;
-    record.kind = static_cast<uint16_t>(placement.kind);
-    record.startRVA = placement.startRVA;
-    record.size = placement.size;
-    placementRecords.push_back(record);
-  }
-
-  redirectRecords.reserve(state.textRedirects.size());
-  for (const IncrementalTextRedirectState &redirect : state.textRedirects) {
-    RedirectRecord record = {};
-    record.targetKeyOffset = strings.add(redirect.targetKey);
-    record.canonicalSymbolOffset = strings.add(redirect.canonicalSymbol);
-    record.redirectRVA = redirect.redirectRVA;
-    record.redirectCapacity = redirect.redirectCapacity;
-    record.bodyRVA = redirect.bodyRVA;
-    record.poolThunkRVA = redirect.poolThunkRVA;
-    redirectRecords.push_back(record);
-  }
-
-  if (state.textThunkPool.poolStartRVA != 0 || state.textThunkPool.poolEndRVA != 0 ||
-      state.textThunkPool.nextFreeRVA != 0) {
-    PoolStateRecord record = {};
-    record.poolStartRVA = state.textThunkPool.poolStartRVA;
-    record.poolEndRVA = state.textThunkPool.poolEndRVA;
-    record.nextFreeRVA = state.textThunkPool.nextFreeRVA;
-    poolStateRecords.push_back(record);
   }
 
   header.inputTableOffset = sizeof(FileHeaderV5);
@@ -768,32 +1564,32 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
       header.poolStateOffset + poolStateRecords.size() * sizeof(PoolStateRecord);
   header.stringTableSize = strings.data().size();
 
-  std::vector<char> buffer;
-  buffer.reserve(header.stringTableOffset + header.stringTableSize);
-  appendObject(buffer, header);
+  std::vector<char> bytes;
+  bytes.reserve(header.stringTableOffset + header.stringTableSize);
+  appendObject(bytes, header);
   for (const InputRecord &record : inputRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const SectionRecord &record : sectionRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const ChunkRecord &record : chunkRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const SymbolRecord &record : symbolRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const EnvelopeRecord &record : envelopeRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const SlotRecord &record : slotRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const PackedSectionRecord &record : packedSectionRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const PackedKeyRecord &record : packedKeyRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const PlacementRecord &record : placementRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const RedirectRecord &record : redirectRecords)
-    appendObject(buffer, record);
+    appendObject(bytes, record);
   for (const PoolStateRecord &record : poolStateRecords)
-    appendObject(buffer, record);
-  buffer.insert(buffer.end(), strings.data().begin(), strings.data().end());
+    appendObject(bytes, record);
+  bytes.insert(bytes.end(), strings.data().begin(), strings.data().end());
 
   SmallString<128> tmpPattern(path);
   tmpPattern += ".tmp-%%%%%%%%";
@@ -807,7 +1603,7 @@ Error writeIncrementalState(StringRef path, const IncrementalStateFile &state) {
     sys::fs::remove(tmpName);
     return createFileError(tmpName, errorCodeToError(ec));
   }
-  os.write(buffer.data(), buffer.size());
+  os.write(bytes.data(), bytes.size());
   os.close();
   if (os.has_error()) {
     sys::fs::remove(tmpName);
