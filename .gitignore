@@ -64,6 +64,12 @@ autoconf/autom4te.cache
 .cursor
 .cursorignore
 .cursorindexingignore
+#Unrelated documentation
+llvm-lld.md
+DESIGN.md
+repomix.config.json
+OPTIMIZATION_PATH_FAILURES.md
+SDD.md
 
 #==============================================================================#
 # Directories to ignore (do not add trailing '/'s, they skip symlinks).
