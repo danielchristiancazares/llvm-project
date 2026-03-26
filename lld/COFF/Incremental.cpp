@@ -4,13 +4,13 @@
 #include "InputFiles.h"
 #include "Symbols.h"
 #include "Writer.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Support/Error.h"
-#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
@@ -27,41 +27,52 @@ std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeDisabled() {
       new IncrementalCoordinator(State::make<IncrementalDisabled>()));
 }
 
-std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeFullImageBuild(
-    IncrementalFallbackReason fallbackReason, std::string fallbackDetail,
+std::unique_ptr<IncrementalCoordinator>
+IncrementalCoordinator::makePendingFullImageBuild(
     IncrementalBaselineEmission baselineEmission) {
-  return std::unique_ptr<IncrementalCoordinator>(new IncrementalCoordinator(
-      State::make<FullImageBuild>(
-          FullImageBuild{fallbackReason, std::move(fallbackDetail),
-                         std::move(baselineEmission)})));
+  return std::unique_ptr<IncrementalCoordinator>(
+      new IncrementalCoordinator(State::make<PendingFullImageBuild>(
+          PendingFullImageBuild{std::move(baselineEmission)})));
 }
 
-std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeStateBackedLink(
-    IncrementalBaselineData baseline, IncrementalPdbReusePolicy pdbReuse,
+std::unique_ptr<IncrementalCoordinator>
+IncrementalCoordinator::makeFullImageBuild(
+    IncrementalFullBuildDecision decision,
     IncrementalBaselineEmission baselineEmission) {
-  return std::unique_ptr<IncrementalCoordinator>(new IncrementalCoordinator(
-      State::make<StateBackedLink>(StateBackedLink{
-          std::move(baseline), std::move(pdbReuse), std::move(baselineEmission)})));
+  return std::unique_ptr<IncrementalCoordinator>(
+      new IncrementalCoordinator(State::make<FullImageBuild>(
+          FullImageBuild{std::move(decision), std::move(baselineEmission)})));
 }
 
-std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeLayoutStableLink(
+std::unique_ptr<IncrementalCoordinator>
+IncrementalCoordinator::makeStateBackedLink(
     IncrementalBaselineData baseline, IncrementalPdbReusePolicy pdbReuse,
     IncrementalBaselineEmission baselineEmission) {
-  return std::unique_ptr<IncrementalCoordinator>(new IncrementalCoordinator(
-      State::make<LayoutStableLink>(
+  return std::unique_ptr<IncrementalCoordinator>(
+      new IncrementalCoordinator(State::make<StateBackedLink>(
+          StateBackedLink{std::move(baseline), std::move(pdbReuse),
+                          std::move(baselineEmission)})));
+}
+
+std::unique_ptr<IncrementalCoordinator>
+IncrementalCoordinator::makeLayoutStableLink(
+    IncrementalBaselineData baseline, IncrementalPdbReusePolicy pdbReuse,
+    IncrementalBaselineEmission baselineEmission) {
+  return std::unique_ptr<IncrementalCoordinator>(
+      new IncrementalCoordinator(State::make<LayoutStableLink>(
           LayoutStableLink{std::move(baseline), std::move(pdbReuse),
                            std::move(baselineEmission)})));
 }
 
-std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeByteReuseLink(
+std::unique_ptr<IncrementalCoordinator>
+IncrementalCoordinator::makeByteReuseLink(
     IncrementalBaselineData baseline, IncrementalReuseData reuse,
     IncrementalPdbReusePolicy pdbReuse,
     IncrementalBaselineEmission baselineEmission) {
-  return std::unique_ptr<IncrementalCoordinator>(new IncrementalCoordinator(
-      State::make<ByteReuseLink>(ByteReuseLink{std::move(baseline),
-                                               std::move(reuse),
-                                               std::move(pdbReuse),
-                                               std::move(baselineEmission)})));
+  return std::unique_ptr<IncrementalCoordinator>(
+      new IncrementalCoordinator(State::make<ByteReuseLink>(
+          ByteReuseLink{std::move(baseline), std::move(reuse),
+                        std::move(pdbReuse), std::move(baselineEmission)})));
 }
 
 namespace {
@@ -72,63 +83,99 @@ struct IncrementalStateBuildResult {
   IncrementalStateFile state;
 };
 
-static bool shouldEmitNextBaseline(
-    const IncrementalBaselineEmission &baselineEmission) {
-  return baselineEmission.match(
-      [](const EmitNextBaseline &) { return true; },
-      [](const SkipNextBaseline &) { return false; });
+static bool
+shouldEmitNextBaseline(const IncrementalBaselineEmission &baselineEmission) {
+  return baselineEmission.match([](const EmitNextBaseline &) { return true; },
+                                [](const SkipNextBaseline &) { return false; });
 }
 
-static bool shouldReusePdbMetadata(
-    const IncrementalPdbReusePolicy &pdbReuse) {
-  return pdbReuse.match([](const ReusePdbMetadata &) { return true; },
-                        [](const RebuildPdbMetadata &) { return false; });
-}
-
-static void clearPendingIncrementalFallback(COFFLinkerContext &ctx) {
-  ctx.pendingIncrementalFallback.reset();
+static StringRef
+getFullImageBuildCauseLabel(const IncrementalFullBuildCause &cause) {
+  return cause.match(
+      [](const RebuildForMissingBaseline &) -> StringRef {
+        return "MissingState";
+      },
+      [](const RebuildForRejectedBaseline &) -> StringRef {
+        return "InvalidState";
+      },
+      [](const RebuildForUnsupportedMachine &) -> StringRef {
+        return "UnsupportedMachine";
+      },
+      [](const RebuildForBitcodeInputs &) -> StringRef { return "LtoInput"; },
+      [](const RebuildForTailMerging &) -> StringRef {
+        return "TailMergeEnabled";
+      },
+      [](const RebuildForConfigDrift &) -> StringRef {
+        return "ConfigChanged";
+      },
+      [](const RebuildForOutputDrift &) -> StringRef {
+        return "OutputMismatch";
+      },
+      [](const RebuildForLayoutRewrite &) -> StringRef {
+        return "LayoutChanged";
+      },
+      [](const RebuildForSlotCapacity &) -> StringRef {
+        return "SlotOverflow";
+      },
+      [](const RebuildForMergeParticipantDrift &) -> StringRef {
+        return "MergeChunkParticipantChanged";
+      },
+      [](const RebuildForPackedSectionGrowth &) -> StringRef {
+        return "PackedSectionOverflow";
+      },
+      [](const RebuildForRel32RangeOverflow &) -> StringRef {
+        return "Amd64Rel32OutOfRange";
+      });
 }
 
 static void logFullImageBuild(COFFLinkerContext &ctx,
-                              IncrementalFallbackReason reason,
-                              StringRef detail) {
-  if (!ctx.config.verbose || reason == IncrementalFallbackReason::None)
+                              const IncrementalFullBuildDecision &decision) {
+  if (!ctx.config.verbose)
     return;
-  Log(ctx) << "incremental: fallback: "
-           << incrementalFallbackReasonToString(reason);
-  if (!detail.empty())
-    Log(ctx) << "incremental: detail: " << detail;
+  StringRef causeLabel = getFullImageBuildCauseLabel(decision.cause);
+  Log(ctx) << "incremental: fallback: " << causeLabel;
+  if (StringRef(decision.message) != causeLabel)
+    Log(ctx) << "incremental: detail: " << decision.message;
 }
 
 static void installIncrementalCoordinatorImpl(
-    COFFLinkerContext &ctx, std::unique_ptr<IncrementalCoordinator> coordinator) {
+    COFFLinkerContext &ctx,
+    std::unique_ptr<IncrementalCoordinator> coordinator) {
   ctx.incremental = std::move(coordinator);
-  clearPendingIncrementalFallback(ctx);
 }
 
-static std::unique_ptr<IncrementalCoordinator>
-buildFullImageBuild(COFFLinkerContext &ctx, IncrementalFallbackReason reason,
-                    const Twine &detail,
-                    IncrementalBaselineEmission baselineEmission) {
-  std::string detailText = detail.str();
-  logFullImageBuild(ctx, reason, detailText);
-  return IncrementalCoordinator::makeFullImageBuild(
-      reason, std::move(detailText), std::move(baselineEmission));
+static void
+preparePendingFullImageBuild(COFFLinkerContext &ctx,
+                             IncrementalBaselineEmission baselineEmission) {
+  ctx.incremental = IncrementalCoordinator::makePendingFullImageBuild(
+      std::move(baselineEmission));
 }
 
-static std::unique_ptr<FullImageBuild> consumePendingIncrementalFallbackImpl(
-    COFFLinkerContext &ctx, IncrementalBaselineEmission baselineEmission,
-    IncrementalFallbackReason defaultReason, const Twine &defaultDetail) {
-  if (!ctx.pendingIncrementalFallback)
-    return std::make_unique<FullImageBuild>(FullImageBuild{
-        defaultReason, defaultDetail.str(), std::move(baselineEmission)});
-
-  std::unique_ptr<FullImageBuild> fallback = std::make_unique<FullImageBuild>(
-      FullImageBuild{ctx.pendingIncrementalFallback->fallbackReason,
-                     ctx.pendingIncrementalFallback->fallbackDetail,
-                     std::move(baselineEmission)});
-  clearPendingIncrementalFallback(ctx);
-  return fallback;
+static PendingFullImageBuild takePendingFullImageBuild(COFFLinkerContext &ctx) {
+  std::unique_ptr<PendingFullImageBuild> pending;
+  ctx.incremental->match(
+      [&](IncrementalDisabled &) {
+        llvm_unreachable("incremental fallback requested without active state");
+      },
+      [&](PendingFullImageBuild &fullBuild) {
+        pending = std::make_unique<PendingFullImageBuild>(
+            PendingFullImageBuild{std::move(fullBuild.baselineEmission)});
+      },
+      [&](FullImageBuild &) {
+        llvm_unreachable("incremental fallback requested after final fallback");
+      },
+      [&](StateBackedLink &) {
+        llvm_unreachable(
+            "incremental fallback requested before transition setup");
+      },
+      [&](LayoutStableLink &) {
+        llvm_unreachable("incremental fallback requested before layout setup");
+      },
+      [&](ByteReuseLink &) {
+        llvm_unreachable("incremental fallback requested after byte reuse");
+      });
+  ctx.incremental = IncrementalCoordinator::makeDisabled();
+  return std::move(*pending);
 }
 
 static bool hasBitcodeInputs(COFFLinkerContext &ctx) {
@@ -142,62 +189,58 @@ static bool hasBitcodeInputs(COFFLinkerContext &ctx) {
 static std::unique_ptr<StateBackedLink>
 takeStateBackedLink(COFFLinkerContext &ctx) {
   std::unique_ptr<StateBackedLink> result;
+  std::unique_ptr<IncrementalBaselineEmission> pendingEmission;
   ctx.incremental->match(
-      [&](IncrementalDisabled &) {},
+      [&](IncrementalDisabled &) {}, [&](PendingFullImageBuild &) {},
       [&](FullImageBuild &) {},
       [&](StateBackedLink &loaded) {
+        pendingEmission = std::make_unique<IncrementalBaselineEmission>(
+            std::move(loaded.baselineEmission));
         result = std::make_unique<StateBackedLink>(std::move(loaded));
       },
-      [&](LayoutStableLink &) {},
-      [&](ByteReuseLink &) {});
-  if (result)
-    ctx.incremental = IncrementalCoordinator::makeDisabled();
+      [&](LayoutStableLink &) {}, [&](ByteReuseLink &) {});
+  if (pendingEmission)
+    preparePendingFullImageBuild(ctx, std::move(*pendingEmission));
   return result;
 }
 
 static std::unique_ptr<LayoutStableLink>
 takeLayoutStableLink(COFFLinkerContext &ctx) {
   std::unique_ptr<LayoutStableLink> result;
+  std::unique_ptr<IncrementalBaselineEmission> pendingEmission;
   ctx.incremental->match(
-      [&](IncrementalDisabled &) {},
-      [&](FullImageBuild &) {},
-      [&](StateBackedLink &) {},
+      [&](IncrementalDisabled &) {}, [&](PendingFullImageBuild &) {},
+      [&](FullImageBuild &) {}, [&](StateBackedLink &) {},
       [&](LayoutStableLink &validated) {
+        pendingEmission = std::make_unique<IncrementalBaselineEmission>(
+            std::move(validated.baselineEmission));
         result = std::make_unique<LayoutStableLink>(std::move(validated));
       },
       [&](ByteReuseLink &) {});
-  if (result)
-    ctx.incremental = IncrementalCoordinator::makeDisabled();
+  if (pendingEmission)
+    preparePendingFullImageBuild(ctx, std::move(*pendingEmission));
   return result;
 }
 
 static ByteReuseLink *findActiveByteReuseLinkImpl(COFFLinkerContext &ctx) {
   return ctx.incremental->match(
       [&](IncrementalDisabled &) -> ByteReuseLink * { return nullptr; },
+      [&](PendingFullImageBuild &) -> ByteReuseLink * { return nullptr; },
       [&](FullImageBuild &) -> ByteReuseLink * { return nullptr; },
       [&](StateBackedLink &) -> ByteReuseLink * { return nullptr; },
       [&](LayoutStableLink &) -> ByteReuseLink * { return nullptr; },
       [&](ByteReuseLink &reuse) -> ByteReuseLink * { return &reuse; });
 }
 
-static const ByteReuseLink *
-findActiveByteReuseLinkImpl(const COFFLinkerContext &ctx) {
-  return ctx.incremental->match(
-      [&](const IncrementalDisabled &) -> const ByteReuseLink * {
-        return nullptr;
-      },
-      [&](const FullImageBuild &) -> const ByteReuseLink * { return nullptr; },
-      [&](const StateBackedLink &) -> const ByteReuseLink * { return nullptr; },
-      [&](const LayoutStableLink &) -> const ByteReuseLink * { return nullptr; },
-      [&](const ByteReuseLink &reuse) -> const ByteReuseLink * {
-        return &reuse;
-      });
-}
-
 static IncrementalBaselineData *
 findActiveIncrementalBaselineImpl(COFFLinkerContext &ctx) {
   return ctx.incremental->match(
-      [&](IncrementalDisabled &) -> IncrementalBaselineData * { return nullptr; },
+      [&](IncrementalDisabled &) -> IncrementalBaselineData * {
+        return nullptr;
+      },
+      [&](PendingFullImageBuild &) -> IncrementalBaselineData * {
+        return nullptr;
+      },
       [&](FullImageBuild &) -> IncrementalBaselineData * { return nullptr; },
       [&](StateBackedLink &loaded) -> IncrementalBaselineData * {
         return &loaded.baseline;
@@ -210,48 +253,10 @@ findActiveIncrementalBaselineImpl(COFFLinkerContext &ctx) {
       });
 }
 
-static const IncrementalBaselineData *
-findActiveIncrementalBaselineImpl(const COFFLinkerContext &ctx) {
-  return ctx.incremental->match(
-      [&](const IncrementalDisabled &) -> const IncrementalBaselineData * {
-        return nullptr;
-      },
-      [&](const FullImageBuild &) -> const IncrementalBaselineData * {
-        return nullptr;
-      },
-      [&](const StateBackedLink &loaded) -> const IncrementalBaselineData * {
-        return &loaded.baseline;
-      },
-      [&](const LayoutStableLink &validated)
-          -> const IncrementalBaselineData * { return &validated.baseline; },
-      [&](const ByteReuseLink &reuse) -> const IncrementalBaselineData * {
-        return &reuse.baseline;
-      });
-}
-
-static const IncrementalStateFile *
-findActiveIncrementalLoadedStateImpl(const COFFLinkerContext &ctx) {
-  return ctx.incremental->match(
-      [&](const IncrementalDisabled &) -> const IncrementalStateFile * {
-        return nullptr;
-      },
-      [&](const FullImageBuild &) -> const IncrementalStateFile * {
-        return nullptr;
-      },
-      [&](const StateBackedLink &loaded) -> const IncrementalStateFile * {
-        return &loaded.baseline.state;
-      },
-      [&](const LayoutStableLink &validated) -> const IncrementalStateFile * {
-        return &validated.baseline.state;
-      },
-      [&](const ByteReuseLink &reuse) -> const IncrementalStateFile * {
-        return &reuse.baseline.state;
-      });
-}
-
 static bool shouldEmitIncrementalBaselineImpl(const COFFLinkerContext &ctx) {
   return ctx.incremental->match(
       [&](const IncrementalDisabled &) { return false; },
+      [&](const PendingFullImageBuild &) { return false; },
       [&](const FullImageBuild &fresh) {
         return shouldEmitNextBaseline(fresh.baselineEmission);
       },
@@ -263,22 +268,6 @@ static bool shouldEmitIncrementalBaselineImpl(const COFFLinkerContext &ctx) {
       },
       [&](const ByteReuseLink &reuse) {
         return shouldEmitNextBaseline(reuse.baselineEmission);
-      });
-}
-
-static bool shouldReuseIncrementalPdbMetadataImpl(
-    const COFFLinkerContext &ctx) {
-  return ctx.incremental->match(
-      [&](const IncrementalDisabled &) { return false; },
-      [&](const FullImageBuild &) { return false; },
-      [&](const StateBackedLink &loaded) {
-        return shouldReusePdbMetadata(loaded.pdbReuse);
-      },
-      [&](const LayoutStableLink &validated) {
-        return shouldReusePdbMetadata(validated.pdbReuse);
-      },
-      [&](const ByteReuseLink &reuse) {
-        return shouldReusePdbMetadata(reuse.pdbReuse);
       });
 }
 
@@ -418,10 +407,9 @@ buildIncrementalLayoutTables(COFFLinkerContext &ctx,
     envelope.name = section->name.str();
     envelope.characteristics = section->header.Characteristics;
     envelope.sectionRVA = section->getRVA();
-    envelope.maxSectionEndRVA =
-        sectionIndex + 1 < activeSections.size()
-            ? activeSections[sectionIndex + 1]->getRVA()
-            : state.sizeOfImage;
+    envelope.maxSectionEndRVA = sectionIndex + 1 < activeSections.size()
+                                    ? activeSections[sectionIndex + 1]->getRVA()
+                                    : state.sizeOfImage;
     envelope.layoutKind = layoutKind;
     uint64_t activeEndRVA = section->getRVA() + section->getVirtualSize();
     if (layoutKind == IncrementalSectionLayoutKind::TextFreeSlots) {
@@ -429,7 +417,8 @@ buildIncrementalLayoutTables(COFFLinkerContext &ctx,
       for (Chunk *chunk : section->chunks) {
         if (isa<IncrementalLongThunkChunkX64>(chunk))
           continue;
-        activeEndRVA = std::max(activeEndRVA, chunk->getRVA() + chunk->getSize());
+        activeEndRVA =
+            std::max(activeEndRVA, chunk->getRVA() + chunk->getSize());
       }
     }
     envelope.activeEndRVA = activeEndRVA;
@@ -464,8 +453,8 @@ buildIncrementalLayoutTables(COFFLinkerContext &ctx,
         bool isPadding = isa<IncrementalPaddingChunk>(chunk);
 
         uint64_t slotEnd = envelope.activeEndRVA;
-        for (size_t nextIndex = chunkIndex + 1; nextIndex < section->chunks.size();
-             ++nextIndex) {
+        for (size_t nextIndex = chunkIndex + 1;
+             nextIndex < section->chunks.size(); ++nextIndex) {
           Chunk *nextChunk = section->chunks[nextIndex];
           if (!isPersistedSlotChunk(nextChunk))
             continue;
@@ -474,7 +463,8 @@ buildIncrementalLayoutTables(COFFLinkerContext &ctx,
         }
         if (slotEnd < chunk->getRVA() ||
             slotEnd - chunk->getRVA() < chunk->getSize()) {
-          suppressStateWrite("slot table builder found an invalid persisted range");
+          suppressStateWrite(
+              "slot table builder found an invalid persisted range");
           return IncrementalBaselineEmission::make<SkipNextBaseline>();
         }
 
@@ -484,8 +474,9 @@ buildIncrementalLayoutTables(COFFLinkerContext &ctx,
         slot.capacity = slotEnd - chunk->getRVA();
         slot.committedSize = chunk->getSize();
         slot.minAlignment = chunk->getAlignment();
-        slot.fillByte = isPadding ? cast<IncrementalPaddingChunk>(chunk)->getFillByte()
-                                  : getIncrementalFillByte(envelope.layoutKind);
+        slot.fillByte =
+            isPadding ? cast<IncrementalPaddingChunk>(chunk)->getFillByte()
+                      : getIncrementalFillByte(envelope.layoutKind);
         slot.state = isPadding ? IncrementalSlotState::Free
                                : IncrementalSlotState::Occupied;
         if (!isPadding)
@@ -578,7 +569,8 @@ buildIncrementalSymbolStates(COFFLinkerContext &ctx,
         state.value = imp->getOrdinal();
         std::string key;
         raw_string_ostream os(key);
-        os << imp->getDLLName() << '\n' << imp->getExternalName() << '\n'
+        os << imp->getDLLName() << '\n'
+           << imp->getExternalName() << '\n'
            << imp->file->hdr->TypeInfo;
         state.auxiliaryKey = os.str();
       } else if (auto *thunk = dyn_cast<DefinedImportThunk>(sym)) {
@@ -606,9 +598,9 @@ buildIncrementalSymbolStates(COFFLinkerContext &ctx,
   llvm::sort(states, [](const IncrementalSymbolState &lhs,
                         const IncrementalSymbolState &rhs) {
     return std::tie(lhs.name, lhs.kind, lhs.inputIndex, lhs.value,
-                    lhs.auxiliaryKey) <
-           std::tie(rhs.name, rhs.kind, rhs.inputIndex, rhs.value,
-                    rhs.auxiliaryKey);
+                    lhs.auxiliaryKey) < std::tie(rhs.name, rhs.kind,
+                                                 rhs.inputIndex, rhs.value,
+                                                 rhs.auxiliaryKey);
   });
   return states;
 }
@@ -627,8 +619,9 @@ buildIncrementalState(COFFLinkerContext &ctx,
   state.exportTopologyHash = computeIncrementalExportTopologyHash(ctx);
   state.resourceInputHash = computeIncrementalResourceInputHash(ctx);
 
-  ErrorOr<std::unique_ptr<MemoryBuffer>> output = MemoryBuffer::getFile(
-      ctx.config.outputFile, /*IsText=*/false, /*RequiresNullTerminator=*/false);
+  ErrorOr<std::unique_ptr<MemoryBuffer>> output =
+      MemoryBuffer::getFile(ctx.config.outputFile, /*IsText=*/false,
+                            /*RequiresNullTerminator=*/false);
   if (!output) {
     report_fatal_error(createFileError(ctx.config.outputFile,
                                        errorCodeToError(output.getError())));
@@ -638,8 +631,7 @@ buildIncrementalState(COFFLinkerContext &ctx,
   state.outputHash = xxh3_64bits(outputData);
 
   if (outputData.size() >= sizeof(dos_header)) {
-    const uint8_t *buf =
-        reinterpret_cast<const uint8_t *>(outputData.data());
+    const uint8_t *buf = reinterpret_cast<const uint8_t *>(outputData.data());
     const dos_header *dos = reinterpret_cast<const dos_header *>(buf);
     uint32_t peOff = dos->AddressOfNewExeHeader;
     uint32_t headerOff =
@@ -686,7 +678,8 @@ buildIncrementalState(COFFLinkerContext &ctx,
       Chunk *chunk = section->chunks[i];
       IncrementalChunkState chunkState;
       chunkState.kind = classifyIncrementalChunk(*chunk);
-      chunkState.key = getIncrementalChunkKey(currentInputs.inputIndices, *chunk);
+      chunkState.key =
+          getIncrementalChunkKey(currentInputs.inputIndices, *chunk);
       chunkState.sectionIndex = state.sections.size() - 1;
       chunkState.outputCharacteristics = chunk->getOutputCharacteristics();
       chunkState.alignment = chunk->getAlignment();
@@ -710,8 +703,8 @@ buildIncrementalState(COFFLinkerContext &ctx,
     }
   }
 
-  IncrementalBaselineEmission baselineEmission = buildIncrementalLayoutTables(
-      ctx, currentInputs.inputIndices, state);
+  IncrementalBaselineEmission baselineEmission =
+      buildIncrementalLayoutTables(ctx, currentInputs.inputIndices, state);
   if (reuseData) {
     state.textRedirects = reuseData->currentTextRedirects;
     state.textThunkPool = reuseData->currentTextThunkPool;
@@ -729,47 +722,32 @@ void installIncrementalCoordinator(
   installIncrementalCoordinatorImpl(ctx, std::move(coordinator));
 }
 
-std::unique_ptr<FullImageBuild> consumePendingIncrementalFallback(
-    COFFLinkerContext &ctx, IncrementalBaselineEmission baselineEmission,
-    IncrementalFallbackReason defaultReason, const Twine &defaultDetail) {
-  std::unique_ptr<FullImageBuild> fallback = consumePendingIncrementalFallbackImpl(
-      ctx, std::move(baselineEmission), defaultReason, defaultDetail);
-  logFullImageBuild(ctx, fallback->fallbackReason, fallback->fallbackDetail);
-  return fallback;
+void installIncrementalFullImageBuild(
+    COFFLinkerContext &ctx, IncrementalFullBuildDecision decision,
+    IncrementalBaselineEmission baselineEmission) {
+  logFullImageBuild(ctx, decision);
+  installIncrementalCoordinator(
+      ctx, IncrementalCoordinator::makeFullImageBuild(
+               std::move(decision), std::move(baselineEmission)));
 }
 
-IncrementalBaselineData *findActiveIncrementalBaseline(COFFLinkerContext &ctx) {
-  return findActiveIncrementalBaselineImpl(ctx);
+void installPendingIncrementalFullImageBuild(
+    COFFLinkerContext &ctx, IncrementalFullBuildDecision decision) {
+  PendingFullImageBuild pending = takePendingFullImageBuild(ctx);
+  installIncrementalFullImageBuild(ctx, std::move(decision),
+                                   std::move(pending.baselineEmission));
 }
 
-const IncrementalBaselineData *
-findActiveIncrementalBaseline(const COFFLinkerContext &ctx) {
-  return findActiveIncrementalBaselineImpl(ctx);
+void installPendingIncrementalFullImageBuild(
+    COFFLinkerContext &ctx, IncrementalFullBuildDecision decision,
+    IncrementalBaselineEmission baselineEmission) {
+  takePendingFullImageBuild(ctx);
+  installIncrementalFullImageBuild(ctx, std::move(decision),
+                                   std::move(baselineEmission));
 }
 
-ByteReuseLink *findActiveByteReuseLink(COFFLinkerContext &ctx) {
-  return findActiveByteReuseLinkImpl(ctx);
-}
-
-const ByteReuseLink *findActiveByteReuseLink(const COFFLinkerContext &ctx) {
-  return findActiveByteReuseLinkImpl(ctx);
-}
-
-const IncrementalStateFile *
-findActiveIncrementalLoadedState(const COFFLinkerContext &ctx) {
-  return findActiveIncrementalLoadedStateImpl(ctx);
-}
-
-bool shouldEmitIncrementalBaseline(const COFFLinkerContext &ctx) {
-  return shouldEmitIncrementalBaselineImpl(ctx);
-}
-
-bool shouldReuseIncrementalPdbMetadata(const COFFLinkerContext &ctx) {
-  return shouldReuseIncrementalPdbMetadataImpl(ctx);
-}
-
-IncrementalSectionLayoutKind classifyIncrementalSection(StringRef name,
-                                                        uint32_t characteristics) {
+IncrementalSectionLayoutKind
+classifyIncrementalSection(StringRef name, uint32_t characteristics) {
   if (name == ".pdata")
     return IncrementalSectionLayoutKind::PackedPDataPrefix;
   if (name == ".xdata")
@@ -837,9 +815,9 @@ bool isIncrementalPersistedSlotChunk(IncrementalSectionLayoutKind layoutKind,
          !isa<IncrementalLongThunkChunkX64>(&chunk);
 }
 
-IncrementalFreeSlotSelection findBestFitIncrementalFreeSlot(
-    ArrayRef<IncrementalSlotRecordState> slots, uint64_t size,
-    uint32_t alignment) {
+IncrementalFreeSlotSelection
+findBestFitIncrementalFreeSlot(ArrayRef<IncrementalSlotRecordState> slots,
+                               uint64_t size, uint32_t alignment) {
   size_t bestIndex = 0;
   bool found = false;
   for (size_t i = 0; i < slots.size(); ++i) {
@@ -859,9 +837,9 @@ IncrementalFreeSlotSelection findBestFitIncrementalFreeSlot(
       SelectedFreeSlot{bestIndex});
 }
 
-IncrementalTailReserveSelection allocateIncrementalTailReserve(
-    uint64_t tailCursor, uint64_t maxSectionEndRVA, uint64_t size,
-    uint32_t alignment) {
+IncrementalTailReserveSelection
+allocateIncrementalTailReserve(uint64_t tailCursor, uint64_t maxSectionEndRVA,
+                               uint64_t size, uint32_t alignment) {
   uint64_t startRVA = alignTo(tailCursor, uint64_t(alignment));
   if (startRVA > maxSectionEndRVA || maxSectionEndRVA - startRVA < size)
     return IncrementalTailReserveSelection::make<TailReserveUnavailable>();
@@ -1002,45 +980,6 @@ bool isIncrementalAmd64Rel32InRange(uint16_t type, uint64_t sourceRVA,
   return isInt<32>(int64_t(targetRVA) - int64_t(sourceRVA) - adjustment);
 }
 
-StringRef incrementalFallbackReasonToString(IncrementalFallbackReason reason) {
-  switch (reason) {
-  case IncrementalFallbackReason::None:
-    return "None";
-  case IncrementalFallbackReason::MissingState:
-    return "MissingState";
-  case IncrementalFallbackReason::InvalidState:
-    return "InvalidState";
-  case IncrementalFallbackReason::UnsupportedMachine:
-    return "UnsupportedMachine";
-  case IncrementalFallbackReason::LtoInput:
-    return "LtoInput";
-  case IncrementalFallbackReason::TailMergeEnabled:
-    return "TailMergeEnabled";
-  case IncrementalFallbackReason::ConfigChanged:
-    return "ConfigChanged";
-  case IncrementalFallbackReason::OutputMismatch:
-    return "OutputMismatch";
-  case IncrementalFallbackReason::LayoutChanged:
-    return "LayoutChanged";
-  case IncrementalFallbackReason::SlotOverflow:
-    return "SlotOverflow";
-  case IncrementalFallbackReason::MergeChunkParticipantChanged:
-    return "MergeChunkParticipantChanged";
-  case IncrementalFallbackReason::PackedSectionOverflow:
-    return "PackedSectionOverflow";
-  case IncrementalFallbackReason::Amd64Rel32OutOfRange:
-    return "Amd64Rel32OutOfRange";
-  }
-  llvm_unreachable("unknown incremental fallback reason");
-}
-
-void setIncrementalFallback(COFFLinkerContext &ctx,
-                            IncrementalFallbackReason reason,
-                            const Twine &detail) {
-  ctx.pendingIncrementalFallback = std::make_unique<PendingFullImageBuild>(
-      PendingFullImageBuild{reason, detail.str()});
-}
-
 uint64_t computeIncrementalHardConfigHash(const Configuration &config) {
   SmallString<512> buffer;
   raw_svector_ostream os(buffer);
@@ -1091,7 +1030,8 @@ uint64_t computeIncrementalSoftConfigHash(const Configuration &config) {
   return xxh3_64bits(buffer);
 }
 
-IncrementalCurrentInputs prepareCurrentIncrementalInputs(COFFLinkerContext &ctx) {
+IncrementalCurrentInputs
+prepareCurrentIncrementalInputs(COFFLinkerContext &ctx) {
   IncrementalCurrentInputs currentInputs;
   currentInputs.hashes.reserve(ctx.objFileInstances.size());
   currentInputs.names.reserve(ctx.objFileInstances.size());
@@ -1126,9 +1066,9 @@ std::string getIncrementalChunkKey(const IncrementalInputIndexMap &inputIndices,
   std::string key;
   raw_string_ostream os(key);
   if (auto *padding = dyn_cast<IncrementalPaddingChunk>(&chunk)) {
-    os << "pad:" << padding->getSectionName() << ':' << chunk.getOutputCharacteristics()
-       << ':' << chunk.getRVA() << ':' << chunk.getSize() << ':'
-       << unsigned(padding->getFillByte());
+    os << "pad:" << padding->getSectionName() << ':'
+       << chunk.getOutputCharacteristics() << ':' << chunk.getRVA() << ':'
+       << chunk.getSize() << ':' << unsigned(padding->getFillByte());
     return os.str();
   }
   if (auto *redirect = dyn_cast<IncrementalEntryRedirectChunkX64>(&chunk)) {
@@ -1152,8 +1092,8 @@ std::string getIncrementalChunkKey(const IncrementalInputIndexMap &inputIndices,
          << section->getSectionName();
     return os.str();
   }
-  os << "syn:" << chunk.getDebugName() << ':' << chunk.getOutputCharacteristics()
-     << ':' << chunk.getAlignment();
+  os << "syn:" << chunk.getDebugName() << ':'
+     << chunk.getOutputCharacteristics() << ':' << chunk.getAlignment();
   return os.str();
 }
 
@@ -1164,16 +1104,16 @@ uint64_t computeIncrementalSymbolHash(const SectionChunk &chunk) {
     COFFSymbolRef symbol = chunk.file->getCOFFObj()->getCOFFSymbol(ref);
     if (!symbol.isExternal())
       continue;
-    Expected<StringRef> nameOrErr = chunk.file->getCOFFObj()->getSymbolName(symbol);
+    Expected<StringRef> nameOrErr =
+        chunk.file->getCOFFObj()->getSymbolName(symbol);
     if (!nameOrErr)
       continue;
     if (symbol.getSectionNumber() != static_cast<int32_t>(sectionNumber))
       continue;
     symbols.emplace_back(nameOrErr->str(), symbol.getValue());
   }
-  llvm::sort(symbols, [](const auto &lhs, const auto &rhs) {
-    return lhs < rhs;
-  });
+  llvm::sort(symbols,
+             [](const auto &lhs, const auto &rhs) { return lhs < rhs; });
 
   SmallString<128> buffer;
   raw_svector_ostream os(buffer);
@@ -1182,13 +1122,14 @@ uint64_t computeIncrementalSymbolHash(const SectionChunk &chunk) {
   return xxh3_64bits(buffer);
 }
 
-static bool validateIncrementalSymbolStates(COFFLinkerContext &ctx,
-                                            const IncrementalBaselineData &baseline) {
+static bool
+validateIncrementalSymbolStates(COFFLinkerContext &ctx,
+                                const IncrementalBaselineData &baseline) {
   std::vector<IncrementalSymbolState> currentSymbols =
       buildIncrementalSymbolStates(ctx, baseline.currentInputs.inputIndices);
   if (currentSymbols.size() != baseline.state.symbols.size()) {
-    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
-                           "resolved symbol count changed");
+    installPendingIncrementalFullImageBuild(
+        ctx, rebuildForLayoutRewrite("resolved symbol count changed"));
     return false;
   }
 
@@ -1201,8 +1142,8 @@ static bool validateIncrementalSymbolStates(COFFLinkerContext &ctx,
       std::string detail;
       raw_string_ostream os(detail);
       os << "symbol winner changed: " << current.name;
-      setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
-                             os.str());
+      installPendingIncrementalFullImageBuild(
+          ctx, rebuildForLayoutRewrite(os.str()));
       return false;
     }
   }
@@ -1219,51 +1160,42 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   ensureIncrementalStatePath(ctx.config);
 
   if (ctx.config.machine != AMD64) {
-    installIncrementalCoordinator(
-        ctx, buildFullImageBuild(ctx,
-                                 IncrementalFallbackReason::UnsupportedMachine,
-                                 {},
-                                 IncrementalBaselineEmission::make<
-                                     SkipNextBaseline>()));
+    installIncrementalFullImageBuild(
+        ctx, rebuildForUnsupportedMachine(),
+        IncrementalBaselineEmission::make<SkipNextBaseline>());
     return;
   }
 
   if (hasBitcodeInputs(ctx)) {
-    installIncrementalCoordinator(
-        ctx, buildFullImageBuild(ctx, IncrementalFallbackReason::LtoInput, {},
-                                 IncrementalBaselineEmission::make<
-                                     SkipNextBaseline>()));
+    installIncrementalFullImageBuild(
+        ctx, rebuildForBitcodeInputs(),
+        IncrementalBaselineEmission::make<SkipNextBaseline>());
     return;
   }
 
   if (ctx.config.tailMerge) {
-    installIncrementalCoordinator(
-        ctx, buildFullImageBuild(ctx,
-                                 IncrementalFallbackReason::TailMergeEnabled,
-                                 {},
-                                 IncrementalBaselineEmission::make<
-                                     SkipNextBaseline>()));
+    installIncrementalFullImageBuild(
+        ctx, rebuildForTailMerging(),
+        IncrementalBaselineEmission::make<SkipNextBaseline>());
     return;
   }
 
-  auto installFallback = [&](IncrementalFallbackReason reason,
-                             const Twine &detail = {}) {
-    installIncrementalCoordinator(
-        ctx, buildFullImageBuild(ctx, reason, detail,
-                                 IncrementalBaselineEmission::make<
-                                     EmitNextBaseline>()));
+  auto installFallback = [&](IncrementalFullBuildDecision decision) {
+    installIncrementalFullImageBuild(
+        ctx, std::move(decision),
+        IncrementalBaselineEmission::make<EmitNextBaseline>());
   };
 
   if (!sys::fs::exists(ctx.config.incrementalStatePath)) {
-    installFallback(IncrementalFallbackReason::MissingState);
+    installFallback(rebuildForMissingBaseline());
     return;
   }
 
   Expected<IncrementalStateFile> stateOrErr =
       loadIncrementalState(ctx.config.incrementalStatePath);
   if (!stateOrErr) {
-    installFallback(IncrementalFallbackReason::InvalidState,
-                    toString(stateOrErr.takeError()));
+    installFallback(
+        rebuildForRejectedBaseline(toString(stateOrErr.takeError())));
     return;
   }
 
@@ -1271,30 +1203,31 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   uint64_t softHash = computeIncrementalSoftConfigHash(ctx.config);
   if (stateOrErr->machine != ctx.config.machine ||
       stateOrErr->hardConfigHash != hardHash) {
-    installFallback(IncrementalFallbackReason::ConfigChanged);
+    installFallback(rebuildForConfigDrift());
     return;
   }
   if (stateOrErr->outputPath != ctx.config.outputFile) {
-    installFallback(IncrementalFallbackReason::OutputMismatch,
-                    "incremental state was written for a different output");
+    installFallback(rebuildForOutputDrift(
+        "incremental state was written for a different output"));
     return;
   }
   if (stateOrErr->version < 3 ||
       stateOrErr->layoutMode != IncrementalLayoutMode::Slotted) {
-    installFallback(IncrementalFallbackReason::MissingState,
-                    "slotted baseline state is missing");
+    installFallback(
+        rebuildForMissingBaseline("slotted baseline state is missing"));
     return;
   }
 
-  ErrorOr<std::unique_ptr<MemoryBuffer>> oldImage = MemoryBuffer::getFile(
-      ctx.config.outputFile, /*IsText=*/false, /*RequiresNullTerminator=*/false);
+  ErrorOr<std::unique_ptr<MemoryBuffer>> oldImage =
+      MemoryBuffer::getFile(ctx.config.outputFile, /*IsText=*/false,
+                            /*RequiresNullTerminator=*/false);
   if (!oldImage) {
-    installFallback(IncrementalFallbackReason::OutputMismatch);
+    installFallback(rebuildForOutputDrift());
     return;
   }
   if ((*oldImage)->getBufferSize() != stateOrErr->outputSize ||
       xxh3_64bits((*oldImage)->getBuffer()) != stateOrErr->outputHash) {
-    installFallback(IncrementalFallbackReason::OutputMismatch);
+    installFallback(rebuildForOutputDrift());
     return;
   }
 
@@ -1329,42 +1262,28 @@ void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
   auto loaded = takeStateBackedLink(ctx);
   if (!loaded)
     return;
-  clearPendingIncrementalFallback(ctx);
-
-  auto installFullImageBuild =
-      [&](std::unique_ptr<FullImageBuild> fullImageBuild) {
-        installIncrementalCoordinator(
-            ctx, IncrementalCoordinator::makeFullImageBuild(
-                     fullImageBuild->fallbackReason,
-                     std::move(fullImageBuild->fallbackDetail),
-                     std::move(fullImageBuild->baselineEmission)));
-      };
 
   if (hasBitcodeInputs(ctx)) {
-    installIncrementalCoordinator(
-        ctx, buildFullImageBuild(ctx, IncrementalFallbackReason::LtoInput, {},
-                                 IncrementalBaselineEmission::make<
-                                     SkipNextBaseline>()));
+    installPendingIncrementalFullImageBuild(
+        ctx, rebuildForBitcodeInputs(),
+        IncrementalBaselineEmission::make<SkipNextBaseline>());
     return;
   }
 
   uint64_t resourceHash = computeIncrementalResourceInputHash(ctx);
   if (resourceHash != loaded->baseline.state.resourceInputHash) {
-    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
-                           "resource or manifest inputs changed");
-    installFullImageBuild(consumePendingIncrementalFallback(
-        ctx, std::move(loaded->baselineEmission)));
+    installPendingIncrementalFullImageBuild(
+        ctx, rebuildForLayoutRewrite("resource or manifest inputs changed"));
     return;
   }
 
   loaded->baseline.currentInputs = prepareCurrentIncrementalInputs(ctx);
   loaded->baseline.changedInputs.clear();
 
-  if (loaded->baseline.state.inputs.size() != loaded->baseline.currentInputs.hashes.size()) {
-    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
-                           "input count changed");
-    installFullImageBuild(consumePendingIncrementalFallback(
-        ctx, std::move(loaded->baselineEmission)));
+  if (loaded->baseline.state.inputs.size() !=
+      loaded->baseline.currentInputs.hashes.size()) {
+    installPendingIncrementalFullImageBuild(
+        ctx, rebuildForLayoutRewrite("input count changed"));
     return;
   }
 
@@ -1372,11 +1291,10 @@ void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
     const IncrementalInputState &input = loaded->baseline.state.inputs[i];
     if (input.name != loaded->baseline.currentInputs.names[i] ||
         input.parentName != loaded->baseline.currentInputs.parentNames[i] ||
-        input.archiveOffset != loaded->baseline.currentInputs.archiveOffsets[i]) {
-      setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
-                             "input order changed");
-      installFullImageBuild(consumePendingIncrementalFallback(
-          ctx, std::move(loaded->baselineEmission)));
+        input.archiveOffset !=
+            loaded->baseline.currentInputs.archiveOffsets[i]) {
+      installPendingIncrementalFullImageBuild(
+          ctx, rebuildForLayoutRewrite("input order changed"));
       return;
     }
     if (input.contentHash != loaded->baseline.currentInputs.hashes[i])
@@ -1385,72 +1303,68 @@ void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
 
   if (loaded->baseline.loadedArchiveMembers.size() !=
       loaded->baseline.expectedArchiveMembers.size()) {
-    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
-                           "archive member extraction changed");
-    installFullImageBuild(consumePendingIncrementalFallback(
-        ctx, std::move(loaded->baselineEmission)));
+    installPendingIncrementalFullImageBuild(
+        ctx, rebuildForLayoutRewrite("archive member extraction changed"));
     return;
   }
   for (const auto &entry : loaded->baseline.expectedArchiveMembers) {
     if (!loaded->baseline.loadedArchiveMembers.contains(entry.getKey())) {
-      setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
-                             "archive member extraction changed");
-      installFullImageBuild(consumePendingIncrementalFallback(
-          ctx, std::move(loaded->baselineEmission)));
+      installPendingIncrementalFullImageBuild(
+          ctx, rebuildForLayoutRewrite("archive member extraction changed"));
       return;
     }
   }
 
   if (loaded->baseline.state.importTopologyHash !=
       computeIncrementalImportTopologyHash(ctx)) {
-    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
-                           "import topology changed");
-    installFullImageBuild(consumePendingIncrementalFallback(
-        ctx, std::move(loaded->baselineEmission)));
+    installPendingIncrementalFullImageBuild(
+        ctx, rebuildForLayoutRewrite("import topology changed"));
     return;
   }
   if (loaded->baseline.state.exportTopologyHash !=
       computeIncrementalExportTopologyHash(ctx)) {
-    setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
-                           "export topology changed");
-    installFullImageBuild(consumePendingIncrementalFallback(
-        ctx, std::move(loaded->baselineEmission)));
+    installPendingIncrementalFullImageBuild(
+        ctx, rebuildForLayoutRewrite("export topology changed"));
     return;
   }
 
   if (!validateIncrementalSymbolStates(ctx, loaded->baseline)) {
-    installFullImageBuild(consumePendingIncrementalFallback(
-        ctx, std::move(loaded->baselineEmission)));
     return;
   }
 
   if (ctx.config.verbose) {
     Log(ctx) << "incremental: using state " << ctx.config.incrementalStatePath;
-    if (!shouldReusePdbMetadata(loaded->pdbReuse))
-      Log(ctx) << "incremental: soft-config metadata changed; rebuilding PDB metadata";
+    loaded->pdbReuse.match([&](const ReusePdbMetadata &) {},
+                           [&](const RebuildPdbMetadata &) {
+                             Log(ctx) << "incremental: soft-config metadata "
+                                         "changed; rebuilding PDB metadata";
+                           });
   }
 
+  PendingFullImageBuild pending = takePendingFullImageBuild(ctx);
   installIncrementalCoordinator(
       ctx, IncrementalCoordinator::makeLayoutStableLink(
                std::move(loaded->baseline), std::move(loaded->pdbReuse),
-               std::move(loaded->baselineEmission)));
+               std::move(pending.baselineEmission)));
 }
 
 void finalizeIncrementalLink(COFFLinkerContext &ctx) {
-  if (errorCount() != 0 || !shouldEmitIncrementalBaseline(ctx))
+  if (errorCount() != 0 || !shouldEmitIncrementalBaselineImpl(ctx))
     return;
 
   IncrementalCurrentInputs currentInputs = prepareCurrentIncrementalInputs(ctx);
-  const ByteReuseLink *activeReuse = findActiveByteReuseLink(ctx);
-  const IncrementalReuseData *reuseData = activeReuse ? &activeReuse->reuse : nullptr;
+  const ByteReuseLink *activeReuse = findActiveByteReuseLinkImpl(ctx);
+  const IncrementalReuseData *reuseData =
+      activeReuse ? &activeReuse->reuse : nullptr;
 
   IncrementalStateBuildResult buildResult =
       buildIncrementalState(ctx, currentInputs, reuseData);
   if (!shouldEmitNextBaseline(buildResult.baselineEmission))
     return;
-  if (Error err =
-          writeIncrementalState(ctx.config.incrementalStatePath, buildResult.state))
-    Warn(ctx) << "failed to write incremental state: " << toString(std::move(err));
+  if (Error err = writeIncrementalState(ctx.config.incrementalStatePath,
+                                        buildResult.state))
+    Warn(ctx) << "failed to write incremental state: "
+              << toString(std::move(err));
 }
 
 void noteIncrementalArchiveMemberLoad(COFFLinkerContext &ctx,
@@ -1460,7 +1374,7 @@ void noteIncrementalArchiveMemberLoad(COFFLinkerContext &ctx,
   if (archiveName.empty())
     return;
 
-  IncrementalBaselineData *baseline = findActiveIncrementalBaseline(ctx);
+  IncrementalBaselineData *baseline = findActiveIncrementalBaselineImpl(ctx);
   if (!baseline || !baseline->replayableArchives.contains(archiveName))
     return;
   baseline->loadedArchiveMembers.insert(

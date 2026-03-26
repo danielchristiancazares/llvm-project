@@ -2206,7 +2206,19 @@ void PDBLinker::addImportFilesToPDB() {
 }
 
 void PDBLinker::addIncrementalRedirectsToPDB() {
-  const ByteReuseLink *reuseLink = findActiveByteReuseLink(ctx);
+  const ByteReuseLink *reuseLink = ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const ByteReuseLink * {
+        return nullptr;
+      },
+      [&](const PendingFullImageBuild &) -> const ByteReuseLink * {
+        return nullptr;
+      },
+      [&](const FullImageBuild &) -> const ByteReuseLink * { return nullptr; },
+      [&](const StateBackedLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const LayoutStableLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const ByteReuseLink &reuse) -> const ByteReuseLink * {
+        return &reuse;
+      });
   if (!reuseLink || reuseLink->reuse.currentTextRedirects.empty())
     return;
 
