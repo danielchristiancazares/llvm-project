@@ -1,0 +1,15 @@
+# REQUIRES: x86
+# RUN: yaml2obj %S/Inputs/pdb-symbol-subsection-corrupt-yaml.yaml -o %t.obj
+# RUN: lld-link -safeseh:no /debug /nodefaultlib /entry:_main /out:%t.exe /pdb:%t.pdb %t.obj 2>&1 | FileCheck %s --check-prefix=WARN
+# RUN: llvm-pdbutil dump -symbols -globals %t.pdb | FileCheck %s --check-prefix=GLOBAL
+# RUN: llvm-pdbutil dump -symbols %t.pdb | FileCheck %s --check-prefix=MODULE
+
+# WARN: corrupt symbol records in
+# WARN-NOT: corrupt symbol records in
+# WARN-NOT: badProc
+
+# GLOBAL: validProc
+# GLOBAL-NOT: badProc
+
+# MODULE: validProc
+# MODULE-NOT: badProc

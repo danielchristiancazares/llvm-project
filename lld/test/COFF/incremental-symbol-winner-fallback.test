@@ -1,0 +1,49 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.out && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main.s -o main.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc winner1-v1.s -o winner1.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc winner2.s -o winner2.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj winner1.obj winner2.obj && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc winner1-v2.s -o winner1.obj && \
+# RUN:   echo CHANGED > %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj winner1.obj winner2.obj >> %t.out 2>&1 && \
+# RUN:   echo REUSE >> %t.out && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug:symtab -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj winner1.obj winner2.obj >> %t.out 2>&1 && \
+# RUN:   FileCheck %s < %t.out
+
+# CHECK: CHANGED
+# CHECK: incremental: fallback: LayoutChanged
+# CHECK: incremental: detail: symbol winner changed: target
+# CHECK: REUSE
+# CHECK: incremental: using state
+# CHECK: incremental: exact-layout reuse active
+
+#--- main.s
+.section .text,"xr",one_only,main
+.globl main
+main:
+  callq target
+  xorl %eax, %eax
+  retq
+
+#--- winner1-v1.s
+.section .text$target,"xr",largest,target
+.globl target
+target:
+  retq
+
+#--- winner1-v2.s
+.section .text$target,"xr",largest,target
+.globl target
+target:
+  nop
+  nop
+  retq
+
+#--- winner2.s
+.section .text$target,"xr",largest,target
+.globl target
+target:
+  nop
+  retq

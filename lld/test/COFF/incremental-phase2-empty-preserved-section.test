@@ -15,10 +15,10 @@
 # RUN:   FileCheck %s --check-prefix=SECTIONS < after.txt
 
 # CHECK: SECOND
-# CHECK: incremental: using state
-# CHECK: incremental: phase2 active
+# CHECK: incremental: fallback: LayoutChanged
+# CHECK: incremental: detail: resolved symbol count changed
 
-# SECTIONS: Name: .data
+# SECTIONS: Name: .rdata
 
 #--- v1.s
 .section .text,"xr",one_only,main
