@@ -900,7 +900,7 @@ void TpiSource::mergeTypeRecord(TypeIndex curIndex, CVType ty) {
   size_t newSize = alignTo(ty.length(), 4);
   merged.recs.resize(offset + newSize);
   auto newRec = MutableArrayRef(&merged.recs[offset], newSize);
-  memcpy(newRec.data(), ty.data().data(), newSize);
+  memcpy(newRec.data(), ty.data().data(), ty.length());
 
   // Fix up the record prefix and padding bytes if it required resizing.
   if (newSize != ty.length()) {
@@ -909,8 +909,12 @@ void TpiSource::mergeTypeRecord(TypeIndex curIndex, CVType ty) {
       newRec[i] = LF_PAD0 + (newSize - i);
   }
 
+  bool isFuncIdRecord = ty.kind() == LF_FUNC_ID || ty.kind() == LF_MFUNC_ID;
+  bool hasFuncIdLayout = !isFuncIdRecord || ty.length() >= 12;
+
   // Remap the type indices in the new record.
-  remapTypesInTypeRecord(newRec);
+  if (hasFuncIdLayout)
+    remapTypesInTypeRecord(newRec);
   uint32_t pdbHash = check(pdb::hashTypeRecord(CVType(newRec)));
   merged.recSizes.push_back(static_cast<uint16_t>(newSize));
   merged.recHashes.push_back(pdbHash);
@@ -918,14 +922,14 @@ void TpiSource::mergeTypeRecord(TypeIndex curIndex, CVType ty) {
   // Retain a mapping from PDB function id to PDB function type. This mapping is
   // used during symbol processing to rewrite S_GPROC32_ID symbols to S_GPROC32
   // symbols.
-  if (ty.kind() == LF_FUNC_ID || ty.kind() == LF_MFUNC_ID) {
-    bool success = ty.length() >= 12;
+  if (isFuncIdRecord) {
+    bool success = hasFuncIdLayout;
     TypeIndex funcId = curIndex;
     if (success)
       success &= remapTypeIndex(funcId, TiRefKind::IndexRef);
-    TypeIndex funcType =
-        *reinterpret_cast<const TypeIndex *>(&newRec.data()[8]);
     if (success) {
+      TypeIndex funcType;
+      memcpy(&funcType, newRec.data() + 8, sizeof(funcType));
       funcIdToType.push_back({funcId, funcType});
     } else {
       StringRef fname = file ? file->getName() : "<unknown PDB>";

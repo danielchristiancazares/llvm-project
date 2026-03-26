@@ -10,25 +10,11 @@ using namespace llvm::object;
 
 namespace lld::coff {
 
-bool isIncrementalControlFlowRefKind(IncrementalRefKind kind) {
-  switch (kind) {
-  case IncrementalRefKind::DirectCall:
-  case IncrementalRefKind::DirectJump:
-  case IncrementalRefKind::DirectCondJump:
-    return true;
-  case IncrementalRefKind::Unknown:
-  case IncrementalRefKind::DataAddress:
-  case IncrementalRefKind::RipRelativeData:
-  case IncrementalRefKind::NonEntryCodeRef:
-    return false;
-  }
-  llvm_unreachable("unknown incremental ref kind");
-}
+namespace {
 
-std::optional<IncrementalCanonicalEntry>
-findIncrementalCanonicalEntry(const SectionChunk &chunk) {
+static bool hasIncrementalCanonicalEntry(const SectionChunk &chunk) {
   if (chunk.sym && chunk.sym->getValue() == 0)
-    return IncrementalCanonicalEntry{chunk.sym->getName().str(), 0};
+    return true;
 
   SmallVector<std::string, 4> candidates;
   uint32_t sectionNumber = chunk.getSectionNumber();
@@ -42,11 +28,35 @@ findIncrementalCanonicalEntry(const SectionChunk &chunk) {
       continue;
     candidates.push_back(nameOrErr->str());
   }
-  if (candidates.empty())
-    return std::nullopt;
-  llvm::sort(candidates);
-  return IncrementalCanonicalEntry{candidates.front(), 0};
+  return !candidates.empty();
 }
+
+static IncrementalEdgeRouting classifyIncrementalAmd64Rel32Routing(
+    const SectionChunk &source, const coff_relocation &rel,
+    uint32_t targetOffset, bool targetHasCanonicalEntry) {
+  if (rel.VirtualAddress > source.getContents().size())
+    return IncrementalEdgeRouting::BodyOnlyReference;
+
+  if (targetOffset != 0 || !targetHasCanonicalEntry)
+    return IncrementalEdgeRouting::BodyOnlyReference;
+
+  ArrayRef<uint8_t> contents = source.getContents();
+  if (rel.VirtualAddress >= 1) {
+    uint8_t opcode = contents[rel.VirtualAddress - 1];
+    if (opcode == 0xE8 || opcode == 0xE9)
+      return IncrementalEdgeRouting::RedirectEligibleEntryReference;
+  }
+
+  if (rel.VirtualAddress >= 2 && contents[rel.VirtualAddress - 2] == 0x0F) {
+    uint8_t opcode = contents[rel.VirtualAddress - 1];
+    if ((opcode & 0xF0) == 0x80)
+      return IncrementalEdgeRouting::RedirectEligibleEntryReference;
+  }
+
+  return IncrementalEdgeRouting::BodyOnlyReference;
+}
+
+} // namespace
 
 Defined *findIncrementalCanonicalEntrySymbol(const SectionChunk &chunk) {
   if (chunk.sym && chunk.sym->getValue() == 0)
@@ -70,43 +80,9 @@ Defined *findIncrementalCanonicalEntrySymbol(const SectionChunk &chunk) {
   return candidates.front();
 }
 
-IncrementalRefKind classifyIncrementalAmd64Rel32Ref(
-    const SectionChunk &source, const coff_relocation &rel, uint32_t targetOffset,
-    bool &redirectEligible) {
-  redirectEligible = false;
-  ArrayRef<uint8_t> contents = source.getContents();
-  if (rel.VirtualAddress > contents.size())
-    return IncrementalRefKind::Unknown;
-
-  if (targetOffset != 0)
-    return IncrementalRefKind::NonEntryCodeRef;
-
-  if (rel.VirtualAddress >= 1) {
-    uint8_t opcode = contents[rel.VirtualAddress - 1];
-    if (opcode == 0xE8) {
-      redirectEligible = true;
-      return IncrementalRefKind::DirectCall;
-    }
-    if (opcode == 0xE9) {
-      redirectEligible = true;
-      return IncrementalRefKind::DirectJump;
-    }
-  }
-
-  if (rel.VirtualAddress >= 2 && contents[rel.VirtualAddress - 2] == 0x0F) {
-    uint8_t opcode = contents[rel.VirtualAddress - 1];
-    if ((opcode & 0xF0) == 0x80) {
-      redirectEligible = true;
-      return IncrementalRefKind::DirectCondJump;
-    }
-  }
-
-  return IncrementalRefKind::Unknown;
-}
-
 std::vector<IncrementalEdgeState>
 buildIncrementalEdgeStates(COFFLinkerContext &ctx,
-                           IncrementalLinkSession &session) {
+                           const IncrementalInputIndexMap &inputIndices) {
   std::vector<IncrementalEdgeState> edges;
   StringMap<bool> targetHasCanonicalEntry;
 
@@ -116,7 +92,7 @@ buildIncrementalEdgeStates(COFFLinkerContext &ctx,
       if (!source || !source->file)
         continue;
 
-      std::string sourceKey = getIncrementalChunkKey(session, *source);
+      std::string sourceKey = getIncrementalChunkKey(inputIndices, *source);
       for (const coff_relocation &rel : source->getRelocs()) {
         auto *sym =
             dyn_cast_or_null<Defined>(source->file->getSymbol(rel.SymbolTableIndex));
@@ -129,29 +105,28 @@ buildIncrementalEdgeStates(COFFLinkerContext &ctx,
         if (!(targetChunk->getOutputCharacteristics() & llvm::COFF::IMAGE_SCN_CNT_CODE))
           continue;
 
-        std::string targetKey = getIncrementalChunkKey(session, *targetChunk);
+        std::string targetKey = getIncrementalChunkKey(inputIndices, *targetChunk);
         uint32_t targetOffset = sym->getRVA() - targetChunk->getRVA();
 
-        bool redirectEligible = false;
-        IncrementalRefKind kind = IncrementalRefKind::Unknown;
+        IncrementalEdgeRouting routing =
+            IncrementalEdgeRouting::BodyOnlyReference;
         if (source->getMachine() == AMD64) {
           auto it = targetHasCanonicalEntry.find(targetKey);
           if (it == targetHasCanonicalEntry.end()) {
-            bool hasEntry = findIncrementalCanonicalEntry(*targetChunk).has_value();
+            bool hasEntry = hasIncrementalCanonicalEntry(*targetChunk);
             it = targetHasCanonicalEntry.try_emplace(targetKey, hasEntry).first;
           }
-          kind = classifyIncrementalAmd64Rel32Ref(*source, rel, targetOffset,
-                                                  redirectEligible);
-          redirectEligible &= it->second;
+          routing = classifyIncrementalAmd64Rel32Routing(*source, rel,
+                                                         targetOffset,
+                                                         it->second);
         }
 
         IncrementalEdgeState edge;
         edge.sourceKey = sourceKey;
         edge.targetKey = targetKey;
-        edge.kind = kind;
+        edge.routing = routing;
         edge.sourceOffset = rel.VirtualAddress;
         edge.targetOffset = targetOffset;
-        edge.redirectEligible = redirectEligible;
         edges.push_back(std::move(edge));
       }
     }
@@ -160,9 +135,9 @@ buildIncrementalEdgeStates(COFFLinkerContext &ctx,
   llvm::sort(edges, [](const IncrementalEdgeState &lhs,
                        const IncrementalEdgeState &rhs) {
     return std::tie(lhs.sourceKey, lhs.sourceOffset, lhs.targetKey, lhs.targetOffset,
-                    lhs.kind) <
+                    lhs.routing) <
            std::tie(rhs.sourceKey, rhs.sourceOffset, rhs.targetKey, rhs.targetOffset,
-                    rhs.kind);
+                    rhs.routing);
   });
   return edges;
 }

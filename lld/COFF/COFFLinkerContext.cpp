@@ -18,6 +18,7 @@
 namespace lld::coff {
 COFFLinkerContext::COFFLinkerContext()
     : driver(*this), symtab(*this),
+      incremental(IncrementalCoordinator::makeDisabled()),
       ltoTextSection(llvm::COFF::IMAGE_SCN_MEM_EXECUTE),
       ltoDataSection(llvm::COFF::IMAGE_SCN_CNT_INITIALIZED_DATA),
       ltoTextSectionChunk(&ltoTextSection.section),

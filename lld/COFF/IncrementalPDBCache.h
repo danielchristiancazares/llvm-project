@@ -131,6 +131,13 @@ struct IncrementalPDBCacheFile {
   std::vector<IncrementalPDBModuleCacheEntry> moduleEntries;
 };
 
+enum class IncrementalPDBCacheRuntimeMode : uint8_t {
+  BypassCache = 1,
+  ReplayOnlyCache = 2,
+  RecordOnlyCache = 3,
+  ReplayAndRecordCache = 4,
+};
+
 class IncrementalPDBCacheSession {
 public:
   static std::unique_ptr<IncrementalPDBCacheSession>
@@ -148,8 +155,7 @@ public:
                                               IncrementalPDBModuleCacheEntry>
                              &modulePlans) const;
 
-  bool readEnabled() const { return canReadCache; }
-  bool writeEnabled() const { return canWriteCache; }
+  IncrementalPDBCacheRuntimeMode runtimeMode() const { return mode; }
   uint64_t getTypeCacheHits() const { return typeCacheHits; }
   uint64_t getTypeCacheMisses() const { return typeCacheMisses; }
   uint64_t getModuleCacheHits() const { return moduleCacheHits; }
@@ -165,9 +171,8 @@ private:
 
   COFFLinkerContext &ctx;
   llvm::SmallString<128> cachePath;
-  bool canReadCache = false;
-  bool canWriteCache = false;
-  bool loadedCacheValid = false;
+  IncrementalPDBCacheRuntimeMode mode =
+      IncrementalPDBCacheRuntimeMode::BypassCache;
   IncrementalPDBCacheFile loadedCache;
   llvm::StringMap<const IncrementalPDBTypeCacheEntry *> loadedTypesByKey;
   llvm::StringMap<const IncrementalPDBModuleCacheEntry *> loadedModulesByKey;
@@ -181,8 +186,8 @@ private:
 llvm::SmallString<128>
 getIncrementalPDBCachePath(const Configuration &config);
 
-bool shouldReadIncrementalPDBCache(const COFFLinkerContext &ctx);
-bool shouldWriteIncrementalPDBCache(const COFFLinkerContext &ctx);
+IncrementalPDBCacheRuntimeMode
+classifyIncrementalPDBCacheRuntimeMode(const COFFLinkerContext &ctx);
 uint64_t computeIncrementalPDBCacheBuildId();
 uint64_t computeIncrementalPDBCacheHardConfigHash(const Configuration &config);
 llvm::Expected<IncrementalPDBCacheFile>

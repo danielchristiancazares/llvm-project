@@ -13,6 +13,7 @@
 #include "Config.h"
 #include "DebugTypes.h"
 #include "Driver.h"
+#include "Incremental.h"
 #include "InputFiles.h"
 #include "PDB.h"
 #include "SymbolTable.h"
@@ -22,7 +23,6 @@
 
 namespace lld::coff {
 
-class IncrementalLinkSession;
 class IncrementalPDBCacheSession;
 
 class COFFLinkerContext : public CommonLinkerContext {
@@ -145,7 +145,8 @@ public:
   std::optional<PDBStats> pdbStats;
 
   Configuration config;
-  std::unique_ptr<IncrementalLinkSession> incrementalSession;
+  std::unique_ptr<IncrementalCoordinator> incremental;
+  std::unique_ptr<PendingFullImageBuild> pendingIncrementalFallback;
   std::unique_ptr<IncrementalPDBCacheSession> pdbCacheSession;
 
   DynamicRelocsChunk *dynamicRelocs = nullptr;

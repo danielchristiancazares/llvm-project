@@ -273,7 +273,7 @@ std::vector<InputFile *> BitcodeCompiler::compile() {
       ltoObjName = saver().save(path.str());
     }
     if (llvm::is_contained(ctx.config.saveTempsArgs, "prelink") || emitASM)
-      saveBuffer(buf[i].second, ltoObjName);
+      saveBuffer(objBuf, ltoObjName);
     if (!emitASM)
       ret.push_back(ObjFile::create(ctx, MemoryBufferRef(objBuf, ltoObjName)));
   }

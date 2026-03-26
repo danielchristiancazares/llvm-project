@@ -382,11 +382,10 @@ void OutputSection::setPermissions(uint32_t c) {
 
 static bool isIncrementalPreservedSection(const COFFLinkerContext &ctx,
                                           const OutputSection *section) {
-  if (!ctx.incrementalSession || !ctx.incrementalSession->stateLoaded ||
-      ctx.incrementalSession->state.layoutMode != IncrementalLayoutMode::Slotted)
+  const IncrementalStateFile *loadedState = findActiveIncrementalLoadedState(ctx);
+  if (!loadedState || loadedState->layoutMode != IncrementalLayoutMode::Slotted)
     return false;
-  for (const IncrementalSectionState &oldSection :
-       ctx.incrementalSession->state.sections)
+  for (const IncrementalSectionState &oldSection : loadedState->sections)
     if (section->name == oldSection.name &&
         section->header.Characteristics == oldSection.characteristics)
       return true;
@@ -814,7 +813,7 @@ void Writer::run() {
       sizeOfHeaders = incrementalLayout.sizeOfHeaders;
     }
     removeEmptySections();
-    if (ctx.config.incrementalLinkActive)
+    if (findActiveByteReuseLink(ctx))
       refreshExceptionTableRanges();
     assignOutputSectionIndices();
     setSectionPermissions();

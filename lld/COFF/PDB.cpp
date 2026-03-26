@@ -493,9 +493,9 @@ void PDBLinker::translateIdSymbols(MutableArrayRef<uint8_t> &recordData,
       } else {
         if (tMerger.getIDTable().contains(*ti)) {
           CVType funcIdData = tMerger.getIDTable().getType(*ti);
-          if (funcIdData.length() >= 8 && (funcIdData.kind() == LF_FUNC_ID ||
-                                           funcIdData.kind() == LF_MFUNC_ID)) {
-            newType = *reinterpret_cast<const TypeIndex *>(&funcIdData.data()[8]);
+          if (funcIdData.length() >= 12 && (funcIdData.kind() == LF_FUNC_ID ||
+                                            funcIdData.kind() == LF_MFUNC_ID)) {
+            memcpy(&newType, funcIdData.data().data() + 8, sizeof(newType));
           }
         }
       }
@@ -1612,7 +1612,11 @@ void PDBLinker::addDebugSymbols(TpiSource *source) {
   }
 
   IncrementalPDBModuleCacheEntry *recordedPlan = nullptr;
-  if (ctx.pdbCacheSession && ctx.pdbCacheSession->writeEnabled()) {
+  if (ctx.pdbCacheSession &&
+      (ctx.pdbCacheSession->runtimeMode() ==
+           IncrementalPDBCacheRuntimeMode::RecordOnlyCache ||
+       ctx.pdbCacheSession->runtimeMode() ==
+           IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache)) {
     IncrementalPDBModuleCacheEntry &entry = modulePlans[source->file];
     entry = cachedPlan ? *cachedPlan : IncrementalPDBModuleCacheEntry();
     entry.path = source->file->getName().str();
@@ -2202,8 +2206,8 @@ void PDBLinker::addImportFilesToPDB() {
 }
 
 void PDBLinker::addIncrementalRedirectsToPDB() {
-  if (!ctx.incrementalSession ||
-      ctx.incrementalSession->currentTextRedirects.empty())
+  const ByteReuseLink *reuseLink = findActiveByteReuseLink(ctx);
+  if (!reuseLink || reuseLink->reuse.currentTextRedirects.empty())
     return;
 
   ExitOnError exitOnErr;
@@ -2266,14 +2270,14 @@ void PDBLinker::addIncrementalRedirectsToPDB() {
   };
 
   for (const IncrementalTextRedirectState &redirect :
-       ctx.incrementalSession->currentTextRedirects) {
+       reuseLink->reuse.currentTextRedirects) {
     if (Defined *redirectSym =
-            ctx.incrementalSession->redirectSymbols.lookup(redirect.targetKey))
+            reuseLink->reuse.redirectSymbols.lookup(redirect.targetKey))
       addThunkRecord(saver().save(redirect.canonicalSymbol + "$redirect"),
                      redirectSym);
     if (redirect.poolThunkRVA != 0)
       if (Defined *poolSym =
-              ctx.incrementalSession->poolThunkSymbols.lookup(redirect.targetKey))
+              reuseLink->reuse.poolThunkSymbols.lookup(redirect.targetKey))
         addThunkRecord(saver().save(redirect.canonicalSymbol + "$pool"),
                        poolSym);
   }

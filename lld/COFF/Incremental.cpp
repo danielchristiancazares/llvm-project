@@ -22,7 +22,114 @@ using namespace llvm::object;
 
 namespace lld::coff {
 
+std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeDisabled() {
+  return std::unique_ptr<IncrementalCoordinator>(
+      new IncrementalCoordinator(State::make<IncrementalDisabled>()));
+}
+
+std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeFullImageBuild(
+    IncrementalFallbackReason fallbackReason, std::string fallbackDetail,
+    IncrementalBaselineEmission baselineEmission) {
+  return std::unique_ptr<IncrementalCoordinator>(new IncrementalCoordinator(
+      State::make<FullImageBuild>(
+          FullImageBuild{fallbackReason, std::move(fallbackDetail),
+                         std::move(baselineEmission)})));
+}
+
+std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeStateBackedLink(
+    IncrementalBaselineData baseline, IncrementalPdbReusePolicy pdbReuse,
+    IncrementalBaselineEmission baselineEmission) {
+  return std::unique_ptr<IncrementalCoordinator>(new IncrementalCoordinator(
+      State::make<StateBackedLink>(StateBackedLink{
+          std::move(baseline), std::move(pdbReuse), std::move(baselineEmission)})));
+}
+
+std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeLayoutStableLink(
+    IncrementalBaselineData baseline, IncrementalPdbReusePolicy pdbReuse,
+    IncrementalBaselineEmission baselineEmission) {
+  return std::unique_ptr<IncrementalCoordinator>(new IncrementalCoordinator(
+      State::make<LayoutStableLink>(
+          LayoutStableLink{std::move(baseline), std::move(pdbReuse),
+                           std::move(baselineEmission)})));
+}
+
+std::unique_ptr<IncrementalCoordinator> IncrementalCoordinator::makeByteReuseLink(
+    IncrementalBaselineData baseline, IncrementalReuseData reuse,
+    IncrementalPdbReusePolicy pdbReuse,
+    IncrementalBaselineEmission baselineEmission) {
+  return std::unique_ptr<IncrementalCoordinator>(new IncrementalCoordinator(
+      State::make<ByteReuseLink>(ByteReuseLink{std::move(baseline),
+                                               std::move(reuse),
+                                               std::move(pdbReuse),
+                                               std::move(baselineEmission)})));
+}
+
 namespace {
+
+struct IncrementalStateBuildResult {
+  IncrementalBaselineEmission baselineEmission =
+      IncrementalBaselineEmission::make<EmitNextBaseline>();
+  IncrementalStateFile state;
+};
+
+static bool shouldEmitNextBaseline(
+    const IncrementalBaselineEmission &baselineEmission) {
+  return baselineEmission.match(
+      [](const EmitNextBaseline &) { return true; },
+      [](const SkipNextBaseline &) { return false; });
+}
+
+static bool shouldReusePdbMetadata(
+    const IncrementalPdbReusePolicy &pdbReuse) {
+  return pdbReuse.match([](const ReusePdbMetadata &) { return true; },
+                        [](const RebuildPdbMetadata &) { return false; });
+}
+
+static void clearPendingIncrementalFallback(COFFLinkerContext &ctx) {
+  ctx.pendingIncrementalFallback.reset();
+}
+
+static void logFullImageBuild(COFFLinkerContext &ctx,
+                              IncrementalFallbackReason reason,
+                              StringRef detail) {
+  if (!ctx.config.verbose || reason == IncrementalFallbackReason::None)
+    return;
+  Log(ctx) << "incremental: fallback: "
+           << incrementalFallbackReasonToString(reason);
+  if (!detail.empty())
+    Log(ctx) << "incremental: detail: " << detail;
+}
+
+static void installIncrementalCoordinatorImpl(
+    COFFLinkerContext &ctx, std::unique_ptr<IncrementalCoordinator> coordinator) {
+  ctx.incremental = std::move(coordinator);
+  clearPendingIncrementalFallback(ctx);
+}
+
+static std::unique_ptr<IncrementalCoordinator>
+buildFullImageBuild(COFFLinkerContext &ctx, IncrementalFallbackReason reason,
+                    const Twine &detail,
+                    IncrementalBaselineEmission baselineEmission) {
+  std::string detailText = detail.str();
+  logFullImageBuild(ctx, reason, detailText);
+  return IncrementalCoordinator::makeFullImageBuild(
+      reason, std::move(detailText), std::move(baselineEmission));
+}
+
+static std::unique_ptr<FullImageBuild> consumePendingIncrementalFallbackImpl(
+    COFFLinkerContext &ctx, IncrementalBaselineEmission baselineEmission,
+    IncrementalFallbackReason defaultReason, const Twine &defaultDetail) {
+  if (!ctx.pendingIncrementalFallback)
+    return std::make_unique<FullImageBuild>(FullImageBuild{
+        defaultReason, defaultDetail.str(), std::move(baselineEmission)});
+
+  std::unique_ptr<FullImageBuild> fallback = std::make_unique<FullImageBuild>(
+      FullImageBuild{ctx.pendingIncrementalFallback->fallbackReason,
+                     ctx.pendingIncrementalFallback->fallbackDetail,
+                     std::move(baselineEmission)});
+  clearPendingIncrementalFallback(ctx);
+  return fallback;
+}
 
 static bool hasBitcodeInputs(COFFLinkerContext &ctx) {
   bool hasBitcode = false;
@@ -30,6 +137,149 @@ static bool hasBitcodeInputs(COFFLinkerContext &ctx) {
     hasBitcode |= !symtab.bitcodeFileInstances.empty();
   });
   return hasBitcode;
+}
+
+static std::unique_ptr<StateBackedLink>
+takeStateBackedLink(COFFLinkerContext &ctx) {
+  std::unique_ptr<StateBackedLink> result;
+  ctx.incremental->match(
+      [&](IncrementalDisabled &) {},
+      [&](FullImageBuild &) {},
+      [&](StateBackedLink &loaded) {
+        result = std::make_unique<StateBackedLink>(std::move(loaded));
+      },
+      [&](LayoutStableLink &) {},
+      [&](ByteReuseLink &) {});
+  if (result)
+    ctx.incremental = IncrementalCoordinator::makeDisabled();
+  return result;
+}
+
+static std::unique_ptr<LayoutStableLink>
+takeLayoutStableLink(COFFLinkerContext &ctx) {
+  std::unique_ptr<LayoutStableLink> result;
+  ctx.incremental->match(
+      [&](IncrementalDisabled &) {},
+      [&](FullImageBuild &) {},
+      [&](StateBackedLink &) {},
+      [&](LayoutStableLink &validated) {
+        result = std::make_unique<LayoutStableLink>(std::move(validated));
+      },
+      [&](ByteReuseLink &) {});
+  if (result)
+    ctx.incremental = IncrementalCoordinator::makeDisabled();
+  return result;
+}
+
+static ByteReuseLink *findActiveByteReuseLinkImpl(COFFLinkerContext &ctx) {
+  return ctx.incremental->match(
+      [&](IncrementalDisabled &) -> ByteReuseLink * { return nullptr; },
+      [&](FullImageBuild &) -> ByteReuseLink * { return nullptr; },
+      [&](StateBackedLink &) -> ByteReuseLink * { return nullptr; },
+      [&](LayoutStableLink &) -> ByteReuseLink * { return nullptr; },
+      [&](ByteReuseLink &reuse) -> ByteReuseLink * { return &reuse; });
+}
+
+static const ByteReuseLink *
+findActiveByteReuseLinkImpl(const COFFLinkerContext &ctx) {
+  return ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const ByteReuseLink * {
+        return nullptr;
+      },
+      [&](const FullImageBuild &) -> const ByteReuseLink * { return nullptr; },
+      [&](const StateBackedLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const LayoutStableLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const ByteReuseLink &reuse) -> const ByteReuseLink * {
+        return &reuse;
+      });
+}
+
+static IncrementalBaselineData *
+findActiveIncrementalBaselineImpl(COFFLinkerContext &ctx) {
+  return ctx.incremental->match(
+      [&](IncrementalDisabled &) -> IncrementalBaselineData * { return nullptr; },
+      [&](FullImageBuild &) -> IncrementalBaselineData * { return nullptr; },
+      [&](StateBackedLink &loaded) -> IncrementalBaselineData * {
+        return &loaded.baseline;
+      },
+      [&](LayoutStableLink &validated) -> IncrementalBaselineData * {
+        return &validated.baseline;
+      },
+      [&](ByteReuseLink &reuse) -> IncrementalBaselineData * {
+        return &reuse.baseline;
+      });
+}
+
+static const IncrementalBaselineData *
+findActiveIncrementalBaselineImpl(const COFFLinkerContext &ctx) {
+  return ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const IncrementalBaselineData * {
+        return nullptr;
+      },
+      [&](const FullImageBuild &) -> const IncrementalBaselineData * {
+        return nullptr;
+      },
+      [&](const StateBackedLink &loaded) -> const IncrementalBaselineData * {
+        return &loaded.baseline;
+      },
+      [&](const LayoutStableLink &validated)
+          -> const IncrementalBaselineData * { return &validated.baseline; },
+      [&](const ByteReuseLink &reuse) -> const IncrementalBaselineData * {
+        return &reuse.baseline;
+      });
+}
+
+static const IncrementalStateFile *
+findActiveIncrementalLoadedStateImpl(const COFFLinkerContext &ctx) {
+  return ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const IncrementalStateFile * {
+        return nullptr;
+      },
+      [&](const FullImageBuild &) -> const IncrementalStateFile * {
+        return nullptr;
+      },
+      [&](const StateBackedLink &loaded) -> const IncrementalStateFile * {
+        return &loaded.baseline.state;
+      },
+      [&](const LayoutStableLink &validated) -> const IncrementalStateFile * {
+        return &validated.baseline.state;
+      },
+      [&](const ByteReuseLink &reuse) -> const IncrementalStateFile * {
+        return &reuse.baseline.state;
+      });
+}
+
+static bool shouldEmitIncrementalBaselineImpl(const COFFLinkerContext &ctx) {
+  return ctx.incremental->match(
+      [&](const IncrementalDisabled &) { return false; },
+      [&](const FullImageBuild &fresh) {
+        return shouldEmitNextBaseline(fresh.baselineEmission);
+      },
+      [&](const StateBackedLink &loaded) {
+        return shouldEmitNextBaseline(loaded.baselineEmission);
+      },
+      [&](const LayoutStableLink &validated) {
+        return shouldEmitNextBaseline(validated.baselineEmission);
+      },
+      [&](const ByteReuseLink &reuse) {
+        return shouldEmitNextBaseline(reuse.baselineEmission);
+      });
+}
+
+static bool shouldReuseIncrementalPdbMetadataImpl(
+    const COFFLinkerContext &ctx) {
+  return ctx.incremental->match(
+      [&](const IncrementalDisabled &) { return false; },
+      [&](const FullImageBuild &) { return false; },
+      [&](const StateBackedLink &loaded) {
+        return shouldReusePdbMetadata(loaded.pdbReuse);
+      },
+      [&](const LayoutStableLink &validated) {
+        return shouldReusePdbMetadata(validated.pdbReuse);
+      },
+      [&](const ByteReuseLink &reuse) {
+        return shouldReusePdbMetadata(reuse.pdbReuse);
+      });
 }
 
 static void appendSortedStrings(raw_ostream &os, const StringSet<> &set) {
@@ -145,9 +395,16 @@ static uint64_t computeIncrementalResourceInputHash(COFFLinkerContext &ctx) {
   return xxh3_64bits(buffer);
 }
 
-static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
-                                         IncrementalLinkSession &session,
-                                         IncrementalStateFile &state) {
+static IncrementalBaselineEmission
+buildIncrementalLayoutTables(COFFLinkerContext &ctx,
+                             const IncrementalInputIndexMap &inputIndices,
+                             IncrementalStateFile &state) {
+  enum class BaselineEmissionChoice : uint8_t {
+    Emit = 1,
+    Skip = 2,
+  };
+
+  BaselineEmissionChoice baselineEmission = BaselineEmissionChoice::Emit;
   SmallVector<OutputSection *, 16> activeSections;
   for (OutputSection *section : ctx.outputSections)
     if (section->getVirtualSize() != 0)
@@ -157,9 +414,9 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
   for (size_t sectionIndex = 0; sectionIndex < activeSections.size();
        ++sectionIndex) {
     OutputSection *section = activeSections[sectionIndex];
-    IncrementalSlotClass slotClass = classifyIncrementalSection(
+    IncrementalSectionLayoutKind layoutKind = classifyIncrementalSection(
         section->name, section->header.Characteristics);
-    if (slotClass == IncrementalSlotClass::None)
+    if (layoutKind == IncrementalSectionLayoutKind::ExactSectionLayout)
       continue;
 
     IncrementalSectionEnvelopeState envelope;
@@ -170,11 +427,9 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
         sectionIndex + 1 < activeSections.size()
             ? activeSections[sectionIndex + 1]->getRVA()
             : state.sizeOfImage;
-    envelope.slotClass = slotClass;
-    envelope.packedActivePrefix = isIncrementalPackedClass(slotClass);
-    envelope.slotReuseEnabled = isIncrementalSlotReuseClass(slotClass);
+    envelope.layoutKind = layoutKind;
     uint64_t activeEndRVA = section->getRVA() + section->getVirtualSize();
-    if (slotClass == IncrementalSlotClass::Text) {
+    if (layoutKind == IncrementalSectionLayoutKind::TextFreeSlots) {
       activeEndRVA = section->getRVA();
       for (Chunk *chunk : section->chunks) {
         if (isa<IncrementalLongThunkChunkX64>(chunk))
@@ -196,21 +451,21 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
     const IncrementalSectionEnvelopeState &envelope =
         state.sectionEnvelopes[envelopeIndex];
 
-    if (envelope.slotReuseEnabled) {
-      auto disableStateWrite = [&](const Twine &detail) {
-        session.canWriteState = false;
+    if (isIncrementalFreeSlotLayout(envelope.layoutKind)) {
+      auto suppressStateWrite = [&](const Twine &detail) {
+        baselineEmission = BaselineEmissionChoice::Skip;
         if (ctx.config.verbose)
           Log(ctx) << "incremental: not writing state: " << detail;
       };
       auto isPersistedSlotChunk = [&](Chunk *chunk) {
-        return isIncrementalPersistedSlotChunk(envelope.slotClass, *chunk);
+        return isIncrementalPersistedSlotChunk(envelope.layoutKind, *chunk);
       };
       for (size_t chunkIndex = 0; chunkIndex < section->chunks.size();
            ++chunkIndex) {
         Chunk *chunk = section->chunks[chunkIndex];
         if (!isPersistedSlotChunk(chunk))
           continue;
-        std::string key = getIncrementalChunkKey(session, *chunk);
+        std::string key = getIncrementalChunkKey(inputIndices, *chunk);
         bool isPadding = isa<IncrementalPaddingChunk>(chunk);
 
         uint64_t slotEnd = envelope.activeEndRVA;
@@ -224,8 +479,8 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
         }
         if (slotEnd < chunk->getRVA() ||
             slotEnd - chunk->getRVA() < chunk->getSize()) {
-          disableStateWrite("slot table builder found an invalid persisted range");
-          return;
+          suppressStateWrite("slot table builder found an invalid persisted range");
+          return IncrementalBaselineEmission::make<SkipNextBaseline>();
         }
 
         IncrementalSlotRecordState slot;
@@ -235,7 +490,7 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
         slot.committedSize = chunk->getSize();
         slot.minAlignment = chunk->getAlignment();
         slot.fillByte = isPadding ? cast<IncrementalPaddingChunk>(chunk)->getFillByte()
-                                  : getIncrementalFillByte(envelope.slotClass);
+                                  : getIncrementalFillByte(envelope.layoutKind);
         slot.state = isPadding ? IncrementalSlotState::Free
                                : IncrementalSlotState::Occupied;
         if (!isPadding)
@@ -257,7 +512,7 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
       continue;
     }
 
-    if (!envelope.packedActivePrefix)
+    if (!isIncrementalPackedLayout(envelope.layoutKind))
       continue;
 
     IncrementalPackedSectionState packedSection;
@@ -269,7 +524,7 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
     for (Chunk *chunk : section->chunks) {
       if (chunk->getSize() == 0)
         continue;
-      std::string key = getIncrementalChunkKey(session, *chunk);
+      std::string key = getIncrementalChunkKey(inputIndices, *chunk);
       packedSection.recordKeys.push_back(key);
 
       IncrementalPlacementState placement;
@@ -283,11 +538,15 @@ static void buildIncrementalLayoutTables(COFFLinkerContext &ctx,
     }
     state.packedSections.push_back(std::move(packedSection));
   }
+
+  if (baselineEmission == BaselineEmissionChoice::Skip)
+    return IncrementalBaselineEmission::make<SkipNextBaseline>();
+  return IncrementalBaselineEmission::make<EmitNextBaseline>();
 }
 
 static std::vector<IncrementalSymbolState>
 buildIncrementalSymbolStates(COFFLinkerContext &ctx,
-                             IncrementalLinkSession &session) {
+                             const IncrementalInputIndexMap &inputIndices) {
   std::vector<IncrementalSymbolState> states;
   ctx.forEachActiveSymtab([&](SymbolTable &symtab) {
     symtab.forEachSymbol([&](Symbol *sym) {
@@ -304,17 +563,15 @@ buildIncrementalSymbolStates(COFFLinkerContext &ctx,
       if (auto *reg = dyn_cast<DefinedRegular>(sym)) {
         state.kind = IncrementalSymbolKind::Regular;
         if (auto *file = dyn_cast<ObjFile>(reg->getFile()))
-          if (auto it = session.inputIndices.find(file);
-              it != session.inputIndices.end())
+          if (auto it = inputIndices.find(file); it != inputIndices.end())
             state.inputIndex = it->second;
         state.value = reg->getValue();
         if (SectionChunk *chunk = reg->getChunk())
-          state.auxiliaryKey = getIncrementalChunkKey(session, *chunk);
+          state.auxiliaryKey = getIncrementalChunkKey(inputIndices, *chunk);
       } else if (auto *common = dyn_cast<DefinedCommon>(sym)) {
         state.kind = IncrementalSymbolKind::Common;
         if (auto *file = dyn_cast<ObjFile>(common->getFile()))
-          if (auto it = session.inputIndices.find(file);
-              it != session.inputIndices.end())
+          if (auto it = inputIndices.find(file); it != inputIndices.end())
             state.inputIndex = it->second;
         state.value = common->getChunk()->getSize();
         std::string key;
@@ -361,10 +618,11 @@ buildIncrementalSymbolStates(COFFLinkerContext &ctx,
   return states;
 }
 
-static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
-                                                  IncrementalLinkSession &session) {
+static IncrementalStateBuildResult
+buildIncrementalState(COFFLinkerContext &ctx,
+                      const IncrementalCurrentInputs &currentInputs,
+                      const IncrementalReuseData *reuseData) {
   IncrementalStateFile state;
-  state.version = 3;
   state.layoutMode = IncrementalLayoutMode::Slotted;
   state.machine = ctx.config.machine;
   state.outputPath = ctx.config.outputFile;
@@ -408,10 +666,10 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
   state.inputs.reserve(ctx.objFileInstances.size());
   for (size_t i = 0; i < ctx.objFileInstances.size(); ++i) {
     IncrementalInputState input;
-    input.name = session.currentInputNames[i];
-    input.parentName = session.currentParentNames[i];
-    input.archiveOffset = session.currentArchiveOffsets[i];
-    input.contentHash = session.currentInputHashes[i];
+    input.name = currentInputs.names[i];
+    input.parentName = currentInputs.parentNames[i];
+    input.archiveOffset = currentInputs.archiveOffsets[i];
+    input.contentHash = currentInputs.hashes[i];
     input.size = ctx.objFileInstances[i]->mb.getBufferSize();
     state.inputs.push_back(std::move(input));
   }
@@ -433,7 +691,7 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
       Chunk *chunk = section->chunks[i];
       IncrementalChunkState chunkState;
       chunkState.kind = classifyIncrementalChunk(*chunk);
-      chunkState.key = getIncrementalChunkKey(session, *chunk);
+      chunkState.key = getIncrementalChunkKey(currentInputs.inputIndices, *chunk);
       chunkState.sectionIndex = state.sections.size() - 1;
       chunkState.outputCharacteristics = chunk->getOutputCharacteristics();
       chunkState.alignment = chunk->getAlignment();
@@ -446,8 +704,8 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
         chunkState.slotCapacity = sectionEnd - chunk->getRVA();
 
       if (auto *sec = dyn_cast<SectionChunk>(chunk)) {
-        auto it = session.inputIndices.find(sec->file);
-        if (it != session.inputIndices.end())
+        auto it = currentInputs.inputIndices.find(sec->file);
+        if (it != currentInputs.inputIndices.end())
           chunkState.inputIndex = it->second;
         chunkState.sectionNumber = sec->getSectionNumber();
         chunkState.contentHash = xxh3_64bits(sec->getContents());
@@ -457,112 +715,166 @@ static IncrementalStateFile buildIncrementalState(COFFLinkerContext &ctx,
     }
   }
 
-  buildIncrementalLayoutTables(ctx, session, state);
-  state.textRedirects = session.currentTextRedirects;
-  state.textThunkPool = session.currentTextThunkPool;
-  state.symbols = buildIncrementalSymbolStates(ctx, session);
-
-  return state;
+  IncrementalBaselineEmission baselineEmission = buildIncrementalLayoutTables(
+      ctx, currentInputs.inputIndices, state);
+  if (reuseData) {
+    state.textRedirects = reuseData->currentTextRedirects;
+    state.textThunkPool = reuseData->currentTextThunkPool;
+  }
+  state.symbols = buildIncrementalSymbolStates(ctx, currentInputs.inputIndices);
+  return IncrementalStateBuildResult{std::move(baselineEmission),
+                                     std::move(state)};
 }
 
 } // namespace
 
-IncrementalSlotClass classifyIncrementalSection(StringRef name,
-                                                uint32_t characteristics) {
+void installIncrementalCoordinator(
+    COFFLinkerContext &ctx,
+    std::unique_ptr<IncrementalCoordinator> coordinator) {
+  installIncrementalCoordinatorImpl(ctx, std::move(coordinator));
+}
+
+std::unique_ptr<FullImageBuild> consumePendingIncrementalFallback(
+    COFFLinkerContext &ctx, IncrementalBaselineEmission baselineEmission,
+    IncrementalFallbackReason defaultReason, const Twine &defaultDetail) {
+  std::unique_ptr<FullImageBuild> fallback = consumePendingIncrementalFallbackImpl(
+      ctx, std::move(baselineEmission), defaultReason, defaultDetail);
+  logFullImageBuild(ctx, fallback->fallbackReason, fallback->fallbackDetail);
+  return fallback;
+}
+
+IncrementalBaselineData *findActiveIncrementalBaseline(COFFLinkerContext &ctx) {
+  return findActiveIncrementalBaselineImpl(ctx);
+}
+
+const IncrementalBaselineData *
+findActiveIncrementalBaseline(const COFFLinkerContext &ctx) {
+  return findActiveIncrementalBaselineImpl(ctx);
+}
+
+ByteReuseLink *findActiveByteReuseLink(COFFLinkerContext &ctx) {
+  return findActiveByteReuseLinkImpl(ctx);
+}
+
+const ByteReuseLink *findActiveByteReuseLink(const COFFLinkerContext &ctx) {
+  return findActiveByteReuseLinkImpl(ctx);
+}
+
+const IncrementalStateFile *
+findActiveIncrementalLoadedState(const COFFLinkerContext &ctx) {
+  return findActiveIncrementalLoadedStateImpl(ctx);
+}
+
+bool shouldEmitIncrementalBaseline(const COFFLinkerContext &ctx) {
+  return shouldEmitIncrementalBaselineImpl(ctx);
+}
+
+bool shouldReuseIncrementalPdbMetadata(const COFFLinkerContext &ctx) {
+  return shouldReuseIncrementalPdbMetadataImpl(ctx);
+}
+
+IncrementalSectionLayoutKind classifyIncrementalSection(StringRef name,
+                                                        uint32_t characteristics) {
   if (name == ".pdata")
-    return IncrementalSlotClass::PDataPacked;
+    return IncrementalSectionLayoutKind::PackedPDataPrefix;
   if (name == ".xdata")
-    return IncrementalSlotClass::XDataPacked;
+    return IncrementalSectionLayoutKind::PackedXDataPrefix;
   if (name == ".text")
-    return IncrementalSlotClass::Text;
+    return IncrementalSectionLayoutKind::TextFreeSlots;
   if (name == ".rdata")
-    return IncrementalSlotClass::RData;
+    return IncrementalSectionLayoutKind::ReadOnlyDataFreeSlots;
   if (name == ".data")
-    return IncrementalSlotClass::Data;
+    return IncrementalSectionLayoutKind::WritableDataFreeSlots;
 
   if ((characteristics & llvm::COFF::IMAGE_SCN_CNT_CODE) &&
       (characteristics & llvm::COFF::IMAGE_SCN_MEM_EXECUTE))
-    return IncrementalSlotClass::Text;
-  return IncrementalSlotClass::None;
+    return IncrementalSectionLayoutKind::TextFreeSlots;
+  return IncrementalSectionLayoutKind::ExactSectionLayout;
 }
 
-bool isIncrementalSlotReuseClass(IncrementalSlotClass slotClass) {
-  switch (slotClass) {
-  case IncrementalSlotClass::Text:
-  case IncrementalSlotClass::RData:
-  case IncrementalSlotClass::Data:
+bool isIncrementalFreeSlotLayout(IncrementalSectionLayoutKind layoutKind) {
+  switch (layoutKind) {
+  case IncrementalSectionLayoutKind::TextFreeSlots:
+  case IncrementalSectionLayoutKind::ReadOnlyDataFreeSlots:
+  case IncrementalSectionLayoutKind::WritableDataFreeSlots:
     return true;
-  case IncrementalSlotClass::None:
-  case IncrementalSlotClass::PDataPacked:
-  case IncrementalSlotClass::XDataPacked:
+  case IncrementalSectionLayoutKind::ExactSectionLayout:
+  case IncrementalSectionLayoutKind::PackedPDataPrefix:
+  case IncrementalSectionLayoutKind::PackedXDataPrefix:
     return false;
   }
-  llvm_unreachable("unknown incremental slot class");
+  llvm_unreachable("unknown incremental section layout");
 }
 
-bool isIncrementalPackedClass(IncrementalSlotClass slotClass) {
-  switch (slotClass) {
-  case IncrementalSlotClass::PDataPacked:
-  case IncrementalSlotClass::XDataPacked:
+bool isIncrementalPackedLayout(IncrementalSectionLayoutKind layoutKind) {
+  switch (layoutKind) {
+  case IncrementalSectionLayoutKind::PackedPDataPrefix:
+  case IncrementalSectionLayoutKind::PackedXDataPrefix:
     return true;
-  case IncrementalSlotClass::None:
-  case IncrementalSlotClass::Text:
-  case IncrementalSlotClass::RData:
-  case IncrementalSlotClass::Data:
+  case IncrementalSectionLayoutKind::ExactSectionLayout:
+  case IncrementalSectionLayoutKind::TextFreeSlots:
+  case IncrementalSectionLayoutKind::ReadOnlyDataFreeSlots:
+  case IncrementalSectionLayoutKind::WritableDataFreeSlots:
     return false;
   }
-  llvm_unreachable("unknown incremental slot class");
+  llvm_unreachable("unknown incremental section layout");
 }
 
-uint8_t getIncrementalFillByte(IncrementalSlotClass slotClass) {
-  switch (slotClass) {
-  case IncrementalSlotClass::Text:
+uint8_t getIncrementalFillByte(IncrementalSectionLayoutKind layoutKind) {
+  switch (layoutKind) {
+  case IncrementalSectionLayoutKind::TextFreeSlots:
     return 0xCC;
-  case IncrementalSlotClass::RData:
-  case IncrementalSlotClass::Data:
-  case IncrementalSlotClass::PDataPacked:
-  case IncrementalSlotClass::XDataPacked:
-  case IncrementalSlotClass::None:
+  case IncrementalSectionLayoutKind::ReadOnlyDataFreeSlots:
+  case IncrementalSectionLayoutKind::WritableDataFreeSlots:
+  case IncrementalSectionLayoutKind::PackedPDataPrefix:
+  case IncrementalSectionLayoutKind::PackedXDataPrefix:
+  case IncrementalSectionLayoutKind::ExactSectionLayout:
     return 0x00;
   }
-  llvm_unreachable("unknown incremental slot class");
+  llvm_unreachable("unknown incremental section layout");
 }
 
-bool isIncrementalPersistedSlotChunk(IncrementalSlotClass slotClass,
+bool isIncrementalPersistedSlotChunk(IncrementalSectionLayoutKind layoutKind,
                                      const Chunk &chunk) {
   if (chunk.getSize() == 0)
     return false;
-  return slotClass != IncrementalSlotClass::Text ||
+  return layoutKind != IncrementalSectionLayoutKind::TextFreeSlots ||
          !isa<IncrementalLongThunkChunkX64>(&chunk);
 }
 
-std::optional<size_t> findBestFitIncrementalFreeSlot(
+IncrementalFreeSlotSelection findBestFitIncrementalFreeSlot(
     ArrayRef<IncrementalSlotRecordState> slots, uint64_t size,
     uint32_t alignment) {
-  std::optional<size_t> bestIndex;
+  size_t bestIndex = 0;
+  bool found = false;
   for (size_t i = 0; i < slots.size(); ++i) {
     const IncrementalSlotRecordState &slot = slots[i];
     if (slot.capacity < size || slot.startRVA % alignment != 0)
       continue;
-    if (!bestIndex || slot.capacity < slots[*bestIndex].capacity ||
-        (slot.capacity == slots[*bestIndex].capacity &&
-         slot.startRVA < slots[*bestIndex].startRVA))
+    if (!found || slot.capacity < slots[bestIndex].capacity ||
+        (slot.capacity == slots[bestIndex].capacity &&
+         slot.startRVA < slots[bestIndex].startRVA)) {
       bestIndex = i;
+      found = true;
+    }
   }
-  return bestIndex;
+  if (!found)
+    return IncrementalFreeSlotSelection::make<NoFreeSlotFit>();
+  return IncrementalFreeSlotSelection::make<SelectedFreeSlot>(
+      SelectedFreeSlot{bestIndex});
 }
 
-std::optional<uint64_t> allocateIncrementalTailReserve(uint64_t tailCursor,
-                                                       uint64_t maxSectionEndRVA,
-                                                       uint64_t size,
-                                                       uint32_t alignment) {
+IncrementalTailReserveSelection allocateIncrementalTailReserve(
+    uint64_t tailCursor, uint64_t maxSectionEndRVA, uint64_t size,
+    uint32_t alignment) {
   uint64_t startRVA = alignTo(tailCursor, uint64_t(alignment));
   if (startRVA > maxSectionEndRVA || maxSectionEndRVA - startRVA < size)
-    return std::nullopt;
-  return startRVA;
+    return IncrementalTailReserveSelection::make<TailReserveUnavailable>();
+  return IncrementalTailReserveSelection::make<TailReserveStart>(
+      TailReserveStart{startRVA});
 }
 
-std::optional<uint64_t>
+IncrementalTextThunkSelection
 chooseIncrementalTextThunkRVA(uint64_t oldPoolThunkRVA, uint64_t tailCursor,
                               uint64_t poolCursor, uint64_t poolEndRVA,
                               ArrayRef<uint64_t> claimedThunkRVAs,
@@ -579,17 +891,22 @@ chooseIncrementalTextThunkRVA(uint64_t oldPoolThunkRVA, uint64_t tailCursor,
   };
 
   if (canReuse(oldPoolThunkRVA))
-    return oldPoolThunkRVA;
+    return IncrementalTextThunkSelection::make<SelectedPoolThunkRVA>(
+        SelectedPoolThunkRVA{oldPoolThunkRVA});
 
-  std::optional<uint64_t> bestFreedThunkRVA;
+  uint64_t bestFreedThunkRVA = 0;
+  bool foundFreedThunk = false;
   for (uint64_t freedThunkRVA : freedThunkRVAs) {
     if (!canReuse(freedThunkRVA))
       continue;
-    if (!bestFreedThunkRVA || freedThunkRVA > *bestFreedThunkRVA)
+    if (!foundFreedThunk || freedThunkRVA > bestFreedThunkRVA) {
       bestFreedThunkRVA = freedThunkRVA;
+      foundFreedThunk = true;
+    }
   }
-  if (bestFreedThunkRVA)
-    return bestFreedThunkRVA;
+  if (foundFreedThunk)
+    return IncrementalTextThunkSelection::make<SelectedPoolThunkRVA>(
+        SelectedPoolThunkRVA{bestFreedThunkRVA});
 
   uint64_t nextCursor = poolCursor;
   while (nextCursor > tailCursor && nextCursor - tailCursor >= thunkSize) {
@@ -598,10 +915,11 @@ chooseIncrementalTextThunkRVA(uint64_t oldPoolThunkRVA, uint64_t tailCursor,
       break;
     if (candidate <= poolEndRVA && poolEndRVA - candidate >= thunkSize &&
         !isClaimed(candidate))
-      return candidate;
+      return IncrementalTextThunkSelection::make<SelectedPoolThunkRVA>(
+          SelectedPoolThunkRVA{candidate});
     nextCursor = candidate;
   }
-  return std::nullopt;
+  return IncrementalTextThunkSelection::make<PoolThunkUnavailable>();
 }
 
 void planIncrementalTextThunkAssignments(
@@ -615,11 +933,12 @@ void planIncrementalTextThunkAssignments(
         !llvm::is_contained(claimedThunkRVAs, plan.poolThunkRVA))
       freedThunkRVAs.push_back(plan.poolThunkRVA);
     plan.poolThunkRVA = 0;
-    plan.usedPool = false;
+    plan.targeting = IncrementalRedirectTargeting::DirectBodyTarget;
   };
 
   for (IncrementalTextThunkPlanState &plan : plans) {
-    if (!plan.active || plan.bodyRVA == 0 || plan.bodyRVA == plan.redirectRVA)
+    if (plan.engagement != IncrementalRedirectEngagement::Installed ||
+        plan.bodyRVA == 0 || plan.bodyRVA == plan.redirectRVA)
       continue;
 
     bool needPool = !isIncrementalAmd64Rel32InRange(
@@ -630,27 +949,33 @@ void planIncrementalTextThunkAssignments(
     }
 
     if (!allowPoolThunks) {
-      plan.active = false;
+      plan.engagement = IncrementalRedirectEngagement::Deferred;
       releasePoolThunkRVA(plan);
       continue;
     }
 
-    std::optional<uint64_t> poolThunkRVA =
+    IncrementalTextThunkSelection poolThunkSelection =
         chooseIncrementalTextThunkRVA(plan.poolThunkRVA, tailCursor, poolCursor,
                                       poolEndRVA, claimedThunkRVAs,
                                       freedThunkRVAs);
+    const SelectedPoolThunkRVA *poolThunkRVA = poolThunkSelection.match(
+        [](const PoolThunkUnavailable &) -> const SelectedPoolThunkRVA * {
+          return nullptr;
+        },
+        [](const SelectedPoolThunkRVA &selected)
+            -> const SelectedPoolThunkRVA * { return &selected; });
     if (!poolThunkRVA) {
-      plan.active = false;
+      plan.engagement = IncrementalRedirectEngagement::Deferred;
       releasePoolThunkRVA(plan);
       continue;
     }
 
-    if (poolStart == 0 || *poolThunkRVA < poolStart)
-      poolStart = *poolThunkRVA;
-    poolCursor = std::min(poolCursor, *poolThunkRVA);
-    claimedThunkRVAs.push_back(*poolThunkRVA);
-    plan.poolThunkRVA = *poolThunkRVA;
-    plan.usedPool = true;
+    if (poolStart == 0 || poolThunkRVA->rva < poolStart)
+      poolStart = poolThunkRVA->rva;
+    poolCursor = std::min(poolCursor, poolThunkRVA->rva);
+    claimedThunkRVAs.push_back(poolThunkRVA->rva);
+    plan.poolThunkRVA = poolThunkRVA->rva;
+    plan.targeting = IncrementalRedirectTargeting::PoolThunkTarget;
   }
 }
 
@@ -717,15 +1042,8 @@ StringRef incrementalFallbackReasonToString(IncrementalFallbackReason reason) {
 void setIncrementalFallback(COFFLinkerContext &ctx,
                             IncrementalFallbackReason reason,
                             const Twine &detail) {
-  ctx.config.incrementalLinkActive = false;
-  ctx.config.incrementalFallbackReason = reason;
-  ctx.config.incrementalFallbackDetail = detail.str();
-  if (!ctx.config.verbose || reason == IncrementalFallbackReason::None)
-    return;
-  Log(ctx) << "incremental: fallback: "
-           << incrementalFallbackReasonToString(reason);
-  if (!ctx.config.incrementalFallbackDetail.empty())
-    Log(ctx) << "incremental: detail: " << ctx.config.incrementalFallbackDetail;
+  ctx.pendingIncrementalFallback = std::make_unique<PendingFullImageBuild>(
+      PendingFullImageBuild{reason, detail.str()});
 }
 
 uint64_t computeIncrementalHardConfigHash(const Configuration &config) {
@@ -778,24 +1096,21 @@ uint64_t computeIncrementalSoftConfigHash(const Configuration &config) {
   return xxh3_64bits(buffer);
 }
 
-bool prepareCurrentIncrementalInputs(COFFLinkerContext &ctx,
-                                     IncrementalLinkSession &session) {
-  session.currentInputHashes.clear();
-  session.currentInputNames.clear();
-  session.currentParentNames.clear();
-  session.currentArchiveOffsets.clear();
-  session.inputIndices.clear();
-  session.changedInputs.clear();
-  session.reusedChunkData.clear();
+IncrementalCurrentInputs prepareCurrentIncrementalInputs(COFFLinkerContext &ctx) {
+  IncrementalCurrentInputs currentInputs;
+  currentInputs.hashes.reserve(ctx.objFileInstances.size());
+  currentInputs.names.reserve(ctx.objFileInstances.size());
+  currentInputs.parentNames.reserve(ctx.objFileInstances.size());
+  currentInputs.archiveOffsets.reserve(ctx.objFileInstances.size());
   for (size_t i = 0; i < ctx.objFileInstances.size(); ++i) {
     ObjFile *file = ctx.objFileInstances[i];
-    session.inputIndices[file] = i;
-    session.currentInputHashes.push_back(xxh3_64bits(file->mb.getBuffer()));
-    session.currentInputNames.push_back(file->getName().str());
-    session.currentParentNames.push_back(file->archiveName.str());
-    session.currentArchiveOffsets.push_back(file->archiveOffset);
+    currentInputs.inputIndices[file] = i;
+    currentInputs.hashes.push_back(xxh3_64bits(file->mb.getBuffer()));
+    currentInputs.names.push_back(file->getName().str());
+    currentInputs.parentNames.push_back(file->archiveName.str());
+    currentInputs.archiveOffsets.push_back(file->archiveOffset);
   }
-  return true;
+  return currentInputs;
 }
 
 IncrementalChunkKind classifyIncrementalChunk(const Chunk &chunk) {
@@ -811,7 +1126,7 @@ IncrementalChunkKind classifyIncrementalChunk(const Chunk &chunk) {
   return IncrementalChunkKind::Synthetic;
 }
 
-std::string getIncrementalChunkKey(const IncrementalLinkSession &session,
+std::string getIncrementalChunkKey(const IncrementalInputIndexMap &inputIndices,
                                    const Chunk &chunk) {
   std::string key;
   raw_string_ostream os(key);
@@ -830,8 +1145,8 @@ std::string getIncrementalChunkKey(const IncrementalLinkSession &session,
     return os.str();
   }
   if (auto *section = dyn_cast<SectionChunk>(&chunk)) {
-    auto it = session.inputIndices.find(section->file);
-    if (it != session.inputIndices.end())
+    auto it = inputIndices.find(section->file);
+    if (it != inputIndices.end())
       os << "obj:" << it->second << ':';
     else
       os << "obj:?:";
@@ -872,44 +1187,19 @@ uint64_t computeIncrementalSymbolHash(const SectionChunk &chunk) {
   return xxh3_64bits(buffer);
 }
 
-static void disableIncrementalStateReuse(COFFLinkerContext &ctx) {
-  if (!ctx.incrementalSession)
-    return;
-  ctx.incrementalSession->stateLoaded = false;
-  ctx.incrementalSession->changedInputs.clear();
-  ctx.incrementalSession->reusedChunkData.clear();
-}
-
 static bool validateIncrementalSymbolStates(COFFLinkerContext &ctx,
-                                            IncrementalLinkSession &session) {
+                                            const IncrementalBaselineData &baseline) {
   std::vector<IncrementalSymbolState> currentSymbols =
-      buildIncrementalSymbolStates(ctx, session);
-  auto shouldCompareStrictly = [&](const IncrementalSymbolState &state) {
-    if (session.state.layoutMode != IncrementalLayoutMode::Slotted)
-      return true;
-    return state.kind != IncrementalSymbolKind::Regular &&
-           state.kind != IncrementalSymbolKind::Common;
-  };
-
-  SmallVector<const IncrementalSymbolState *, 32> filteredCurrentSymbols;
-  SmallVector<const IncrementalSymbolState *, 32> filteredOldSymbols;
-  for (const IncrementalSymbolState &symbol : currentSymbols)
-    if (shouldCompareStrictly(symbol))
-      filteredCurrentSymbols.push_back(&symbol);
-  for (const IncrementalSymbolState &symbol : session.state.symbols)
-    if (shouldCompareStrictly(symbol))
-      filteredOldSymbols.push_back(&symbol);
-
-  if (filteredCurrentSymbols.size() != filteredOldSymbols.size()) {
+      buildIncrementalSymbolStates(ctx, baseline.currentInputs.inputIndices);
+  if (currentSymbols.size() != baseline.state.symbols.size()) {
     setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                            "resolved symbol count changed");
-    disableIncrementalStateReuse(ctx);
     return false;
   }
 
-  for (size_t i = 0; i < filteredCurrentSymbols.size(); ++i) {
-    const IncrementalSymbolState &current = *filteredCurrentSymbols[i];
-    const IncrementalSymbolState &old = *filteredOldSymbols[i];
+  for (size_t i = 0; i < currentSymbols.size(); ++i) {
+    const IncrementalSymbolState &current = currentSymbols[i];
+    const IncrementalSymbolState &old = baseline.state.symbols[i];
     if (current.name != old.name || current.kind != old.kind ||
         current.inputIndex != old.inputIndex || current.value != old.value ||
         current.auxiliaryKey != old.auxiliaryKey) {
@@ -918,7 +1208,6 @@ static bool validateIncrementalSymbolStates(COFFLinkerContext &ctx,
       os << "symbol winner changed: " << current.name;
       setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                              os.str());
-      disableIncrementalStateReuse(ctx);
       return false;
     }
   }
@@ -926,55 +1215,60 @@ static bool validateIncrementalSymbolStates(COFFLinkerContext &ctx,
 }
 
 void prepareIncrementalLink(COFFLinkerContext &ctx) {
-  ctx.config.incrementalLinkActive = false;
-  ctx.config.incrementalLinkEligible = false;
-  ctx.config.incrementalFallbackReason = IncrementalFallbackReason::None;
-  ctx.config.incrementalFallbackDetail.clear();
-  ctx.incrementalSession.reset();
+  installIncrementalCoordinator(ctx, IncrementalCoordinator::makeDisabled());
 
-  if (!ctx.config.incrementalLinkRequested ||
-      !ctx.config.incrementalLinkSpecified)
+  if (ctx.config.incrementalRequestPolicy !=
+      IncrementalRequestPolicy::AttemptIncrementalReuse)
     return;
 
   ensureIncrementalStatePath(ctx.config);
-  auto session = std::make_unique<IncrementalLinkSession>();
-  session->canWriteState = true;
 
   if (ctx.config.machine != AMD64) {
-    session->canWriteState = false;
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::UnsupportedMachine);
+    installIncrementalCoordinator(
+        ctx, buildFullImageBuild(ctx,
+                                 IncrementalFallbackReason::UnsupportedMachine,
+                                 {},
+                                 IncrementalBaselineEmission::make<
+                                     SkipNextBaseline>()));
     return;
   }
 
   if (hasBitcodeInputs(ctx)) {
-    session->canWriteState = false;
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::LtoInput);
+    installIncrementalCoordinator(
+        ctx, buildFullImageBuild(ctx, IncrementalFallbackReason::LtoInput, {},
+                                 IncrementalBaselineEmission::make<
+                                     SkipNextBaseline>()));
     return;
   }
 
   if (ctx.config.tailMerge) {
-    session->canWriteState = false;
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::TailMergeEnabled);
+    installIncrementalCoordinator(
+        ctx, buildFullImageBuild(ctx,
+                                 IncrementalFallbackReason::TailMergeEnabled,
+                                 {},
+                                 IncrementalBaselineEmission::make<
+                                     SkipNextBaseline>()));
     return;
   }
 
-  ctx.config.incrementalLinkEligible = true;
+  auto installFallback = [&](IncrementalFallbackReason reason,
+                             const Twine &detail = {}) {
+    installIncrementalCoordinator(
+        ctx, buildFullImageBuild(ctx, reason, detail,
+                                 IncrementalBaselineEmission::make<
+                                     EmitNextBaseline>()));
+  };
 
   if (!sys::fs::exists(ctx.config.incrementalStatePath)) {
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::MissingState);
+    installFallback(IncrementalFallbackReason::MissingState);
     return;
   }
 
   Expected<IncrementalStateFile> stateOrErr =
       loadIncrementalState(ctx.config.incrementalStatePath);
   if (!stateOrErr) {
-    std::string message = toString(stateOrErr.takeError());
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::InvalidState, message);
+    installFallback(IncrementalFallbackReason::InvalidState,
+                    toString(stateOrErr.takeError()));
     return;
   }
 
@@ -982,57 +1276,51 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
   uint64_t softHash = computeIncrementalSoftConfigHash(ctx.config);
   if (stateOrErr->machine != ctx.config.machine ||
       stateOrErr->hardConfigHash != hardHash) {
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::ConfigChanged);
+    installFallback(IncrementalFallbackReason::ConfigChanged);
     return;
   }
   if (stateOrErr->outputPath != ctx.config.outputFile) {
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::OutputMismatch,
-                           "incremental state was written for a different output");
+    installFallback(IncrementalFallbackReason::OutputMismatch,
+                    "incremental state was written for a different output");
     return;
   }
   if (stateOrErr->version < 3 ||
       stateOrErr->layoutMode != IncrementalLayoutMode::Slotted) {
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::MissingState,
-                           "phase2 slotted baseline state is missing");
+    installFallback(IncrementalFallbackReason::MissingState,
+                    "slotted baseline state is missing");
     return;
   }
 
   ErrorOr<std::unique_ptr<MemoryBuffer>> oldImage = MemoryBuffer::getFile(
       ctx.config.outputFile, /*IsText=*/false, /*RequiresNullTerminator=*/false);
   if (!oldImage) {
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::OutputMismatch);
+    installFallback(IncrementalFallbackReason::OutputMismatch);
     return;
   }
   if ((*oldImage)->getBufferSize() != stateOrErr->outputSize ||
       xxh3_64bits((*oldImage)->getBuffer()) != stateOrErr->outputHash) {
-    ctx.incrementalSession = std::move(session);
-    setIncrementalFallback(ctx, IncrementalFallbackReason::OutputMismatch);
+    installFallback(IncrementalFallbackReason::OutputMismatch);
     return;
   }
 
-  session->state = std::move(*stateOrErr);
-  session->oldImage = std::move(*oldImage);
-  session->stateLoaded = true;
-  session->softConfigChanged = session->state.softConfigHash != softHash;
+  IncrementalBaselineData baseline;
+  baseline.state = std::move(*stateOrErr);
+  baseline.oldImage = std::move(*oldImage);
   for (ArchiveFile *file : ctx.archiveFileInstances)
-    session->replayableArchives.insert(file->getName());
+    baseline.replayableArchives.insert(file->getName());
 
   StringMap<ArchiveFile *> archives;
   for (ArchiveFile *file : ctx.archiveFileInstances)
     archives[file->getName()] = file;
 
-  for (const IncrementalInputState &input : session->state.inputs) {
+  for (const IncrementalInputState &input : baseline.state.inputs) {
     if (input.parentName.empty())
       continue;
     auto archiveIt = archives.find(input.parentName);
     if (archiveIt == archives.end())
       continue;
 
-    session->expectedArchiveMembers.insert(getIncrementalArchiveMemberKey(
+    baseline.expectedArchiveMembers.insert(getIncrementalArchiveMemberKey(
         input.parentName, input.archiveOffset, input.name));
     if (input.archiveOffset != 0)
       archiveIt->second->addMemberByOffset(input.archiveOffset, input.name);
@@ -1040,102 +1328,141 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
       archiveIt->second->addMemberByName(input.name, input.name);
   }
 
-  ctx.incrementalSession = std::move(session);
+  IncrementalPdbReusePolicy pdbReuse =
+      baseline.state.softConfigHash == softHash
+          ? IncrementalPdbReusePolicy::make<ReusePdbMetadata>()
+          : IncrementalPdbReusePolicy::make<RebuildPdbMetadata>();
+  installIncrementalCoordinator(
+      ctx, IncrementalCoordinator::makeStateBackedLink(
+               std::move(baseline), std::move(pdbReuse),
+               IncrementalBaselineEmission::make<EmitNextBaseline>()));
 }
 
 void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
-  if (!ctx.incrementalSession || !ctx.incrementalSession->stateLoaded)
+  auto loaded = takeStateBackedLink(ctx);
+  if (!loaded)
     return;
+  clearPendingIncrementalFallback(ctx);
 
-  IncrementalLinkSession &session = *ctx.incrementalSession;
+  auto installFullImageBuild =
+      [&](std::unique_ptr<FullImageBuild> fullImageBuild) {
+        installIncrementalCoordinator(
+            ctx, IncrementalCoordinator::makeFullImageBuild(
+                     fullImageBuild->fallbackReason,
+                     std::move(fullImageBuild->fallbackDetail),
+                     std::move(fullImageBuild->baselineEmission)));
+      };
 
   if (hasBitcodeInputs(ctx)) {
-    session.canWriteState = false;
-    setIncrementalFallback(ctx, IncrementalFallbackReason::LtoInput);
-    disableIncrementalStateReuse(ctx);
+    installIncrementalCoordinator(
+        ctx, buildFullImageBuild(ctx, IncrementalFallbackReason::LtoInput, {},
+                                 IncrementalBaselineEmission::make<
+                                     SkipNextBaseline>()));
     return;
   }
 
   uint64_t resourceHash = computeIncrementalResourceInputHash(ctx);
-  if (resourceHash != session.state.resourceInputHash) {
+  if (resourceHash != loaded->baseline.state.resourceInputHash) {
     setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                            "resource or manifest inputs changed");
-    disableIncrementalStateReuse(ctx);
+    installFullImageBuild(consumePendingIncrementalFallback(
+        ctx, std::move(loaded->baselineEmission)));
     return;
   }
 
-  prepareCurrentIncrementalInputs(ctx, session);
+  loaded->baseline.currentInputs = prepareCurrentIncrementalInputs(ctx);
+  loaded->baseline.changedInputs.clear();
 
-  if (session.state.inputs.size() != session.currentInputHashes.size()) {
+  if (loaded->baseline.state.inputs.size() != loaded->baseline.currentInputs.hashes.size()) {
     setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                            "input count changed");
-    disableIncrementalStateReuse(ctx);
+    installFullImageBuild(consumePendingIncrementalFallback(
+        ctx, std::move(loaded->baselineEmission)));
     return;
   }
 
-  for (size_t i = 0; i < session.state.inputs.size(); ++i) {
-    const IncrementalInputState &input = session.state.inputs[i];
-    if (input.name != session.currentInputNames[i] ||
-        input.parentName != session.currentParentNames[i] ||
-        input.archiveOffset != session.currentArchiveOffsets[i]) {
+  for (size_t i = 0; i < loaded->baseline.state.inputs.size(); ++i) {
+    const IncrementalInputState &input = loaded->baseline.state.inputs[i];
+    if (input.name != loaded->baseline.currentInputs.names[i] ||
+        input.parentName != loaded->baseline.currentInputs.parentNames[i] ||
+        input.archiveOffset != loaded->baseline.currentInputs.archiveOffsets[i]) {
       setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                              "input order changed");
-      disableIncrementalStateReuse(ctx);
+      installFullImageBuild(consumePendingIncrementalFallback(
+          ctx, std::move(loaded->baselineEmission)));
       return;
     }
-    if (input.contentHash != session.currentInputHashes[i])
-      session.changedInputs.insert(ctx.objFileInstances[i]);
+    if (input.contentHash != loaded->baseline.currentInputs.hashes[i])
+      loaded->baseline.changedInputs.insert(ctx.objFileInstances[i]);
   }
 
-  if (session.loadedArchiveMembers.size() != session.expectedArchiveMembers.size()) {
+  if (loaded->baseline.loadedArchiveMembers.size() !=
+      loaded->baseline.expectedArchiveMembers.size()) {
     setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                            "archive member extraction changed");
-    disableIncrementalStateReuse(ctx);
+    installFullImageBuild(consumePendingIncrementalFallback(
+        ctx, std::move(loaded->baselineEmission)));
     return;
   }
-  for (const auto &entry : session.expectedArchiveMembers) {
-    if (!session.loadedArchiveMembers.contains(entry.getKey())) {
+  for (const auto &entry : loaded->baseline.expectedArchiveMembers) {
+    if (!loaded->baseline.loadedArchiveMembers.contains(entry.getKey())) {
       setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                              "archive member extraction changed");
-      disableIncrementalStateReuse(ctx);
+      installFullImageBuild(consumePendingIncrementalFallback(
+          ctx, std::move(loaded->baselineEmission)));
       return;
     }
   }
 
-  if (session.state.importTopologyHash != computeIncrementalImportTopologyHash(ctx)) {
+  if (loaded->baseline.state.importTopologyHash !=
+      computeIncrementalImportTopologyHash(ctx)) {
     setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                            "import topology changed");
-    disableIncrementalStateReuse(ctx);
+    installFullImageBuild(consumePendingIncrementalFallback(
+        ctx, std::move(loaded->baselineEmission)));
     return;
   }
-  if (session.state.exportTopologyHash != computeIncrementalExportTopologyHash(ctx)) {
+  if (loaded->baseline.state.exportTopologyHash !=
+      computeIncrementalExportTopologyHash(ctx)) {
     setIncrementalFallback(ctx, IncrementalFallbackReason::LayoutChanged,
                            "export topology changed");
-    disableIncrementalStateReuse(ctx);
+    installFullImageBuild(consumePendingIncrementalFallback(
+        ctx, std::move(loaded->baselineEmission)));
     return;
   }
 
-  if (!validateIncrementalSymbolStates(ctx, session))
+  if (!validateIncrementalSymbolStates(ctx, loaded->baseline)) {
+    installFullImageBuild(consumePendingIncrementalFallback(
+        ctx, std::move(loaded->baselineEmission)));
     return;
+  }
 
   if (ctx.config.verbose) {
     Log(ctx) << "incremental: using state " << ctx.config.incrementalStatePath;
-    if (session.softConfigChanged)
+    if (!shouldReusePdbMetadata(loaded->pdbReuse))
       Log(ctx) << "incremental: soft-config metadata changed; rebuilding PDB metadata";
   }
+
+  installIncrementalCoordinator(
+      ctx, IncrementalCoordinator::makeLayoutStableLink(
+               std::move(loaded->baseline), std::move(loaded->pdbReuse),
+               std::move(loaded->baselineEmission)));
 }
 
 void finalizeIncrementalLink(COFFLinkerContext &ctx) {
-  if (errorCount() != 0 || !ctx.incrementalSession ||
-      !ctx.incrementalSession->canWriteState)
+  if (errorCount() != 0 || !shouldEmitIncrementalBaseline(ctx))
     return;
 
-  prepareCurrentIncrementalInputs(ctx, *ctx.incrementalSession);
-  IncrementalStateFile state =
-      buildIncrementalState(ctx, *ctx.incrementalSession);
-  if (!ctx.incrementalSession->canWriteState)
+  IncrementalCurrentInputs currentInputs = prepareCurrentIncrementalInputs(ctx);
+  const ByteReuseLink *activeReuse = findActiveByteReuseLink(ctx);
+  const IncrementalReuseData *reuseData = activeReuse ? &activeReuse->reuse : nullptr;
+
+  IncrementalStateBuildResult buildResult =
+      buildIncrementalState(ctx, currentInputs, reuseData);
+  if (!shouldEmitNextBaseline(buildResult.baselineEmission))
     return;
-  if (Error err = writeIncrementalState(ctx.config.incrementalStatePath, state))
+  if (Error err =
+          writeIncrementalState(ctx.config.incrementalStatePath, buildResult.state))
     Warn(ctx) << "failed to write incremental state: " << toString(std::move(err));
 }
 
@@ -1143,13 +1470,13 @@ void noteIncrementalArchiveMemberLoad(COFFLinkerContext &ctx,
                                       StringRef archiveName,
                                       uint64_t archiveOffset,
                                       StringRef memberName) {
-  if (!ctx.incrementalSession || archiveName.empty())
+  if (archiveName.empty())
     return;
 
-  IncrementalLinkSession &session = *ctx.incrementalSession;
-  if (!session.replayableArchives.contains(archiveName))
+  IncrementalBaselineData *baseline = findActiveIncrementalBaseline(ctx);
+  if (!baseline || !baseline->replayableArchives.contains(archiveName))
     return;
-  session.loadedArchiveMembers.insert(
+  baseline->loadedArchiveMembers.insert(
       getIncrementalArchiveMemberKey(archiveName, archiveOffset, memberName));
 }
 

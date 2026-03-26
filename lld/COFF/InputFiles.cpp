@@ -284,9 +284,9 @@ void ArchiveFile::addMember(const Archive::Child &c, StringRef reason) {
   symtab.ctx.driver.enqueueArchiveMember(c, reason, getName());
 }
 
-std::vector<MemoryBufferRef>
+std::vector<ArchiveMemberBuffer>
 lld::coff::getArchiveMembers(COFFLinkerContext &ctx, Archive *file) {
-  std::vector<MemoryBufferRef> v;
+  std::vector<ArchiveMemberBuffer> v;
   Error err = Error::success();
 
   // Thin archives refer to .o files, so --reproduces needs the .o files too.
@@ -301,7 +301,7 @@ lld::coff::getArchiveMembers(COFFLinkerContext &ctx, Archive *file) {
       ctx.driver.tar->append(relativeToRoot(check(c.getFullName())),
                              mbref.getBuffer());
     }
-    v.push_back(mbref);
+    v.push_back(ArchiveMemberBuffer{mbref, c.getChildOffset()});
   }
   if (err)
     Fatal(ctx) << file->getFileName()

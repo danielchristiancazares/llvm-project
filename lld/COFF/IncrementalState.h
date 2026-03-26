@@ -33,13 +33,13 @@ enum class IncrementalSymbolKind : uint16_t {
   Synthetic = 7,
 };
 
-enum class IncrementalSlotClass : uint16_t {
-  None = 0,
-  Text = 1,
-  RData = 2,
-  Data = 3,
-  PDataPacked = 4,
-  XDataPacked = 5,
+enum class IncrementalSectionLayoutKind : uint16_t {
+  ExactSectionLayout = 1,
+  TextFreeSlots = 2,
+  ReadOnlyDataFreeSlots = 3,
+  WritableDataFreeSlots = 4,
+  PackedPDataPrefix = 5,
+  PackedXDataPrefix = 6,
 };
 
 enum class IncrementalSlotState : uint16_t {
@@ -54,14 +54,9 @@ enum class IncrementalPlacementKind : uint16_t {
   PackedPrefix = 4,
 };
 
-enum class IncrementalRefKind : uint16_t {
-  Unknown = 0,
-  DirectCall = 1,
-  DirectJump = 2,
-  DirectCondJump = 3,
-  DataAddress = 4,
-  RipRelativeData = 5,
-  NonEntryCodeRef = 6,
+enum class IncrementalEdgeRouting : uint16_t {
+  BodyOnlyReference = 1,
+  RedirectEligibleEntryReference = 2,
 };
 
 struct IncrementalInputState {
@@ -112,9 +107,8 @@ struct IncrementalSectionEnvelopeState {
   uint64_t sectionRVA = 0;
   uint64_t maxSectionEndRVA = 0;
   uint64_t activeEndRVA = 0;
-  IncrementalSlotClass slotClass = IncrementalSlotClass::None;
-  bool packedActivePrefix = false;
-  bool slotReuseEnabled = false;
+  IncrementalSectionLayoutKind layoutKind =
+      IncrementalSectionLayoutKind::ExactSectionLayout;
 };
 
 struct IncrementalSlotRecordState {
@@ -147,10 +141,9 @@ struct IncrementalPlacementState {
 struct IncrementalEdgeState {
   std::string sourceKey;
   std::string targetKey;
-  IncrementalRefKind kind = IncrementalRefKind::Unknown;
+  IncrementalEdgeRouting routing = IncrementalEdgeRouting::BodyOnlyReference;
   uint32_t sourceOffset = 0;
   uint32_t targetOffset = 0;
-  bool redirectEligible = false;
 };
 
 struct IncrementalTextRedirectState {
@@ -160,7 +153,6 @@ struct IncrementalTextRedirectState {
   uint64_t redirectCapacity = 0;
   uint64_t bodyRVA = 0;
   uint64_t poolThunkRVA = 0;
-  bool active = false;
 };
 
 struct IncrementalTextThunkPoolState {
@@ -170,7 +162,7 @@ struct IncrementalTextThunkPoolState {
 };
 
 struct IncrementalStateFile {
-  uint32_t version = 5;
+  uint32_t version = 6;
   IncrementalLayoutMode layoutMode = IncrementalLayoutMode::Slotted;
   llvm::COFF::MachineTypes machine = IMAGE_FILE_MACHINE_UNKNOWN;
   uint64_t outputHash = 0;

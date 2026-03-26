@@ -304,12 +304,13 @@ void LinkerDriver::addBuffer(std::unique_ptr<MemoryBuffer> mb,
       Archive *archive = file.get();
       make<std::unique_ptr<Archive>>(std::move(file)); // take ownership
 
-      int memberIndex = 0;
-      for (MemoryBufferRef m : getArchiveMembers(ctx, archive)) {
+      for (const ArchiveMemberBuffer &member : getArchiveMembers(ctx, archive)) {
         if (!archive->isThin())
-          addArchiveBuffer(m, "<whole-archive>", filename, memberIndex++);
+          addArchiveBuffer(member.buffer, "<whole-archive>", filename,
+                           member.offsetInArchive);
         else
-          addThinArchiveBuffer(m, "<whole-archive>", filename, 0);
+          addThinArchiveBuffer(member.buffer, "<whole-archive>", filename,
+                               member.offsetInArchive);
       }
 
       return;
@@ -460,10 +461,10 @@ void LinkerDriver::addArchiveBuffer(MemoryBufferRef mb, StringRef symName,
 void LinkerDriver::addThinArchiveBuffer(MemoryBufferRef mb, StringRef symName,
                                         StringRef parentName,
                                         uint64_t offsetInArchive) {
-  // Pass an empty string as the archive name and an offset of 0 so that
-  // the original filename is used as the buffer identifier. This is
-  // useful for DTLTO, where having the member identifier be the actual
-  // path on disk enables distribution of bitcode files during ThinLTO.
+  // Pass an empty archive name to preserve the original member filename as the
+  // buffer identifier. This is useful for DTLTO, where having the member
+  // identifier be the actual path on disk enables distribution of bitcode
+  // files during ThinLTO.
   file_magic magic = identify_magic(mb.getBuffer());
   InputFile *obj;
   if (magic == file_magic::coff_object) {
@@ -1808,7 +1809,6 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
       if (s == "none") {
         config->debug = false;
         config->keepUnchangedImplib = false;
-        config->incrementalLinkRequested = false;
         config->includeDwarfChunks = false;
         config->debugGHashes = false;
         config->writeSymtab = false;
@@ -1817,7 +1817,6 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
       } else if (s == "full" || s == "ghash" || s == "noghash") {
         config->debug = true;
         config->keepUnchangedImplib = true;
-        config->incrementalLinkRequested = true;
         config->includeDwarfChunks = true;
         if (s == "full" || s == "ghash")
           config->debugGHashes = true;
@@ -1826,7 +1825,6 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
       } else if (s == "dwarf") {
         config->debug = true;
         config->keepUnchangedImplib = true;
-        config->incrementalLinkRequested = true;
         config->includeDwarfChunks = true;
         config->writeSymtab = true;
         config->warnLongSectionNames = false;
@@ -2268,13 +2266,12 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   config->allowBind = args.hasFlag(OPT_allowbind, OPT_allowbind_no, true);
   config->allowIsolation =
       args.hasFlag(OPT_allowisolation, OPT_allowisolation_no, true);
-  config->incrementalLinkSpecified =
-      args.hasArg(OPT_incremental) || args.hasArg(OPT_incremental_no);
-  config->incrementalLinkRequested =
-      args.hasFlag(OPT_incremental, OPT_incremental_no,
-                   !config->doGC && config->doICF == ICFLevel::None &&
-                       !args.hasArg(OPT_order) && !args.hasArg(OPT_profile));
-  config->keepUnchangedImplib = config->incrementalLinkRequested;
+  bool requestedIncremental =
+      args.hasFlag(OPT_incremental, OPT_incremental_no, false);
+  config->keepUnchangedImplib = args.hasFlag(
+      OPT_incremental, OPT_incremental_no,
+      !config->doGC && config->doICF == ICFLevel::None &&
+          !args.hasArg(OPT_order) && !args.hasArg(OPT_profile));
   if (auto *arg = args.getLastArg(OPT_ilk))
     config->incrementalStatePath = arg->getValue();
   config->integrityCheck =
@@ -2309,33 +2306,37 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   if (args.hasFlag(OPT_inferasanlibs, OPT_inferasanlibs_no, false))
     Warn(ctx) << "ignoring '/inferasanlibs', this flag is not supported";
 
-  if (config->incrementalLinkRequested && args.hasArg(OPT_profile)) {
+  if (requestedIncremental && args.hasArg(OPT_profile)) {
     Warn(ctx) << "ignoring '/incremental' due to '/profile' specification";
-    config->incrementalLinkRequested = false;
+    requestedIncremental = false;
     config->keepUnchangedImplib = false;
   }
 
-  if (config->incrementalLinkRequested && args.hasArg(OPT_order)) {
+  if (requestedIncremental && args.hasArg(OPT_order)) {
     Warn(ctx) << "ignoring '/incremental' due to '/order' specification";
-    config->incrementalLinkRequested = false;
+    requestedIncremental = false;
     config->keepUnchangedImplib = false;
   }
 
-  if (config->incrementalLinkRequested && config->doGC) {
+  if (requestedIncremental && config->doGC) {
     Warn(ctx) << "ignoring '/incremental' because REF is enabled; use "
                  "'/opt:noref' to "
                  "disable";
-    config->incrementalLinkRequested = false;
+    requestedIncremental = false;
     config->keepUnchangedImplib = false;
   }
 
-  if (config->incrementalLinkRequested && config->doICF != ICFLevel::None) {
+  if (requestedIncremental && config->doICF != ICFLevel::None) {
     Warn(ctx) << "ignoring '/incremental' because ICF is enabled; use "
                  "'/opt:noicf' to "
                  "disable";
-    config->incrementalLinkRequested = false;
+    requestedIncremental = false;
     config->keepUnchangedImplib = false;
   }
+
+  config->incrementalRequestPolicy =
+      requestedIncremental ? IncrementalRequestPolicy::AttemptIncrementalReuse
+                           : IncrementalRequestPolicy::FullRelinkOnly;
 
   if (args.hasFlag(OPT_prefetch_inputs, OPT_prefetch_inputs_no, false))
     config->prefetchInputs = true;
