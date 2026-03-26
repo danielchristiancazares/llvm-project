@@ -70,12 +70,11 @@ $ nasm -fbin /tmp/DOSProgram.asm -o /tmp/DOSProgram.bin
 $ xxd -i /tmp/DOSProgram.bin
 */
 static unsigned char dosProgram[] = {
-  0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
-  0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
-  0x61, 0x6d, 0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65,
-  0x20, 0x72, 0x75, 0x6e, 0x20, 0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20,
-  0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x24, 0x00, 0x00
-};
+    0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
+    0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
+    0x61, 0x6d, 0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65,
+    0x20, 0x72, 0x75, 0x6e, 0x20, 0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20,
+    0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x24, 0x00, 0x00};
 static_assert(sizeof(dosProgram) % 8 == 0,
               "DOSProgram size must be multiple of 8");
 static_assert((sizeof(dos_header) + sizeof(dosProgram)) % 8 == 0,
@@ -99,7 +98,7 @@ public:
   void writeTo(uint8_t *b) const override {
     auto *d = reinterpret_cast<debug_directory *>(b);
 
-    for (const std::pair<COFF::DebugType, Chunk *>& record : records) {
+    for (const std::pair<COFF::DebugType, Chunk *> &record : records) {
       Chunk *c = record.second;
       const OutputSection *os = ctx.getOutputSection(c);
       uint64_t offs = os->getFileOff() + (c->getRVA() - os->getRVA());
@@ -255,7 +254,7 @@ private:
                               ArrayRef<SectionChunk *> symIdxChunks,
                               std::vector<Symbol *> &symbols);
   void maybeAddRVATable(SymbolRVASet tableSymbols, StringRef tableSym,
-                        StringRef countSym, bool hasFlag=false);
+                        StringRef countSym, bool hasFlag = false);
   void setSectionPermissions();
   void setECSymbols();
   void writeSections();
@@ -367,9 +366,7 @@ void lld::coff::writeResult(COFFLinkerContext &ctx) {
   Writer(ctx).run();
 }
 
-void OutputSection::addChunk(Chunk *c) {
-  chunks.push_back(c);
-}
+void OutputSection::addChunk(Chunk *c) { chunks.push_back(c); }
 
 void OutputSection::insertChunkAtStart(Chunk *c) {
   chunks.insert(chunks.begin(), c);
@@ -382,7 +379,25 @@ void OutputSection::setPermissions(uint32_t c) {
 
 static bool isIncrementalPreservedSection(const COFFLinkerContext &ctx,
                                           const OutputSection *section) {
-  const IncrementalStateFile *loadedState = findActiveIncrementalLoadedState(ctx);
+  const IncrementalStateFile *loadedState = ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const IncrementalStateFile * {
+        return nullptr;
+      },
+      [&](const PendingFullImageBuild &) -> const IncrementalStateFile * {
+        return nullptr;
+      },
+      [&](const FullImageBuild &) -> const IncrementalStateFile * {
+        return nullptr;
+      },
+      [&](const StateBackedLink &loaded) -> const IncrementalStateFile * {
+        return &loaded.baseline.state;
+      },
+      [&](const LayoutStableLink &validated) -> const IncrementalStateFile * {
+        return &validated.baseline.state;
+      },
+      [&](const ByteReuseLink &reuse) -> const IncrementalStateFile * {
+        return &reuse.baseline.state;
+      });
   if (!loadedState || loadedState->layoutMode != IncrementalLayoutMode::Slotted)
     return false;
   for (const IncrementalSectionState &oldSection : loadedState->sections)
@@ -806,21 +821,27 @@ void Writer::run() {
     removeUnusedSections();
     layoutSections();
     finalizeAddresses();
-    bool hadIncrementalLayoutCandidate =
-        findActiveIncrementalBaseline(ctx) != nullptr;
-    IncrementalLayoutResult incrementalLayout;
-    if (applyIncrementalLayout(ctx, incrementalLayout)) {
-      fileSize = incrementalLayout.fileSize;
-      sizeOfImage = incrementalLayout.sizeOfImage;
-      sizeOfHeaders = incrementalLayout.sizeOfHeaders;
-    } else if (hadIncrementalLayoutCandidate) {
-      // applyIncrementalLayout() may have mutated section membership, RVAs, and
-      // relocations before deciding to fall back. Recompute the clean full-link
-      // layout before continuing to write the image.
-      finalizeAddresses();
-    }
+    applyIncrementalLayout(ctx).match(
+        [&](const WriteCurrentFullImageLayout &) {},
+        [&](const RecomputeCurrentFullImageLayout &) {
+          // applyIncrementalLayout() may have mutated section membership,
+          // RVAs, and relocations before deciding to fall back. Recompute the
+          // clean full-link layout before continuing to write the image.
+          finalizeAddresses();
+        },
+        [&](const WriteReusedIncrementalLayout &layout) {
+          fileSize = layout.layout.fileSize;
+          sizeOfImage = layout.layout.sizeOfImage;
+          sizeOfHeaders = layout.layout.sizeOfHeaders;
+        });
     removeEmptySections();
-    if (findActiveByteReuseLink(ctx))
+    if (ctx.incremental->match(
+            [&](const IncrementalDisabled &) { return false; },
+            [&](const PendingFullImageBuild &) { return false; },
+            [&](const FullImageBuild &) { return false; },
+            [&](const StateBackedLink &) { return false; },
+            [&](const LayoutStableLink &) { return false; },
+            [&](const ByteReuseLink &) { return true; }))
       refreshExceptionTableRanges();
     assignOutputSectionIndices();
     setSectionPermissions();
@@ -1155,8 +1176,8 @@ void Writer::createSections() {
     if (name.starts_with(".tls"))
       tlsAlignment = std::max(tlsAlignment, c->getAlignment());
 
-    PartialSection *pSec = createPartialSection(name,
-                                                c->getOutputCharacteristics());
+    PartialSection *pSec =
+        createPartialSection(name, c->getOutputCharacteristics());
     pSec->chunks.push_back(c);
   }
 

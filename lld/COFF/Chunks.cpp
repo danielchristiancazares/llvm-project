@@ -462,7 +462,20 @@ void SectionChunk::writeTo(uint8_t *buf) const {
   if (!hasData)
     return;
   COFFLinkerContext &ctx = file->symtab.ctx;
-  if (const ByteReuseLink *reuseLink = findActiveByteReuseLink(ctx); reuseLink) {
+  const ByteReuseLink *reuseLink = ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const ByteReuseLink * {
+        return nullptr;
+      },
+      [&](const PendingFullImageBuild &) -> const ByteReuseLink * {
+        return nullptr;
+      },
+      [&](const FullImageBuild &) -> const ByteReuseLink * { return nullptr; },
+      [&](const StateBackedLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const LayoutStableLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const ByteReuseLink &reuse) -> const ByteReuseLink * {
+        return &reuse;
+      });
+  if (reuseLink) {
     auto it = reuseLink->reuse.reusedChunkData.find(this);
     if (it != reuseLink->reuse.reusedChunkData.end()) {
       ArrayRef<uint8_t> reused = it->second;

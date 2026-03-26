@@ -146,7 +146,6 @@ public:
 
   Configuration config;
   std::unique_ptr<IncrementalCoordinator> incremental;
-  std::unique_ptr<PendingFullImageBuild> pendingIncrementalFallback;
   std::unique_ptr<IncrementalPDBCacheSession> pdbCacheSession;
 
   DynamicRelocsChunk *dynamicRelocs = nullptr;

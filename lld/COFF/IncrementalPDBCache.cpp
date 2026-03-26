@@ -169,15 +169,49 @@ classifyIncrementalPDBCacheRuntimeMode(const COFFLinkerContext &ctx) {
       ctx.config.pdbPath.empty() || hasBitcodeInputs(ctx))
     return IncrementalPDBCacheRuntimeMode::BypassCache;
 
-  bool mayReplay = findActiveByteReuseLink(ctx) != nullptr;
-  bool mayRecord = shouldEmitIncrementalBaseline(ctx);
-  if (mayReplay && mayRecord)
-    return IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache;
-  if (mayReplay)
-    return IncrementalPDBCacheRuntimeMode::ReplayOnlyCache;
-  if (mayRecord)
-    return IncrementalPDBCacheRuntimeMode::RecordOnlyCache;
-  return IncrementalPDBCacheRuntimeMode::BypassCache;
+  return ctx.incremental->match(
+      [&](const IncrementalDisabled &) {
+        return IncrementalPDBCacheRuntimeMode::BypassCache;
+      },
+      [&](const PendingFullImageBuild &) {
+        return IncrementalPDBCacheRuntimeMode::BypassCache;
+      },
+      [&](const FullImageBuild &full) {
+        return full.baselineEmission.match(
+            [&](const EmitNextBaseline &) {
+              return IncrementalPDBCacheRuntimeMode::RecordOnlyCache;
+            },
+            [&](const SkipNextBaseline &) {
+              return IncrementalPDBCacheRuntimeMode::BypassCache;
+            });
+      },
+      [&](const StateBackedLink &loaded) {
+        return loaded.baselineEmission.match(
+            [&](const EmitNextBaseline &) {
+              return IncrementalPDBCacheRuntimeMode::RecordOnlyCache;
+            },
+            [&](const SkipNextBaseline &) {
+              return IncrementalPDBCacheRuntimeMode::BypassCache;
+            });
+      },
+      [&](const LayoutStableLink &validated) {
+        return validated.baselineEmission.match(
+            [&](const EmitNextBaseline &) {
+              return IncrementalPDBCacheRuntimeMode::RecordOnlyCache;
+            },
+            [&](const SkipNextBaseline &) {
+              return IncrementalPDBCacheRuntimeMode::BypassCache;
+            });
+      },
+      [&](const ByteReuseLink &reuse) {
+        return reuse.baselineEmission.match(
+            [&](const EmitNextBaseline &) {
+              return IncrementalPDBCacheRuntimeMode::ReplayAndRecordCache;
+            },
+            [&](const SkipNextBaseline &) {
+              return IncrementalPDBCacheRuntimeMode::ReplayOnlyCache;
+            });
+      });
 }
 
 uint64_t computeIncrementalPDBCacheBuildId() {

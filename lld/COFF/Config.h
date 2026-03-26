@@ -25,9 +25,9 @@
 
 namespace lld::coff {
 
+using llvm::StringRef;
 using llvm::COFF::IMAGE_FILE_MACHINE_UNKNOWN;
 using llvm::COFF::WindowsSubsystem;
-using llvm::StringRef;
 class COFFLinkerContext;
 class DefinedAbsolute;
 class StringChunk;
@@ -83,18 +83,18 @@ struct Export {
 };
 
 enum class DebugType {
-  None  = 0x0,
-  CV    = 0x1,  /// CodeView
-  PData = 0x2,  /// Procedure Data
-  Fixup = 0x4,  /// Relocation Table
+  None = 0x0,
+  CV = 0x1,    /// CodeView
+  PData = 0x2, /// Procedure Data
+  Fixup = 0x4, /// Relocation Table
 };
 
 enum GuardCFLevel {
-  Off     = 0x0,
-  CF      = 0x1, /// Emit gfids tables
+  Off = 0x0,
+  CF = 0x1,      /// Emit gfids tables
   LongJmp = 0x2, /// Emit longjmp tables
-  EHCont  = 0x4, /// Emit ehcont tables
-  All     = 0x7  /// Enable all protections
+  EHCont = 0x4,  /// Emit ehcont tables
+  All = 0x7      /// Enable all protections
 };
 
 enum class ICFLevel {
@@ -108,22 +108,6 @@ enum class BuildIDHash {
   None,
   PDB,
   Binary,
-};
-
-enum class IncrementalFallbackReason {
-  None,
-  MissingState,
-  InvalidState,
-  UnsupportedMachine,
-  LtoInput,
-  TailMergeEnabled,
-  ConfigChanged,
-  OutputMismatch,
-  LayoutChanged,
-  SlotOverflow,
-  MergeChunkParticipantChanged,
-  PackedSectionOverflow,
-  Amd64Rel32OutOfRange,
 };
 
 enum class IncrementalRequestPolicy {

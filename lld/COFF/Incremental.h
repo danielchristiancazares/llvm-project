@@ -14,8 +14,8 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Twine.h"
 #include <memory>
@@ -127,12 +127,110 @@ using IncrementalTextThunkSelection =
 
 struct IncrementalDisabled final {};
 
+struct RebuildForMissingBaseline final {};
+struct RebuildForRejectedBaseline final {};
+struct RebuildForUnsupportedMachine final {};
+struct RebuildForBitcodeInputs final {};
+struct RebuildForTailMerging final {};
+struct RebuildForConfigDrift final {};
+struct RebuildForOutputDrift final {};
+struct RebuildForLayoutRewrite final {};
+struct RebuildForSlotCapacity final {};
+struct RebuildForMergeParticipantDrift final {};
+struct RebuildForPackedSectionGrowth final {};
+struct RebuildForRel32RangeOverflow final {};
+using IncrementalFullBuildCause =
+    lld::Closed<RebuildForMissingBaseline, RebuildForRejectedBaseline,
+                RebuildForUnsupportedMachine, RebuildForBitcodeInputs,
+                RebuildForTailMerging, RebuildForConfigDrift,
+                RebuildForOutputDrift, RebuildForLayoutRewrite,
+                RebuildForSlotCapacity, RebuildForMergeParticipantDrift,
+                RebuildForPackedSectionGrowth, RebuildForRel32RangeOverflow>;
+
+struct IncrementalFullBuildDecision final {
+  IncrementalFullBuildCause cause;
+  std::string message;
+};
+
+template <class Cause>
+IncrementalFullBuildDecision
+makeIncrementalFullBuildDecision(Cause cause, const llvm::Twine &message) {
+  return IncrementalFullBuildDecision{
+      IncrementalFullBuildCause::make<Cause>(std::move(cause)), message.str()};
+}
+
+inline IncrementalFullBuildDecision
+rebuildForMissingBaseline(const llvm::Twine &message = "MissingState") {
+  return makeIncrementalFullBuildDecision(RebuildForMissingBaseline{}, message);
+}
+
+inline IncrementalFullBuildDecision
+rebuildForRejectedBaseline(const llvm::Twine &message = "InvalidState") {
+  return makeIncrementalFullBuildDecision(RebuildForRejectedBaseline{},
+                                          message);
+}
+
+inline IncrementalFullBuildDecision rebuildForUnsupportedMachine(
+    const llvm::Twine &message = "UnsupportedMachine") {
+  return makeIncrementalFullBuildDecision(RebuildForUnsupportedMachine{},
+                                          message);
+}
+
+inline IncrementalFullBuildDecision
+rebuildForBitcodeInputs(const llvm::Twine &message = "LtoInput") {
+  return makeIncrementalFullBuildDecision(RebuildForBitcodeInputs{}, message);
+}
+
+inline IncrementalFullBuildDecision
+rebuildForTailMerging(const llvm::Twine &message = "TailMergeEnabled") {
+  return makeIncrementalFullBuildDecision(RebuildForTailMerging{}, message);
+}
+
+inline IncrementalFullBuildDecision
+rebuildForConfigDrift(const llvm::Twine &message = "ConfigChanged") {
+  return makeIncrementalFullBuildDecision(RebuildForConfigDrift{}, message);
+}
+
+inline IncrementalFullBuildDecision
+rebuildForOutputDrift(const llvm::Twine &message = "OutputMismatch") {
+  return makeIncrementalFullBuildDecision(RebuildForOutputDrift{}, message);
+}
+
+inline IncrementalFullBuildDecision
+rebuildForLayoutRewrite(const llvm::Twine &message = "LayoutChanged") {
+  return makeIncrementalFullBuildDecision(RebuildForLayoutRewrite{}, message);
+}
+
+inline IncrementalFullBuildDecision
+rebuildForSlotCapacity(const llvm::Twine &message = "SlotOverflow") {
+  return makeIncrementalFullBuildDecision(RebuildForSlotCapacity{}, message);
+}
+
+inline IncrementalFullBuildDecision rebuildForMergeParticipantDrift(
+    const llvm::Twine &message = "MergeChunkParticipantChanged") {
+  return makeIncrementalFullBuildDecision(RebuildForMergeParticipantDrift{},
+                                          message);
+}
+
+inline IncrementalFullBuildDecision rebuildForPackedSectionGrowth(
+    const llvm::Twine &message = "PackedSectionOverflow") {
+  return makeIncrementalFullBuildDecision(RebuildForPackedSectionGrowth{},
+                                          message);
+}
+
+inline IncrementalFullBuildDecision rebuildForRel32RangeOverflow(
+    const llvm::Twine &message = "Amd64Rel32OutOfRange") {
+  return makeIncrementalFullBuildDecision(RebuildForRel32RangeOverflow{},
+                                          message);
+}
+
+struct PendingFullImageBuild final {
+  IncrementalBaselineEmission baselineEmission;
+};
+
 struct FullImageBuild final {
-  IncrementalFallbackReason fallbackReason =
-      IncrementalFallbackReason::None;
-  std::string fallbackDetail;
-  IncrementalBaselineEmission baselineEmission =
-      IncrementalBaselineEmission::make<SkipNextBaseline>();
+  IncrementalFullBuildDecision decision;
+  IncrementalBaselineEmission baselineEmission;
 };
 
 struct StateBackedLink final {
@@ -169,8 +267,9 @@ public:
 
   [[nodiscard]] static std::unique_ptr<IncrementalCoordinator> makeDisabled();
   [[nodiscard]] static std::unique_ptr<IncrementalCoordinator>
-  makeFullImageBuild(IncrementalFallbackReason fallbackReason,
-                     std::string fallbackDetail,
+  makePendingFullImageBuild(IncrementalBaselineEmission baselineEmission);
+  [[nodiscard]] static std::unique_ptr<IncrementalCoordinator>
+  makeFullImageBuild(IncrementalFullBuildDecision decision,
                      IncrementalBaselineEmission baselineEmission);
   [[nodiscard]] static std::unique_ptr<IncrementalCoordinator>
   makeStateBackedLink(IncrementalBaselineData baseline,
@@ -181,7 +280,8 @@ public:
                        IncrementalPdbReusePolicy pdbReuse,
                        IncrementalBaselineEmission baselineEmission);
   [[nodiscard]] static std::unique_ptr<IncrementalCoordinator>
-  makeByteReuseLink(IncrementalBaselineData baseline, IncrementalReuseData reuse,
+  makeByteReuseLink(IncrementalBaselineData baseline,
+                    IncrementalReuseData reuse,
                     IncrementalPdbReusePolicy pdbReuse,
                     IncrementalBaselineEmission baselineEmission);
 
@@ -195,18 +295,12 @@ public:
 
 private:
   using State =
-      lld::Closed<IncrementalDisabled, FullImageBuild, StateBackedLink,
-                  LayoutStableLink, ByteReuseLink>;
+      lld::Closed<IncrementalDisabled, PendingFullImageBuild, FullImageBuild,
+                  StateBackedLink, LayoutStableLink, ByteReuseLink>;
 
   explicit IncrementalCoordinator(State &&state) : state(std::move(state)) {}
 
   State state;
-};
-
-struct PendingFullImageBuild final {
-  IncrementalFallbackReason fallbackReason =
-      IncrementalFallbackReason::None;
-  std::string fallbackDetail;
 };
 
 void prepareIncrementalLink(COFFLinkerContext &ctx);
@@ -217,33 +311,22 @@ void noteIncrementalArchiveMemberLoad(COFFLinkerContext &ctx,
                                       uint64_t archiveOffset,
                                       llvm::StringRef memberName);
 
-void installIncrementalCoordinator(COFFLinkerContext &ctx,
-                                   std::unique_ptr<IncrementalCoordinator>
-                                       coordinator);
-std::unique_ptr<FullImageBuild> consumePendingIncrementalFallback(
-    COFFLinkerContext &ctx, IncrementalBaselineEmission baselineEmission,
-    IncrementalFallbackReason defaultReason =
-        IncrementalFallbackReason::LayoutChanged,
-    const llvm::Twine &defaultDetail = {});
-
-void setIncrementalFallback(COFFLinkerContext &ctx,
-                            IncrementalFallbackReason reason,
-                            const llvm::Twine &detail = {});
-llvm::StringRef incrementalFallbackReasonToString(
-    IncrementalFallbackReason reason);
+void installIncrementalCoordinator(
+    COFFLinkerContext &ctx,
+    std::unique_ptr<IncrementalCoordinator> coordinator);
+void installIncrementalFullImageBuild(
+    COFFLinkerContext &ctx, IncrementalFullBuildDecision decision,
+    IncrementalBaselineEmission baselineEmission);
+void installPendingIncrementalFullImageBuild(
+    COFFLinkerContext &ctx, IncrementalFullBuildDecision decision);
+void installPendingIncrementalFullImageBuild(
+    COFFLinkerContext &ctx, IncrementalFullBuildDecision decision,
+    IncrementalBaselineEmission baselineEmission);
 uint64_t computeIncrementalHardConfigHash(const Configuration &config);
 uint64_t computeIncrementalSoftConfigHash(const Configuration &config);
-IncrementalBaselineData *findActiveIncrementalBaseline(COFFLinkerContext &ctx);
-const IncrementalBaselineData *
-findActiveIncrementalBaseline(const COFFLinkerContext &ctx);
-ByteReuseLink *findActiveByteReuseLink(COFFLinkerContext &ctx);
-const ByteReuseLink *findActiveByteReuseLink(const COFFLinkerContext &ctx);
-const IncrementalStateFile *
-findActiveIncrementalLoadedState(const COFFLinkerContext &ctx);
-bool shouldEmitIncrementalBaseline(const COFFLinkerContext &ctx);
-bool shouldReuseIncrementalPdbMetadata(const COFFLinkerContext &ctx);
 
-IncrementalCurrentInputs prepareCurrentIncrementalInputs(COFFLinkerContext &ctx);
+IncrementalCurrentInputs
+prepareCurrentIncrementalInputs(COFFLinkerContext &ctx);
 IncrementalSectionLayoutKind
 classifyIncrementalSection(llvm::StringRef name, uint32_t characteristics);
 bool isIncrementalFreeSlotLayout(IncrementalSectionLayoutKind layoutKind);
@@ -251,12 +334,12 @@ bool isIncrementalPackedLayout(IncrementalSectionLayoutKind layoutKind);
 uint8_t getIncrementalFillByte(IncrementalSectionLayoutKind layoutKind);
 bool isIncrementalPersistedSlotChunk(IncrementalSectionLayoutKind layoutKind,
                                      const Chunk &chunk);
-IncrementalFreeSlotSelection findBestFitIncrementalFreeSlot(
-    llvm::ArrayRef<IncrementalSlotRecordState> slots, uint64_t size,
-    uint32_t alignment);
-IncrementalTailReserveSelection allocateIncrementalTailReserve(
-    uint64_t tailCursor, uint64_t maxSectionEndRVA, uint64_t size,
-    uint32_t alignment);
+IncrementalFreeSlotSelection
+findBestFitIncrementalFreeSlot(llvm::ArrayRef<IncrementalSlotRecordState> slots,
+                               uint64_t size, uint32_t alignment);
+IncrementalTailReserveSelection
+allocateIncrementalTailReserve(uint64_t tailCursor, uint64_t maxSectionEndRVA,
+                               uint64_t size, uint32_t alignment);
 IncrementalTextThunkSelection
 chooseIncrementalTextThunkRVA(uint64_t oldPoolThunkRVA, uint64_t tailCursor,
                               uint64_t poolCursor, uint64_t poolEndRVA,
