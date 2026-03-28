@@ -303,7 +303,8 @@ private:
                     &comdatDefs,
                 bool &prevailingComdat);
   Symbol *createRegular(COFFSymbolRef sym);
-  Symbol *createUndefined(COFFSymbolRef sym, bool overrideLazy);
+  Symbol *createUndefined(COFFSymbolRef sym, StringRef name,
+                          bool overrideLazy);
 
   std::unique_ptr<COFFObjectFile> coffObj;
 
