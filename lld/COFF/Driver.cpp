@@ -506,6 +506,51 @@ void LinkerDriver::addThinArchiveBuffer(MemoryBufferRef mb, StringRef symName,
 }
 
 void LinkerDriver::enqueueArchiveMember(const Archive::Child &c,
+                                        const Archive::Symbol &sym,
+                                        StringRef parentName) {
+  auto reportBufferError = [=](Error &&e) {
+    StringRef childName = CHECK(
+        c.getName(), "could not get child name for archive " + parentName +
+                         " while loading symbol " + toCOFFString(ctx, sym));
+    Fatal(ctx) << "could not get the buffer for the member defining symbol "
+               << &sym << ": " << parentName << "(" << childName
+               << "): " << std::move(e);
+  };
+
+  if (!c.getParent()->isThin()) {
+    uint64_t offsetInArchive = c.getChildOffset();
+    Expected<MemoryBufferRef> mbOrErr = c.getMemoryBufferRef();
+    if (!mbOrErr)
+      reportBufferError(mbOrErr.takeError());
+    MemoryBufferRef mb = mbOrErr.get();
+    enqueueTask([=]() {
+      llvm::TimeTraceScope timeScope("Archive: ", mb.getBufferIdentifier());
+      ctx.driver.addArchiveBuffer(mb, toCOFFString(ctx, sym), parentName,
+                                  offsetInArchive);
+    });
+    return;
+  }
+
+  std::string childName =
+      CHECK(c.getFullName(),
+            "could not get the filename for the member defining symbol " +
+                toCOFFString(ctx, sym));
+  auto future = std::make_shared<std::future<MBErrPair>>(
+      createFutureForFile(childName, ctx.config.vfs.get(),
+                          ctx.config.inputPrefetchMode));
+  enqueueTask([=]() {
+    auto mbOrErr = future->get();
+    if (mbOrErr.second)
+      reportBufferError(errorCodeToError(mbOrErr.second));
+    llvm::TimeTraceScope timeScope("Archive: ",
+                                   mbOrErr.first->getBufferIdentifier());
+    ctx.driver.addThinArchiveBuffer(takeBuffer(std::move(mbOrErr.first)),
+                                    toCOFFString(ctx, sym), parentName,
+                                    c.getChildOffset());
+  });
+}
+
+void LinkerDriver::enqueueArchiveMember(const Archive::Child &c,
                                         StringRef symName,
                                         StringRef parentName) {
 

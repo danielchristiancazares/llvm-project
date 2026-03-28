@@ -67,9 +67,7 @@ AGENTS.md
 .cursorindexingignore
 #Unrelated documentation
 llvm-lld.md
-CPP_DESIGN.md
 repomix.config.json
-OPTIMIZATION_PATH_FAILURES.md
 SDD.md
 
 #==============================================================================#
