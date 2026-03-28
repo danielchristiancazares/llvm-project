@@ -85,6 +85,8 @@ public:
   void addClangLibSearchPaths(const std::string &argv0);
 
   // Used by ArchiveFile to enqueue members.
+  void enqueueArchiveMember(const Archive::Child &c, const Archive::Symbol &sym,
+                            StringRef parentName);
   void enqueueArchiveMember(const Archive::Child &c, StringRef symName,
                             StringRef parentName);
 
