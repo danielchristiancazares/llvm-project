@@ -16,6 +16,7 @@
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "lld/Common/Timer.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/DebugInfo/DIContext.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Mangler.h"
@@ -34,6 +35,10 @@ using namespace llvm::object;
 using namespace llvm::support;
 
 namespace lld::coff {
+
+template <typename T> static void bumpStat(T &counter) {
+  ++counter;
+}
 
 StringRef ltrim1(StringRef s, const char *chars) {
   if (!s.empty() && strchr(chars, s[0]))
@@ -529,6 +534,14 @@ void SymbolTable::resolveRemainingUndefines(std::vector<Undefined *> &aliases) {
 }
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name) {
+  return insert(name, static_cast<SymbolMutationStats *>(nullptr));
+}
+
+std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
+                                              SymbolMutationStats *stats) {
+  ScopedTimer t(ctx.symbolTableInsertTimer);
+  if (stats)
+    bumpStat(stats->insert.calls);
   bool inserted = false;
   Symbol *&sym = symMap[CachedHashStringRef(name)];
   if (!sym) {
@@ -541,11 +554,23 @@ std::pair<Symbol *, bool> SymbolTable::insert(StringRef name) {
     if (isEC() && name.starts_with("EXP+"))
       expSymbols.push_back(sym);
   }
+  if (inserted) {
+    if (stats)
+      bumpStat(stats->insert.inserted);
+  } else {
+    if (stats)
+      bumpStat(stats->insert.existing);
+  }
   return {sym, inserted};
 }
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name, InputFile *file) {
-  std::pair<Symbol *, bool> result = insert(name);
+  return insert(name, file, nullptr);
+}
+
+std::pair<Symbol *, bool> SymbolTable::insert(StringRef name, InputFile *file,
+                                              SymbolMutationStats *stats) {
+  std::pair<Symbol *, bool> result = insert(name, stats);
   if (!file || !isa<BitcodeFile>(file))
     result.first->isUsedInRegularObj = true;
   return result;
@@ -690,13 +715,29 @@ void SymbolTable::initializeSameAddressThunks() {
 
 Symbol *SymbolTable::addUndefined(StringRef name, InputFile *f,
                                   bool overrideLazy) {
-  auto [s, wasInserted] = insert(name, f);
+  return addUndefined(name, f, overrideLazy, nullptr);
+}
+
+Symbol *SymbolTable::addUndefined(StringRef name, InputFile *f,
+                                  bool overrideLazy,
+                                  SymbolMutationStats *stats) {
+  if (stats)
+    bumpStat(stats->addUndefined.calls);
+  auto [s, wasInserted] = insert(name, f, stats);
   if (wasInserted || (s->isLazy() && overrideLazy)) {
+    if (stats)
+      bumpStat(stats->addUndefined.newOrOverrode);
     replaceSymbol<Undefined>(s, name);
     return s;
   }
-  if (s->isLazy())
+  if (s->isLazy()) {
+    if (stats)
+      bumpStat(stats->addUndefined.forcedLazy);
     forceLazy(s);
+    return s;
+  }
+  if (stats)
+    bumpStat(stats->addUndefined.reused);
   return s;
 }
 
@@ -878,7 +919,7 @@ void SymbolTable::reportDuplicate(Symbol *existing, InputFile *newFile,
 }
 
 Symbol *SymbolTable::addAbsolute(StringRef n, COFFSymbolRef sym) {
-  auto [s, wasInserted] = insert(n, nullptr);
+  auto [s, wasInserted] = insert(n);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy())
     replaceSymbol<DefinedAbsolute>(s, ctx, n, sym);
@@ -891,7 +932,7 @@ Symbol *SymbolTable::addAbsolute(StringRef n, COFFSymbolRef sym) {
 }
 
 Symbol *SymbolTable::addAbsolute(StringRef n, uint64_t va) {
-  auto [s, wasInserted] = insert(n, nullptr);
+  auto [s, wasInserted] = insert(n);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy())
     replaceSymbol<DefinedAbsolute>(s, ctx, n, va);
@@ -904,7 +945,7 @@ Symbol *SymbolTable::addAbsolute(StringRef n, uint64_t va) {
 }
 
 Symbol *SymbolTable::addSynthetic(StringRef n, Chunk *c) {
-  auto [s, wasInserted] = insert(n, nullptr);
+  auto [s, wasInserted] = insert(n);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy())
     replaceSymbol<DefinedSynthetic>(s, n, c);
@@ -916,44 +957,98 @@ Symbol *SymbolTable::addSynthetic(StringRef n, Chunk *c) {
 Symbol *SymbolTable::addRegular(InputFile *f, StringRef n,
                                 const coff_symbol_generic *sym, SectionChunk *c,
                                 uint32_t sectionOffset, bool isWeak) {
-  auto [s, wasInserted] = insert(n, f);
-  if (wasInserted || !isa<DefinedRegular>(s) || s->isWeak)
+  return addRegular(f, n, sym, c, sectionOffset, isWeak, nullptr);
+}
+
+Symbol *SymbolTable::addRegular(InputFile *f, StringRef n,
+                                const coff_symbol_generic *sym, SectionChunk *c,
+                                uint32_t sectionOffset, bool isWeak,
+                                SymbolMutationStats *stats) {
+  if (stats)
+    bumpStat(stats->addRegular.calls);
+  auto [s, wasInserted] = insert(n, f, stats);
+  if (wasInserted || !isa<DefinedRegular>(s) || s->isWeak) {
+    if (stats)
+      bumpStat(stats->addRegular.newOrReplaced);
     replaceSymbol<DefinedRegular>(s, f, n, /*IsCOMDAT*/ false,
                                   /*IsExternal*/ true, sym, c, isWeak);
-  else if (!isWeak)
+  } else if (!isWeak) {
+    if (stats)
+      bumpStat(stats->addRegular.duplicate);
     reportDuplicate(s, f, c, sectionOffset);
+  } else {
+    if (stats)
+      bumpStat(stats->addRegular.ignoredWeak);
+  }
   return s;
 }
 
 std::pair<DefinedRegular *, bool>
 SymbolTable::addComdat(InputFile *f, StringRef n,
                        const coff_symbol_generic *sym) {
-  auto [s, wasInserted] = insert(n, f);
+  return addComdat(f, n, sym, nullptr);
+}
+
+std::pair<DefinedRegular *, bool>
+SymbolTable::addComdat(InputFile *f, StringRef n,
+                       const coff_symbol_generic *sym,
+                       SymbolMutationStats *stats) {
+  if (stats)
+    bumpStat(stats->addComdat.calls);
+  auto [s, wasInserted] = insert(n, f, stats);
   if (wasInserted || !isa<DefinedRegular>(s)) {
+    if (stats)
+      bumpStat(stats->addComdat.inserted);
     replaceSymbol<DefinedRegular>(s, f, n, /*IsCOMDAT*/ true,
                                   /*IsExternal*/ true, sym, nullptr);
     return {cast<DefinedRegular>(s), true};
   }
   auto *existingSymbol = cast<DefinedRegular>(s);
-  if (!existingSymbol->isCOMDAT)
+  if (!existingSymbol->isCOMDAT) {
+    if (stats)
+      bumpStat(stats->addComdat.duplicateNonComdat);
     reportDuplicate(s, f);
+  } else {
+    if (stats)
+      bumpStat(stats->addComdat.existingComdat);
+  }
   return {existingSymbol, false};
 }
 
 Symbol *SymbolTable::addCommon(InputFile *f, StringRef n, uint64_t size,
                                const coff_symbol_generic *sym, CommonChunk *c) {
-  auto [s, wasInserted] = insert(n, f);
-  if (wasInserted || !isa<DefinedCOFF>(s))
+  return addCommon(f, n, size, sym, c, nullptr);
+}
+
+Symbol *SymbolTable::addCommon(InputFile *f, StringRef n, uint64_t size,
+                               const coff_symbol_generic *sym, CommonChunk *c,
+                               SymbolMutationStats *stats) {
+  if (stats)
+    bumpStat(stats->addCommon.calls);
+  auto [s, wasInserted] = insert(n, f, stats);
+  if (wasInserted || !isa<DefinedCOFF>(s)) {
+    if (stats)
+      bumpStat(stats->addCommon.newOrReplacedNonCOFF);
     replaceSymbol<DefinedCommon>(s, f, n, size, sym, c);
-  else if (auto *dc = dyn_cast<DefinedCommon>(s))
-    if (size > dc->getSize())
+  } else if (auto *dc = dyn_cast<DefinedCommon>(s)) {
+    if (size > dc->getSize()) {
+      if (stats)
+        bumpStat(stats->addCommon.replacedLarger);
       replaceSymbol<DefinedCommon>(s, f, n, size, sym, c);
+    } else {
+      if (stats)
+        bumpStat(stats->addCommon.reusedExisting);
+    }
+  } else {
+    if (stats)
+      bumpStat(stats->addCommon.reusedExisting);
+  }
   return s;
 }
 
 DefinedImportData *SymbolTable::addImportData(StringRef n, ImportFile *f,
                                               Chunk *&location) {
-  auto [s, wasInserted] = insert(n, nullptr);
+  auto [s, wasInserted] = insert(n);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy()) {
     replaceSymbol<DefinedImportData>(s, n, f, location);
@@ -966,7 +1061,7 @@ DefinedImportData *SymbolTable::addImportData(StringRef n, ImportFile *f,
 
 Defined *SymbolTable::addImportThunk(StringRef name, DefinedImportData *id,
                                      ImportThunkChunk *chunk) {
-  auto [s, wasInserted] = insert(name, nullptr);
+  auto [s, wasInserted] = insert(name);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy()) {
     replaceSymbol<DefinedImportThunk>(s, ctx, name, id, chunk);
@@ -1002,21 +1097,6 @@ Symbol *SymbolTable::findUnderscore(StringRef name) const {
   return find(name);
 }
 
-// Return all symbols that start with Prefix, possibly ignoring the first
-// character of Prefix or the first character symbol.
-std::vector<Symbol *> SymbolTable::getSymsWithPrefix(StringRef prefix) {
-  std::vector<Symbol *> syms;
-  for (auto pair : symMap) {
-    StringRef name = pair.first.val();
-    if (name.starts_with(prefix) || name.starts_with(prefix.drop_front()) ||
-        name.drop_front().starts_with(prefix) ||
-        name.drop_front().starts_with(prefix.drop_front())) {
-      syms.push_back(pair.second);
-    }
-  }
-  return syms;
-}
-
 Symbol *SymbolTable::findMangle(StringRef name) {
   if (Symbol *sym = find(name)) {
     if (auto *u = dyn_cast<Undefined>(sym)) {
@@ -1030,36 +1110,42 @@ Symbol *SymbolTable::findMangle(StringRef name) {
     }
   }
 
-  // Efficient fuzzy string lookup is impossible with a hash table, so iterate
-  // the symbol table once and collect all possibly matching symbols into this
-  // vector. Then compare each possibly matching symbol with each possible
-  // mangling.
-  std::vector<Symbol *> syms = getSymsWithPrefix(name);
-  auto findByPrefix = [&syms](const Twine &t) -> Symbol * {
-    std::string prefix = t.str();
-    for (auto *s : syms)
-      if (s->getName().starts_with(prefix))
-        return s;
-    return nullptr;
-  };
-
   // For non-x86, just look for C++ functions.
-  if (machine != I386)
-    return findByPrefix("?" + name + "@@Y");
+  if (machine != I386) {
+    SmallString<64> cxxPrefix;
+    ("?" + name + "@@Y").toVector(cxxPrefix);
+    for (auto &pair : symMap) {
+      if (pair.first.val().starts_with(cxxPrefix))
+        return pair.second;
+    }
+    return nullptr;
+  }
 
   if (!name.starts_with("_"))
     return nullptr;
-  // Search for x86 stdcall function.
-  if (Symbol *s = findByPrefix(name + "@"))
-    return s;
-  // Search for x86 fastcall function.
-  if (Symbol *s = findByPrefix("@" + name.substr(1) + "@"))
-    return s;
-  // Search for x86 vectorcall function.
-  if (Symbol *s = findByPrefix(name.substr(1) + "@@"))
-    return s;
-  // Search for x86 C++ non-member function.
-  return findByPrefix("?" + name.substr(1) + "@@Y");
+
+  // Precompute all exact prefixes for x86 mangling variants.
+  // Use SmallString to keep prefix storage on the stack.
+  StringRef base = name.drop_front(); // strip leading _
+  SmallString<64> stdcallPfx, fastcallPfx, vectorcallPfx, cxxPfx;
+  (name + "@").toVector(stdcallPfx);
+  ("@" + base + "@").toVector(fastcallPfx);
+  (base + "@@").toVector(vectorcallPfx);
+  ("?" + base + "@@Y").toVector(cxxPfx);
+
+  // Single scan checking exact prefixes — C++ first (most common).
+  for (auto &pair : symMap) {
+    StringRef symName = pair.first.val();
+    if (symName.starts_with(cxxPfx))
+      return pair.second;
+    if (symName.starts_with(stdcallPfx))
+      return pair.second;
+    if (symName.starts_with(fastcallPfx))
+      return pair.second;
+    if (symName.starts_with(vectorcallPfx))
+      return pair.second;
+  }
+  return nullptr;
 }
 
 bool SymbolTable::findUnderscoreMangle(StringRef sym) {

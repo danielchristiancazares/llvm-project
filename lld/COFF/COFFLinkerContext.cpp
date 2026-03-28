@@ -13,9 +13,26 @@
 #include "Incremental.h"
 #include "IncrementalPDBCache.h"
 #include "Symbols.h"
+#include "lld/Common/ErrorHandler.h"
 #include "llvm/BinaryFormat/COFF.h"
 
 namespace lld::coff {
+namespace {
+
+void printCounterLine(
+    llvm::raw_ostream &os, llvm::StringRef name,
+    std::initializer_list<std::pair<llvm::StringRef, uint64_t>> fields) {
+  std::string line;
+  llvm::raw_string_ostream stream(line);
+  stream << "  " << name << ':';
+  for (const auto &field : fields)
+    stream << ' ' << field.first << '=' << field.second;
+  stream.flush();
+  message(line, os);
+}
+
+} // namespace
+
 COFFLinkerContext::COFFLinkerContext()
     : driver(*this), symtab(*this),
       incremental(IncrementalCoordinator::makeDisabled()),
@@ -30,10 +47,29 @@ COFFLinkerContext::COFFLinkerContext()
       initializeSymbolsTimer("Initialize Symbols", inputParseTimer),
       initializeSymbolsMainPassTimer("Main Symbol Scan",
                                      initializeSymbolsTimer),
+      initializeSymbolsUndefinedTimer("Undefined Symbols",
+                                      initializeSymbolsMainPassTimer),
+      initializeSymbolsWeakExternalsTimer("Weak Externals",
+                                          initializeSymbolsMainPassTimer),
+      initializeSymbolsDefinedTimer("Defined Symbols",
+                                    initializeSymbolsMainPassTimer),
+      initializeSymbolsPendingDeferralTimer("Defer Pending Symbols",
+                                            initializeSymbolsMainPassTimer),
+      initializeSymbolsCommonTimer("Common Symbols",
+                                   initializeSymbolsDefinedTimer),
+      initializeSymbolsAbsoluteTimer("Absolute Symbols",
+                                     initializeSymbolsDefinedTimer),
+      initializeSymbolsEmptySectionsTimer("Empty Section Declarations",
+                                          initializeSymbolsDefinedTimer),
+      initializeSymbolsComdatTimer("COMDAT Leaders",
+                                   initializeSymbolsDefinedTimer),
+      initializeSymbolsRegularTimer("Regular Symbols",
+                                    initializeSymbolsDefinedTimer),
       initializeSymbolsPendingTimer("Resolve Pending Symbols",
                                     initializeSymbolsTimer),
       initializeSymbolsWeakAliasesTimer("Resolve Weak Aliases",
                                         initializeSymbolsTimer),
+      symbolTableInsertTimer("Symbol Table Insert/Lookup", rootTimer),
       initializeFlagsTimer("Initialize Flags", inputParseTimer),
       initializeDependenciesTimer("Initialize Dependencies", inputParseTimer),
       initializeECThunksTimer("Initialize EC Thunks", inputParseTimer),
@@ -88,4 +124,40 @@ COFFLinkerContext::COFFLinkerContext()
                                    moduleSymbolRecordWriteTimer) {}
 
 COFFLinkerContext::~COFFLinkerContext() = default;
+
+void COFFLinkerContext::printSymbolMutationStats(llvm::raw_ostream &os) const {
+  message(std::string(50, '-'), os);
+  message("Initialize Symbols Mutation Counters", os);
+  message("  scope=regular ObjFile parse path only", os);
+  printCounterLine(os, "insert",
+                   {{"calls", symbolMutationStats.insert.calls},
+                    {"new", symbolMutationStats.insert.inserted},
+                    {"existing", symbolMutationStats.insert.existing}});
+  printCounterLine(
+      os, "addUndefined",
+      {{"calls", symbolMutationStats.addUndefined.calls},
+       {"newOrOverrode", symbolMutationStats.addUndefined.newOrOverrode},
+       {"forcedLazy", symbolMutationStats.addUndefined.forcedLazy},
+       {"reused", symbolMutationStats.addUndefined.reused}});
+  printCounterLine(
+      os, "addRegular",
+      {{"calls", symbolMutationStats.addRegular.calls},
+       {"newOrReplaced", symbolMutationStats.addRegular.newOrReplaced},
+       {"duplicate", symbolMutationStats.addRegular.duplicate},
+       {"ignoredWeak", symbolMutationStats.addRegular.ignoredWeak}});
+  printCounterLine(
+      os, "addComdat",
+      {{"calls", symbolMutationStats.addComdat.calls},
+       {"inserted", symbolMutationStats.addComdat.inserted},
+       {"existingComdat", symbolMutationStats.addComdat.existingComdat},
+       {"duplicateNonComdat",
+        symbolMutationStats.addComdat.duplicateNonComdat}});
+  printCounterLine(
+      os, "addCommon",
+      {{"calls", symbolMutationStats.addCommon.calls},
+       {"newOrReplacedNonCOFF",
+        symbolMutationStats.addCommon.newOrReplacedNonCOFF},
+       {"replacedLarger", symbolMutationStats.addCommon.replacedLarger},
+       {"reusedExisting", symbolMutationStats.addCommon.reusedExisting}});
+}
 } // namespace lld::coff

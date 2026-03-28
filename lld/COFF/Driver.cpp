@@ -20,6 +20,7 @@
 #include "Writer.h"
 #include "lld/Common/Args.h"
 #include "lld/Common/CommonLinkerContext.h"
+#include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Filesystem.h"
 #include "lld/Common/Timer.h"
 #include "lld/Common/Version.h"
@@ -3117,8 +3118,10 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
 
   // Stop early so we can print the results.
   rootTimer.stop();
-  if (config->showTiming)
+  if (config->showTiming) {
     ctx.rootTimer.print();
+    ctx.printSymbolMutationStats(outs());
+  }
 
   // Clean up /linkreprofullpathrsp file
   reproFile.reset();
