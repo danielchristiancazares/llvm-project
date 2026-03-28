@@ -616,13 +616,13 @@ void ObjFile::maybeAssociateSEHForMingw(
   }
 }
 
-Symbol *ObjFile::createRegular(COFFSymbolRef sym) {
+Symbol *ObjFile::createRegular(COFFSymbolRef sym, SymbolMutationStats *stats) {
   SectionChunk *sc = sparseChunks[sym.getSectionNumber()];
   if (sym.isExternal()) {
     StringRef name = check(coffObj->getSymbolName(sym));
     if (sc)
       return symtab.addRegular(this, name, sym.getGeneric(), sc,
-                               sym.getValue());
+                               sym.getValue(), /*isWeak=*/false, stats);
     // For MinGW symbols named .weak.* that point to a discarded section,
     // don't create an Undefined symbol. If nothing ever refers to the symbol,
     // everything should be fine. If something actually refers to the symbol
@@ -630,7 +630,7 @@ Symbol *ObjFile::createRegular(COFFSymbolRef sym) {
     // references at the end.
     if (symtab.ctx.config.mingw && name.starts_with(".weak."))
       return nullptr;
-    return symtab.addUndefined(name, this, false);
+    return symtab.addUndefined(name, this, false, stats);
   }
   if (sc) {
     const coff_symbol_generic *symGen = sym.getGeneric();
@@ -648,6 +648,7 @@ Symbol *ObjFile::createRegular(COFFSymbolRef sym) {
 void ObjFile::initializeSymbols() {
   uint32_t numSymbols = coffObj->getNumberOfSymbols();
   symbols.resize(numSymbols);
+  SymbolMutationStats localMutationStats;
 
   SmallVector<std::pair<Symbol *, const coff_aux_weak_external *>, 8>
       weakAliases;
@@ -674,8 +675,11 @@ void ObjFile::initializeSymbols() {
       };
       bool prevailingComdat;
       if (coffSym.isUndefined()) {
-        symbols[i] = createUndefined(coffSym, getName(), false);
+        ScopedTimer t(ctx.initializeSymbolsUndefinedTimer);
+        symbols[i] =
+            createUndefined(coffSym, getName(), false, &localMutationStats);
       } else if (coffSym.isWeakExternal()) {
+        ScopedTimer t(ctx.initializeSymbolsWeakExternalsTimer);
         auto aux = coffSym.getAux<coff_aux_weak_external>();
         bool overrideLazy = true;
 
@@ -700,24 +704,33 @@ void ObjFile::initializeSymbols() {
             overrideLazy = false;
           }
         }
-        symbols[i] = createUndefined(coffSym, getName(), overrideLazy);
+        symbols[i] = createUndefined(coffSym, getName(), overrideLazy,
+                                     &localMutationStats);
         weakAliases.emplace_back(symbols[i], aux);
-      } else if (std::optional<Symbol *> optSym =
-                     createDefined(coffSym, comdatDefs, prevailingComdat)) {
-        symbols[i] = *optSym;
-        if (ctx.config.mingw && prevailingComdat)
-          recordPrevailingSymbolForMingw(coffSym, prevailingSectionMap);
       } else {
-        // createDefined() returns std::nullopt if a symbol belongs to a
-        // section that was pending at the point when the symbol was read. This
-        // can happen in two cases:
-        // 1) section definition symbol for a comdat leader;
-        // 2) symbol belongs to a comdat section associated with another
-        //    section.
-        // In both of these cases, we can expect the section to be resolved by
-        // the time we finish visiting the remaining symbols in the symbol
-        // table. So we postpone the handling of this symbol until that time.
-        pendingIndexes.push_back(i);
+        std::optional<Symbol *> optSym;
+        {
+          ScopedTimer t(ctx.initializeSymbolsDefinedTimer);
+          optSym = createDefined(coffSym, comdatDefs, prevailingComdat,
+                                 &localMutationStats);
+        }
+        if (optSym) {
+          symbols[i] = *optSym;
+          if (ctx.config.mingw && prevailingComdat)
+            recordPrevailingSymbolForMingw(coffSym, prevailingSectionMap);
+        } else {
+          ScopedTimer t(ctx.initializeSymbolsPendingDeferralTimer);
+          // createDefined() returns std::nullopt if a symbol belongs to a
+          // section that was pending at the point when the symbol was read.
+          // This can happen in two cases:
+          // 1) section definition symbol for a comdat leader;
+          // 2) symbol belongs to a comdat section associated with another
+          //    section.
+          // In both of these cases, we can expect the section to be resolved by
+          // the time we finish visiting the remaining symbols in the symbol
+          // table. So we postpone the handling of this symbol until that time.
+          pendingIndexes.push_back(i);
+        }
       }
       i += coffSym.getNumberOfAuxSymbols();
     }
@@ -739,7 +752,7 @@ void ObjFile::initializeSymbols() {
                  << " without leader and unassociated, discarding";
         continue;
       }
-      symbols[i] = createRegular(sym);
+      symbols[i] = createRegular(sym, &localMutationStats);
     }
   }
 
@@ -754,13 +767,16 @@ void ObjFile::initializeSymbols() {
     }
   }
 
+  ctx.symbolMutationStats.mergeFrom(localMutationStats);
+
   // Free the memory used by sparseChunks now that symbol loading is finished.
   decltype(sparseChunks)().swap(sparseChunks);
 }
 
 Symbol *ObjFile::createUndefined(COFFSymbolRef sym, StringRef name,
-                                 bool overrideLazy) {
-  Symbol *s = symtab.addUndefined(name, this, overrideLazy);
+                                 bool overrideLazy,
+                                 SymbolMutationStats *stats) {
+  Symbol *s = symtab.addUndefined(name, this, overrideLazy, stats);
 
   // Add an anti-dependency alias for undefined AMD64 symbols on the ARM64EC
   // target.
@@ -770,7 +786,7 @@ Symbol *ObjFile::createUndefined(COFFSymbolRef sym, StringRef name,
       if (std::optional<std::string> mangledName =
               getArm64ECMangledFunctionName(name)) {
         Symbol *m = symtab.addUndefined(saver().save(*mangledName), this,
-                                        /*overrideLazy=*/false);
+                                        /*overrideLazy=*/false, stats);
         u->setWeakAlias(m, /*antiDep=*/true);
       }
     }
@@ -915,7 +931,7 @@ void ObjFile::handleComdatSelection(
 std::optional<Symbol *> ObjFile::createDefined(
     COFFSymbolRef sym,
     std::vector<const coff_aux_section_definition *> &comdatDefs,
-    bool &prevailing) {
+    bool &prevailing, SymbolMutationStats *stats) {
   prevailing = false;
   StringRef name;
   bool nameInitialized = false;
@@ -926,16 +942,18 @@ std::optional<Symbol *> ObjFile::createDefined(
     }
     return name;
   };
+  COFFLinkerContext &ctx = symtab.ctx;
 
   if (sym.isCommon()) {
+    ScopedTimer t(ctx.initializeSymbolsCommonTimer);
     auto *c = make<CommonChunk>(sym);
     chunks.push_back(c);
-    return symtab.addCommon(this, getName(), sym.getValue(), sym.getGeneric(),
-                            c);
+    return symtab.addCommon(this, getName(), sym.getValue(), sym.getGeneric(), c,
+                            stats);
   }
 
-  COFFLinkerContext &ctx = symtab.ctx;
   if (sym.isAbsolute()) {
+    ScopedTimer t(ctx.initializeSymbolsAbsoluteTimer);
     StringRef name = getName();
 
     if (name == "@feat.00")
@@ -954,6 +972,7 @@ std::optional<Symbol *> ObjFile::createDefined(
     return nullptr;
 
   if (sym.isEmptySectionDeclaration()) {
+    ScopedTimer t(ctx.initializeSymbolsEmptySectionsTimer);
     // As there is no coff_section in the object file for these, make a
     // new virtual one, with everything zeroed out (i.e. an empty section),
     // with only the name and characteristics set.
@@ -1003,12 +1022,13 @@ std::optional<Symbol *> ObjFile::createDefined(
 
   // Handle comdat leader.
   if (const coff_aux_section_definition *def = comdatDefs[sectionNumber]) {
+    ScopedTimer t(ctx.initializeSymbolsComdatTimer);
     comdatDefs[sectionNumber] = nullptr;
     DefinedRegular *leader;
 
     if (sym.isExternal()) {
       std::tie(leader, prevailing) =
-          symtab.addComdat(this, getName(), sym.getGeneric());
+          symtab.addComdat(this, getName(), sym.getGeneric(), stats);
     } else {
       leader = make<DefinedRegular>(this, /*Name*/ "", /*IsCOMDAT*/ false,
                                     /*IsExternal*/ false, sym.getGeneric());
@@ -1052,7 +1072,8 @@ std::optional<Symbol *> ObjFile::createDefined(
     return std::nullopt;
   }
 
-  return createRegular(sym);
+  ScopedTimer t(ctx.initializeSymbolsRegularTimer);
+  return createRegular(sym, stats);
 }
 
 MachineTypes ObjFile::getMachineType() const {
