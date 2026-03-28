@@ -6,9 +6,9 @@
 # RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
 # RUN:   %python -c "import pathlib,struct; path=pathlib.Path(r'%t.llpdbcache'); data=bytearray(path.read_bytes()); value=struct.unpack_from('<Q', data, 24)[0]; struct.pack_into('<Q', data, 24, value ^ 1); path.write_bytes(data)" && \
 # RUN:   echo SECOND >> %t.out && \
-# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -timestamp:0 -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
 # RUN:   echo THIRD >> %t.out && \
-# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -timestamp:0 -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
 # RUN:   FileCheck %s < %t.out
 
 # CHECK: FIRST

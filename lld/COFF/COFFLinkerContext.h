@@ -26,90 +26,6 @@ namespace lld::coff {
 
 class IncrementalPDBCacheSession;
 
-struct SymbolInsertStats {
-  uint64_t calls = 0;
-  uint64_t inserted = 0;
-  uint64_t existing = 0;
-
-  void mergeFrom(const SymbolInsertStats &other) {
-    calls += other.calls;
-    inserted += other.inserted;
-    existing += other.existing;
-  }
-};
-
-struct SymbolUndefinedStats {
-  uint64_t calls = 0;
-  uint64_t newOrOverrode = 0;
-  uint64_t forcedLazy = 0;
-  uint64_t reused = 0;
-
-  void mergeFrom(const SymbolUndefinedStats &other) {
-    calls += other.calls;
-    newOrOverrode += other.newOrOverrode;
-    forcedLazy += other.forcedLazy;
-    reused += other.reused;
-  }
-};
-
-struct SymbolRegularStats {
-  uint64_t calls = 0;
-  uint64_t newOrReplaced = 0;
-  uint64_t duplicate = 0;
-  uint64_t ignoredWeak = 0;
-
-  void mergeFrom(const SymbolRegularStats &other) {
-    calls += other.calls;
-    newOrReplaced += other.newOrReplaced;
-    duplicate += other.duplicate;
-    ignoredWeak += other.ignoredWeak;
-  }
-};
-
-struct SymbolComdatStats {
-  uint64_t calls = 0;
-  uint64_t inserted = 0;
-  uint64_t existingComdat = 0;
-  uint64_t duplicateNonComdat = 0;
-
-  void mergeFrom(const SymbolComdatStats &other) {
-    calls += other.calls;
-    inserted += other.inserted;
-    existingComdat += other.existingComdat;
-    duplicateNonComdat += other.duplicateNonComdat;
-  }
-};
-
-struct SymbolCommonStats {
-  uint64_t calls = 0;
-  uint64_t newOrReplacedNonCOFF = 0;
-  uint64_t replacedLarger = 0;
-  uint64_t reusedExisting = 0;
-
-  void mergeFrom(const SymbolCommonStats &other) {
-    calls += other.calls;
-    newOrReplacedNonCOFF += other.newOrReplacedNonCOFF;
-    replacedLarger += other.replacedLarger;
-    reusedExisting += other.reusedExisting;
-  }
-};
-
-struct SymbolMutationStats {
-  SymbolInsertStats insert;
-  SymbolUndefinedStats addUndefined;
-  SymbolRegularStats addRegular;
-  SymbolComdatStats addComdat;
-  SymbolCommonStats addCommon;
-
-  void mergeFrom(const SymbolMutationStats &other) {
-    insert.mergeFrom(other.insert);
-    addUndefined.mergeFrom(other.addUndefined);
-    addRegular.mergeFrom(other.addRegular);
-    addComdat.mergeFrom(other.addComdat);
-    addCommon.mergeFrom(other.addCommon);
-  }
-};
-
 class COFFLinkerContext : public CommonLinkerContext {
 public:
   COFFLinkerContext();
@@ -261,9 +177,6 @@ public:
 
   DynamicRelocsChunk *dynamicRelocs = nullptr;
 
-  SymbolMutationStats symbolMutationStats;
-
-  void printSymbolMutationStats(llvm::raw_ostream &os) const;
 };
 
 } // namespace lld::coff

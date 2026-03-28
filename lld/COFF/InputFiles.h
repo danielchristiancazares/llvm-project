@@ -39,7 +39,6 @@ class DWARFCache;
 
 namespace coff {
 
-struct SymbolMutationStats;
 class COFFLinkerContext;
 
 const COFFSyncStream &operator<<(const COFFSyncStream &, const InputFile *);
@@ -295,12 +294,10 @@ private:
   createDefined(COFFSymbolRef sym,
                 std::vector<const llvm::object::coff_aux_section_definition *>
                     &comdatDefs,
-                bool &prevailingComdat,
-                SymbolMutationStats *stats = nullptr);
-  Symbol *createRegular(COFFSymbolRef sym, SymbolMutationStats *stats = nullptr);
+                bool &prevailingComdat);
+  Symbol *createRegular(COFFSymbolRef sym);
   Symbol *createUndefined(COFFSymbolRef sym, StringRef name,
-                          bool overrideLazy,
-                          SymbolMutationStats *stats = nullptr);
+                          bool overrideLazy);
 
   std::unique_ptr<COFFObjectFile> coffObj;
 

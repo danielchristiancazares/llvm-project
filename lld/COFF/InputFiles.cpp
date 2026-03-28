@@ -611,13 +611,13 @@ void ObjFile::maybeAssociateSEHForMingw(
   }
 }
 
-Symbol *ObjFile::createRegular(COFFSymbolRef sym, SymbolMutationStats *stats) {
+Symbol *ObjFile::createRegular(COFFSymbolRef sym) {
   SectionChunk *sc = sparseChunks[sym.getSectionNumber()];
   if (sym.isExternal()) {
     StringRef name = check(coffObj->getSymbolName(sym));
     if (sc)
       return symtab.addRegular(this, name, sym.getGeneric(), sc,
-                               sym.getValue(), /*isWeak=*/false, stats);
+                               sym.getValue(), /*isWeak=*/false);
     // For MinGW symbols named .weak.* that point to a discarded section,
     // don't create an Undefined symbol. If nothing ever refers to the symbol,
     // everything should be fine. If something actually refers to the symbol
@@ -625,7 +625,7 @@ Symbol *ObjFile::createRegular(COFFSymbolRef sym, SymbolMutationStats *stats) {
     // references at the end.
     if (symtab.ctx.config.mingw && name.starts_with(".weak."))
       return nullptr;
-    return symtab.addUndefined(name, this, false, stats);
+    return symtab.addUndefined(name, this, false);
   }
   if (sc) {
     const coff_symbol_generic *symGen = sym.getGeneric();
@@ -748,9 +748,8 @@ void ObjFile::initializeSymbols() {
 }
 
 Symbol *ObjFile::createUndefined(COFFSymbolRef sym, StringRef name,
-                                 bool overrideLazy,
-                                 SymbolMutationStats *stats) {
-  Symbol *s = symtab.addUndefined(name, this, overrideLazy, stats);
+                                 bool overrideLazy) {
+  Symbol *s = symtab.addUndefined(name, this, overrideLazy);
 
   // Add an anti-dependency alias for undefined AMD64 symbols on the ARM64EC
   // target.
@@ -760,7 +759,7 @@ Symbol *ObjFile::createUndefined(COFFSymbolRef sym, StringRef name,
       if (std::optional<std::string> mangledName =
               getArm64ECMangledFunctionName(name)) {
         Symbol *m = symtab.addUndefined(saver().save(*mangledName), this,
-                                        /*overrideLazy=*/false, stats);
+                                        /*overrideLazy=*/false);
         u->setWeakAlias(m, /*antiDep=*/true);
       }
     }
@@ -905,7 +904,7 @@ void ObjFile::handleComdatSelection(
 std::optional<Symbol *> ObjFile::createDefined(
     COFFSymbolRef sym,
     std::vector<const coff_aux_section_definition *> &comdatDefs,
-    bool &prevailing, SymbolMutationStats *stats) {
+    bool &prevailing) {
   prevailing = false;
   StringRef name;
   bool nameInitialized = false;
@@ -921,8 +920,8 @@ std::optional<Symbol *> ObjFile::createDefined(
   if (sym.isCommon()) {
     auto *c = make<CommonChunk>(sym);
     chunks.push_back(c);
-    return symtab.addCommon(this, getName(), sym.getValue(), sym.getGeneric(), c,
-                            stats);
+    return symtab.addCommon(this, getName(), sym.getValue(), sym.getGeneric(),
+                            c);
   }
 
   if (sym.isAbsolute()) {
@@ -998,7 +997,7 @@ std::optional<Symbol *> ObjFile::createDefined(
 
     if (sym.isExternal()) {
       std::tie(leader, prevailing) =
-          symtab.addComdat(this, getName(), sym.getGeneric(), stats);
+          symtab.addComdat(this, getName(), sym.getGeneric());
     } else {
       leader = make<DefinedRegular>(this, /*Name*/ "", /*IsCOMDAT*/ false,
                                     /*IsExternal*/ false, sym.getGeneric());
@@ -1042,7 +1041,7 @@ std::optional<Symbol *> ObjFile::createDefined(
     return std::nullopt;
   }
 
-  return createRegular(sym, stats);
+  return createRegular(sym);
 }
 
 MachineTypes ObjFile::getMachineType() const {

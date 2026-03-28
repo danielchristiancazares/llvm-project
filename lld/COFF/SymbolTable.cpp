@@ -36,10 +36,6 @@ using namespace llvm::support;
 
 namespace lld::coff {
 
-template <typename T> static void bumpStat(T &counter) {
-  ++counter;
-}
-
 StringRef ltrim1(StringRef s, const char *chars) {
   if (!s.empty() && strchr(chars, s[0]))
     return s.substr(1);
@@ -534,13 +530,6 @@ void SymbolTable::resolveRemainingUndefines(std::vector<Undefined *> &aliases) {
 }
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name) {
-  return insert(name, static_cast<SymbolMutationStats *>(nullptr));
-}
-
-std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
-                                              SymbolMutationStats *stats) {
-  if (stats)
-    bumpStat(stats->insert.calls);
   bool inserted = false;
   Symbol *&sym = symMap[CachedHashStringRef(name)];
   if (!sym) {
@@ -553,23 +542,11 @@ std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
     if (isEC() && name.starts_with("EXP+"))
       expSymbols.push_back(sym);
   }
-  if (inserted) {
-    if (stats)
-      bumpStat(stats->insert.inserted);
-  } else {
-    if (stats)
-      bumpStat(stats->insert.existing);
-  }
   return {sym, inserted};
 }
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name, InputFile *file) {
-  return insert(name, file, nullptr);
-}
-
-std::pair<Symbol *, bool> SymbolTable::insert(StringRef name, InputFile *file,
-                                              SymbolMutationStats *stats) {
-  std::pair<Symbol *, bool> result = insert(name, stats);
+  std::pair<Symbol *, bool> result = insert(name);
   if (!file || !isa<BitcodeFile>(file))
     result.first->isUsedInRegularObj = true;
   return result;
@@ -714,29 +691,15 @@ void SymbolTable::initializeSameAddressThunks() {
 
 Symbol *SymbolTable::addUndefined(StringRef name, InputFile *f,
                                   bool overrideLazy) {
-  return addUndefined(name, f, overrideLazy, nullptr);
-}
-
-Symbol *SymbolTable::addUndefined(StringRef name, InputFile *f,
-                                  bool overrideLazy,
-                                  SymbolMutationStats *stats) {
-  if (stats)
-    bumpStat(stats->addUndefined.calls);
-  auto [s, wasInserted] = insert(name, f, stats);
+  auto [s, wasInserted] = insert(name, f);
   if (wasInserted || (s->isLazy() && overrideLazy)) {
-    if (stats)
-      bumpStat(stats->addUndefined.newOrOverrode);
     replaceSymbol<Undefined>(s, name);
     return s;
   }
   if (s->isLazy()) {
-    if (stats)
-      bumpStat(stats->addUndefined.forcedLazy);
     forceLazy(s);
     return s;
   }
-  if (stats)
-    bumpStat(stats->addUndefined.reused);
   return s;
 }
 
@@ -956,28 +919,12 @@ Symbol *SymbolTable::addSynthetic(StringRef n, Chunk *c) {
 Symbol *SymbolTable::addRegular(InputFile *f, StringRef n,
                                 const coff_symbol_generic *sym, SectionChunk *c,
                                 uint32_t sectionOffset, bool isWeak) {
-  return addRegular(f, n, sym, c, sectionOffset, isWeak, nullptr);
-}
-
-Symbol *SymbolTable::addRegular(InputFile *f, StringRef n,
-                                const coff_symbol_generic *sym, SectionChunk *c,
-                                uint32_t sectionOffset, bool isWeak,
-                                SymbolMutationStats *stats) {
-  if (stats)
-    bumpStat(stats->addRegular.calls);
-  auto [s, wasInserted] = insert(n, f, stats);
+  auto [s, wasInserted] = insert(n, f);
   if (wasInserted || !isa<DefinedRegular>(s) || s->isWeak) {
-    if (stats)
-      bumpStat(stats->addRegular.newOrReplaced);
     replaceSymbol<DefinedRegular>(s, f, n, /*IsCOMDAT*/ false,
                                   /*IsExternal*/ true, sym, c, isWeak);
   } else if (!isWeak) {
-    if (stats)
-      bumpStat(stats->addRegular.duplicate);
     reportDuplicate(s, f, c, sectionOffset);
-  } else {
-    if (stats)
-      bumpStat(stats->addRegular.ignoredWeak);
   }
   return s;
 }
@@ -985,62 +932,26 @@ Symbol *SymbolTable::addRegular(InputFile *f, StringRef n,
 std::pair<DefinedRegular *, bool>
 SymbolTable::addComdat(InputFile *f, StringRef n,
                        const coff_symbol_generic *sym) {
-  return addComdat(f, n, sym, nullptr);
-}
-
-std::pair<DefinedRegular *, bool>
-SymbolTable::addComdat(InputFile *f, StringRef n,
-                       const coff_symbol_generic *sym,
-                       SymbolMutationStats *stats) {
-  if (stats)
-    bumpStat(stats->addComdat.calls);
-  auto [s, wasInserted] = insert(n, f, stats);
+  auto [s, wasInserted] = insert(n, f);
   if (wasInserted || !isa<DefinedRegular>(s)) {
-    if (stats)
-      bumpStat(stats->addComdat.inserted);
     replaceSymbol<DefinedRegular>(s, f, n, /*IsCOMDAT*/ true,
                                   /*IsExternal*/ true, sym, nullptr);
     return {cast<DefinedRegular>(s), true};
   }
   auto *existingSymbol = cast<DefinedRegular>(s);
-  if (!existingSymbol->isCOMDAT) {
-    if (stats)
-      bumpStat(stats->addComdat.duplicateNonComdat);
+  if (!existingSymbol->isCOMDAT)
     reportDuplicate(s, f);
-  } else {
-    if (stats)
-      bumpStat(stats->addComdat.existingComdat);
-  }
   return {existingSymbol, false};
 }
 
 Symbol *SymbolTable::addCommon(InputFile *f, StringRef n, uint64_t size,
                                const coff_symbol_generic *sym, CommonChunk *c) {
-  return addCommon(f, n, size, sym, c, nullptr);
-}
-
-Symbol *SymbolTable::addCommon(InputFile *f, StringRef n, uint64_t size,
-                               const coff_symbol_generic *sym, CommonChunk *c,
-                               SymbolMutationStats *stats) {
-  if (stats)
-    bumpStat(stats->addCommon.calls);
-  auto [s, wasInserted] = insert(n, f, stats);
+  auto [s, wasInserted] = insert(n, f);
   if (wasInserted || !isa<DefinedCOFF>(s)) {
-    if (stats)
-      bumpStat(stats->addCommon.newOrReplacedNonCOFF);
     replaceSymbol<DefinedCommon>(s, f, n, size, sym, c);
   } else if (auto *dc = dyn_cast<DefinedCommon>(s)) {
-    if (size > dc->getSize()) {
-      if (stats)
-        bumpStat(stats->addCommon.replacedLarger);
+    if (size > dc->getSize())
       replaceSymbol<DefinedCommon>(s, f, n, size, sym, c);
-    } else {
-      if (stats)
-        bumpStat(stats->addCommon.reusedExisting);
-    }
-  } else {
-    if (stats)
-      bumpStat(stats->addCommon.reusedExisting);
   }
   return s;
 }

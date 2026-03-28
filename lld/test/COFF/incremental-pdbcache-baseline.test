@@ -7,7 +7,7 @@
 # RUN:   echo CACHE >> %t.out && \
 # RUN:   %python -c "import pathlib; print(pathlib.Path(r'%t.llpdbcache').is_file())" >> %t.out && \
 # RUN:   echo SECOND >> %t.out && \
-# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -timestamp:0 -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj >> %t.out 2>&1 && \
 # RUN:   FileCheck %s < %t.out
 
 # CHECK: FIRST

@@ -43,7 +43,6 @@ struct WrappedSymbol {
 };
 
 struct UndefinedDiag;
-struct SymbolMutationStats;
 
 enum class ExportConfigurationMode {
   AllowAutoExports,
@@ -216,24 +215,8 @@ private:
   Defined *impSymbol(StringRef name);
   /// Inserts symbol if not already present.
   std::pair<Symbol *, bool> insert(StringRef name);
-  std::pair<Symbol *, bool> insert(StringRef name, SymbolMutationStats *stats);
   /// Same as insert(Name), but also sets isUsedInRegularObj.
   std::pair<Symbol *, bool> insert(StringRef name, InputFile *f);
-  std::pair<Symbol *, bool> insert(StringRef name, InputFile *f,
-                                   SymbolMutationStats *stats);
-  Symbol *addUndefined(StringRef name, InputFile *f, bool overrideLazy,
-                       SymbolMutationStats *stats);
-  Symbol *addRegular(InputFile *f, StringRef n,
-                     const llvm::object::coff_symbol_generic *s,
-                     SectionChunk *c, uint32_t sectionOffset, bool isWeak,
-                     SymbolMutationStats *stats);
-  std::pair<DefinedRegular *, bool>
-  addComdat(InputFile *f, StringRef n,
-            const llvm::object::coff_symbol_generic *s,
-            SymbolMutationStats *stats);
-  Symbol *addCommon(InputFile *f, StringRef n, uint64_t size,
-                    const llvm::object::coff_symbol_generic *s, CommonChunk *c,
-                    SymbolMutationStats *stats);
 
   bool findUnderscoreMangle(StringRef sym);
 

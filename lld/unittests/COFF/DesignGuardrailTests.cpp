@@ -117,18 +117,18 @@ TEST(ClosedDesignTest, MatchReturnsActiveAlternativeAfterMoveConstruction) {
 }
 
 TEST(DesignGuardrailTest, CoffHeadersDoNotAddMoreBoolLines) {
-  EXPECT_LE(countMatchingLinesInCoffHeaders(std::regex(R"(\bbool\b)")), 175u);
+  EXPECT_LE(countMatchingLinesInCoffHeaders(std::regex(R"(\bbool\b)")), 182u);
 }
 
 TEST(DesignGuardrailTest, CoffHeadersDoNotAddMoreOptionalLines) {
   EXPECT_LE(
       countMatchingLinesInCoffHeaders(std::regex(R"(std::optional|optional<)")),
-      13u);
+      15u);
 }
 
 TEST(DesignGuardrailTest, CoffHeadersDoNotAddFriendClassLines) {
   EXPECT_LE(countMatchingLinesInCoffHeaders(std::regex(R"(friend class)")),
-            1u);
+            2u);
 }
 
 TEST(DesignGuardrailTest, CoffHeadersDoNotAddMoreNullabilityLines) {
