@@ -47,6 +47,8 @@
 # LLDMAP-NEXT: 00001000 00000026  4096 .text
 # LLDMAP-NEXT: 00001000 00000008     4         {{.*}}map.test.tmp.obj:(.text)
 # LLDMAP-NEXT: 00001000 00000000     0                 main
+# LLDMAP:      00001010 00000000     0                 exportfn1
+# LLDMAP:      00002040 00000000     0                 __imp_exportfn1
 
 # MAPINFO: Exports
 # MAPINFO-EMPTY:

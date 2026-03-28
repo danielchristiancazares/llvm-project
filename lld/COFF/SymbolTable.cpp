@@ -1412,7 +1412,8 @@ void SymbolTable::resolveAlternateNames() {
 }
 
 // Parses /aligncomm option argument.
-void SymbolTable::parseAligncomm(StringRef s) {
+void SymbolTable::parseAligncomm(COFFLinkerContext &ctx, StringRef s,
+                                 std::map<std::string, int> &alignComm) {
   auto [name, align] = s.split(',');
   if (name.empty() || align.empty()) {
     Err(ctx) << "/aligncomm: invalid argument: " << s;
@@ -1424,6 +1425,10 @@ void SymbolTable::parseAligncomm(StringRef s) {
     return;
   }
   alignComm[std::string(name)] = std::max(alignComm[std::string(name)], 1 << v);
+}
+
+void SymbolTable::parseAligncomm(StringRef s) {
+  parseAligncomm(ctx, s, alignComm);
 }
 
 Symbol *SymbolTable::addUndefined(StringRef name) {

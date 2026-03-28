@@ -8,6 +8,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/TimeProfiler.h"
 #include <algorithm>
 
 using namespace llvm;
@@ -1071,6 +1072,8 @@ recomputeOutputLayout(COFFLinkerContext &ctx,
 } // namespace
 
 IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
+  llvm::TimeTraceScope timeScope("Incremental layout application");
+  ScopedTimer t(ctx.incrementalLayoutTimer);
   std::unique_ptr<LayoutStableLink> validated = takeActiveLayoutStableLink(ctx);
   if (!validated)
     return IncrementalLayoutOutcome::make<WriteCurrentFullImageLayout>();
@@ -1191,8 +1194,7 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
       return installLayoutFallback();
   }
 
-  reuse.currentEdges =
-      buildIncrementalEdgeStates(ctx, baseline.currentInputs.inputIndices);
+  reuse.exactLayoutOnly = exactLayoutOnly;
 
   StringMap<uint64_t> oldPlacementRVAs;
   for (const IncrementalSectionSnapshot &sectionSnapshot :
@@ -1235,14 +1237,18 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
   }
 
   StringSet<> affectedSourceKeys;
-  for (const IncrementalEdgeState &edge : reuse.currentEdges) {
-    if (!reuse.movedChunkTargets.contains(edge.targetKey) &&
-        !reuse.activeRedirectTargets.contains(edge.targetKey))
-      continue;
-    if (reuse.activeRedirectTargets.contains(edge.targetKey) &&
-        edge.routing == IncrementalEdgeRouting::RedirectEligibleEntryReference)
-      continue;
-    affectedSourceKeys.insert(edge.sourceKey);
+  if (!exactLayoutOnly) {
+    reuse.currentEdges =
+        buildIncrementalEdgeStates(ctx, baseline.currentInputs.inputIndices);
+    for (const IncrementalEdgeState &edge : reuse.currentEdges) {
+      if (!reuse.movedChunkTargets.contains(edge.targetKey) &&
+          !reuse.activeRedirectTargets.contains(edge.targetKey))
+        continue;
+      if (reuse.activeRedirectTargets.contains(edge.targetKey) &&
+          edge.routing == IncrementalEdgeRouting::RedirectEligibleEntryReference)
+        continue;
+      affectedSourceKeys.insert(edge.sourceKey);
+    }
   }
 
   StringRef oldImage = baseline.oldImage->getBuffer();
@@ -1303,18 +1309,33 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
     }
   }
 
-  rewriteRelocsToRedirectTargets(ctx, baseline.currentInputs.inputIndices,
-                                 reuse);
-  for (OutputSection *section : activeSections) {
-    if (classifyIncrementalSection(section->name,
-                                   section->header.Characteristics) !=
-        IncrementalSectionLayoutKind::TextFreeSlots)
-      continue;
-    if (!validateAmd64Rel32Layout(ctx, reuse.rewrittenChunks, *section))
-      return installLayoutFallback();
+  if (!exactLayoutOnly) {
+    rewriteRelocsToRedirectTargets(ctx, baseline.currentInputs.inputIndices,
+                                   reuse);
+    for (OutputSection *section : activeSections) {
+      if (classifyIncrementalSection(section->name,
+                                     section->header.Characteristics) !=
+          IncrementalSectionLayoutKind::TextFreeSlots)
+        continue;
+      if (!validateAmd64Rel32Layout(ctx, reuse.rewrittenChunks, *section))
+        return installLayoutFallback();
+    }
   }
 
   recomputeOutputLayout(ctx, activeSections, baseline.snapshot, result);
+
+  bool skipBaselineEmission =
+      exactLayoutOnly && baseline.changedInputs.empty() &&
+      shouldPreserveIncrementalBuildMetadata(ctx) &&
+      validated->pdbReuse.match([](const ReusePdbMetadata &) { return true; },
+                                [](const RebuildPdbMetadata &) {
+                                  return false;
+                                });
+  IncrementalBaselineEmission baselineEmission = [&]() {
+    if (skipBaselineEmission)
+      return IncrementalBaselineEmission::make<SkipNextBaseline>();
+    return std::move(validated->baselineEmission);
+  }();
 
   if (ctx.config.verbose) {
     Log(ctx) << "incremental: byte-reuse layout active";
@@ -1322,13 +1343,16 @@ IncrementalLayoutOutcome applyIncrementalLayout(COFFLinkerContext &ctx) {
       Log(ctx) << "incremental: exact-layout reuse active";
     for (const std::string &log : verboseLogs)
       Log(ctx) << log;
+    Log(ctx) << "incremental: reuse counters: reused-chunks="
+             << reuse.reusedChunkData.size()
+             << " rewritten-chunks=" << reuse.rewrittenChunks.size()
+             << " baseline-skip=" << (skipBaselineEmission ? "yes" : "no");
   }
 
   installIncrementalCoordinator(
       ctx, IncrementalCoordinator::makeByteReuseLink(
                std::move(validated->baseline), std::move(reuse),
-               std::move(validated->pdbReuse),
-               std::move(validated->baselineEmission)));
+               std::move(validated->pdbReuse), std::move(baselineEmission)));
   return IncrementalLayoutOutcome::make<WriteReusedIncrementalLayout>(
       WriteReusedIncrementalLayout{result});
 }

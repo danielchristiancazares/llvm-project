@@ -872,7 +872,8 @@ void Writer::run() {
 
   if (!ctx.config.pdbPath.empty() && ctx.config.debug) {
     assert(buildId);
-    createPDB(ctx, sectionTable, buildId->buildId);
+    if (!shouldSkipIncrementalPdbEmission(ctx))
+      createPDB(ctx, sectionTable, buildId->buildId);
   }
   writeBuildId();
 
@@ -2742,11 +2743,17 @@ void Writer::writeBuildId() {
 
   uint32_t timestamp = config->timestamp;
   uint64_t hash = 0;
+  const IncrementalOutputMetadata *oldMetadata =
+      findActiveIncrementalOutputMetadata(ctx);
+  bool preserveMetadata =
+      shouldPreserveIncrementalBuildMetadata(ctx) && oldMetadata;
 
   if (config->repro || generateSyntheticBuildId)
     hash = xxh3_64bits(outputFileData);
 
-  if (config->repro)
+  if (preserveMetadata)
+    timestamp = oldMetadata->timestamp;
+  else if (config->repro)
     timestamp = static_cast<uint32_t>(hash);
 
   if (generateSyntheticBuildId) {
@@ -2755,6 +2762,12 @@ void Writer::writeBuildId() {
     memcpy(buildId->buildId->PDB70.Signature, &hash, 8);
     // xxhash only gives us 8 bytes, so put some fixed data in the other half.
     memcpy(&buildId->buildId->PDB70.Signature[8], "LLD PDB.", 8);
+  } else if (buildId && shouldReuseIncrementalPdbMetadata(ctx) && oldMetadata &&
+             oldMetadata->pdbGuid) {
+    buildId->buildId->PDB70.CVSignature = OMF::Signature::PDB70;
+    buildId->buildId->PDB70.Age = oldMetadata->pdbAge;
+    memcpy(buildId->buildId->PDB70.Signature, oldMetadata->pdbGuid->Guid,
+           sizeof(oldMetadata->pdbGuid->Guid));
   }
 
   if (debugDirectory)
@@ -3038,7 +3051,7 @@ void Writer::fixTlsAlignment() {
 }
 
 void Writer::prepareLoadConfig() {
-  ctx.forEachActiveSymtab([&](SymbolTable &symtab) {
+  ctx.forEachSymtabWithInputs([&](SymbolTable &symtab) {
     if (!symtab.loadConfigSym)
       return;
 

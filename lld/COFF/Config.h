@@ -328,6 +328,9 @@ struct Configuration {
   // Used for /mapinfo.
   bool mapInfo = false;
 
+  // Used for command-line /aligncomm.
+  std::map<std::string, int> alignComm;
+
   // Used for /thinlto-index-only:
   llvm::StringRef thinLTOIndexOnlyArg;
 
@@ -390,6 +393,7 @@ struct Configuration {
   uint32_t majorSubsystemVersion = 6;
   uint32_t minorSubsystemVersion = 0;
   uint32_t timestamp = 0;
+  bool timestampSpecified = false;
   uint32_t functionPadMin = 0;
   uint32_t timeTraceGranularity = 0;
   uint16_t dependentLoadFlags = 0;

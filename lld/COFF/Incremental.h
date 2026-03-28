@@ -14,6 +14,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/DebugInfo/CodeView/GUID.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -21,6 +22,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/MathExtras.h"
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,12 +76,18 @@ struct IncrementalCurrentInputs {
   IncrementalInputIndexMap inputIndices;
 };
 
+struct IncrementalOutputMetadata {
+  uint32_t timestamp = 0;
+  std::optional<llvm::codeview::GUID> pdbGuid;
+  uint32_t pdbAge = 1;
+};
+
 struct IncrementalBaselineData {
   IncrementalBaselineSnapshot snapshot;
   std::unique_ptr<llvm::MemoryBuffer> oldImage;
+  IncrementalOutputMetadata previousOutputMetadata;
   IncrementalCurrentInputs currentInputs;
   llvm::DenseSet<const ObjFile *> changedInputs;
-  llvm::StringSet<> replayableArchives;
   llvm::StringSet<> expectedArchiveMembers;
   llvm::StringSet<> loadedArchiveMembers;
 };
@@ -94,6 +102,7 @@ struct IncrementalReuseData {
   llvm::StringMap<Defined *> poolThunkSymbols;
   llvm::StringSet<> movedChunkTargets;
   llvm::StringSet<> activeRedirectTargets;
+  bool exactLayoutOnly = false;
 };
 
 enum class IncrementalRedirectEngagement : uint8_t {
@@ -321,10 +330,21 @@ void installPendingIncrementalFullImageBuild(
     COFFLinkerContext &ctx, IncrementalFullBuildDecision decision,
     IncrementalBaselineEmission baselineEmission);
 uint64_t computeIncrementalHardConfigHash(const Configuration &config);
-uint64_t computeIncrementalSoftConfigHash(const Configuration &config);
+uint64_t computeIncrementalSoftConfigHash(
+    const Configuration &config,
+    std::optional<uint32_t> timestampOverride = std::nullopt);
 
 IncrementalCurrentInputs
 prepareCurrentIncrementalInputs(COFFLinkerContext &ctx);
+const IncrementalCurrentInputs *
+findActiveIncrementalCurrentInputs(const COFFLinkerContext &ctx);
+const IncrementalBaselineData *
+findActiveIncrementalBaseline(const COFFLinkerContext &ctx);
+const IncrementalOutputMetadata *
+findActiveIncrementalOutputMetadata(const COFFLinkerContext &ctx);
+bool shouldPreserveIncrementalBuildMetadata(const COFFLinkerContext &ctx);
+bool shouldReuseIncrementalPdbMetadata(const COFFLinkerContext &ctx);
+bool shouldSkipIncrementalPdbEmission(const COFFLinkerContext &ctx);
 IncrementalSectionLayoutKind
 classifyIncrementalSection(llvm::StringRef name, uint32_t characteristics);
 bool isIncrementalFreeSlotLayout(IncrementalSectionLayoutKind layoutKind);

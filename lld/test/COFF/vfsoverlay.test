@@ -4,6 +4,9 @@
 # RUN: sed -e "s|REPLACE|%/t/std64.lib|g" %t/overlay.yaml.in > %t/overlay.yaml
 
 # RUN: lld-link %S/Inputs/hello64.obj /libpath:/noexist /out:%t.exe /entry:main /defaultlib:notstd64 /vfsoverlay:%t/overlay.yaml
+# RUN: not lld-link %S/Inputs/hello64.obj /libpath:/noexist /out:%t.exe /entry:main /defaultlib:notstd64 /nodefaultlib:notstd64 /vfsoverlay:%t/overlay.yaml 2>&1 \
+# RUN:   | FileCheck %s --check-prefix=NODEFAULT
+# NODEFAULT: error: undefined symbol:
 
 # RUN: not lld-link %S/Inputs/hello64.obj /libpath:/noexist /out:%t.exe /entry:main /defaultlib:notstd64 /vfsoverlay:noexist 2>&1 \
 # RUN:   | FileCheck %s
@@ -17,6 +20,7 @@
 #--- overlay.yaml.in
 {
   'version': 0,
+  'use-external-names': false,
   'roots' : [
     {
       'name': '/noexist',

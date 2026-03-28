@@ -1317,6 +1317,8 @@ ImportFile::ImportFile(COFFLinkerContext &ctx, MemoryBufferRef m)
       live(!ctx.config.doGC) {}
 
 MachineTypes ImportFile::getMachineType(MemoryBufferRef m) {
+  if (m.getBufferSize() < sizeof(coff_import_header))
+    return IMAGE_FILE_MACHINE_UNKNOWN;
   uint16_t machine =
       reinterpret_cast<const coff_import_header *>(m.getBufferStart())->Machine;
   return MachineTypes(machine);
@@ -1586,8 +1588,9 @@ std::string lld::coff::replaceThinLTOSuffix(StringRef path, StringRef suffix,
 static bool isRVACode(COFFObjectFile *coffObj, uint64_t rva, InputFile *file) {
   for (size_t i = 1, e = coffObj->getNumberOfSections(); i <= e; i++) {
     const coff_section *sec = CHECK(coffObj->getSection(i), file);
-    if (rva >= sec->VirtualAddress &&
-        rva <= sec->VirtualAddress + sec->VirtualSize) {
+    uint64_t secStart = sec->VirtualAddress;
+    uint64_t secEnd = secStart + sec->VirtualSize;
+    if (rva >= secStart && rva < secEnd) {
       return (sec->Characteristics & COFF::IMAGE_SCN_CNT_CODE) != 0;
     }
   }

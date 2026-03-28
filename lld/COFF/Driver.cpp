@@ -151,10 +151,21 @@ static bool isCrtend(StringRef s) {
 // (a limited resource on Windows) for the duration that the future is pending.
 using MBErrPair = std::pair<std::unique_ptr<MemoryBuffer>, std::error_code>;
 
+static ErrorOr<std::unique_ptr<MemoryBuffer>>
+openFile(StringRef path, llvm::vfs::FileSystem *fs) {
+  if (fs)
+    return fs->getBufferForFile(path, /*FileSize=*/-1,
+                                /*RequiresNullTerminator=*/false,
+                                /*IsVolatile=*/false, /*IsText=*/false);
+  return MemoryBuffer::getFile(path, /*IsText=*/false,
+                               /*RequiresNullTerminator=*/false);
+}
+
 // Create a std::future that opens and maps a file using the best strategy for
 // the host platform.
-static std::future<MBErrPair> createFutureForFile(std::string path,
-                                                  InputPrefetchMode prefetchMode) {
+static std::future<MBErrPair>
+createFutureForFile(std::string path, llvm::vfs::FileSystem *fs,
+                    InputPrefetchMode prefetchMode) {
 #if _WIN64
   // On Windows, file I/O is relatively slow so it is best to do this
   // asynchronously.  But 32-bit has issues with potentially launching tons
@@ -164,8 +175,7 @@ static std::future<MBErrPair> createFutureForFile(std::string path,
   auto strategy = std::launch::deferred;
 #endif
   return std::async(strategy, [=]() {
-    auto mbOrErr = MemoryBuffer::getFile(path, /*IsText=*/false,
-                                         /*RequiresNullTerminator=*/false);
+    auto mbOrErr = openFile(path, fs);
     if (!mbOrErr)
       return MBErrPair{nullptr, mbOrErr.getError()};
     // Prefetch memory pages in the background as we will need them soon enough.
@@ -219,6 +229,7 @@ void LinkerDriver::addFile(InputFile *file) {
     }
     if (auto *f = dyn_cast<ObjFile>(file)) {
       ctx.objFileInstances.push_back(f);
+      f->symtab.noteInputFile();
     } else if (auto *f = dyn_cast<ArchiveFile>(file)) {
       ctx.archiveFileInstances.push_back(f);
     } else if (auto *f = dyn_cast<BitcodeFile>(file)) {
@@ -228,8 +239,10 @@ void LinkerDriver::addFile(InputFile *file) {
                     "doing LTO compilation.";
       }
       f->symtab.bitcodeFileInstances.push_back(f);
+      f->symtab.noteInputFile();
     } else if (auto *f = dyn_cast<ImportFile>(file)) {
       ctx.importFileInstances.push_back(f);
+      f->symtab.noteInputFile();
     }
   }
 
@@ -325,7 +338,7 @@ void LinkerDriver::addBuffer(std::unique_ptr<MemoryBuffer> mb,
     break;
   }
   case file_magic::coff_import_library:
-    addFile(ObjFile::create(ctx, mbref, lazy));
+    addFile(make<ImportFile>(ctx, mbref));
     break;
   case file_magic::pdb:
     addFile(make<PDBInputFile>(ctx, mbref));
@@ -373,7 +386,8 @@ void LinkerDriver::handleReproFile(StringRef path, InputOpt inputOpt) {
 
 void LinkerDriver::enqueuePath(StringRef path, bool lazy, InputOpt inputOpt) {
   auto future = std::make_shared<std::future<MBErrPair>>(
-      createFutureForFile(std::string(path), ctx.config.inputPrefetchMode));
+      createFutureForFile(std::string(path), ctx.config.vfs.get(),
+                          ctx.config.inputPrefetchMode));
   std::string pathStr = std::string(path);
   enqueueTask([=]() {
     llvm::TimeTraceScope timeScope("File: ", path);
@@ -387,8 +401,7 @@ void LinkerDriver::enqueuePath(StringRef path, bool lazy, InputOpt inputOpt) {
       // before something we can find with an architecture, we won't find the
       // winsysroot file.
       if (std::optional<StringRef> retryPath = findFileIfNew(pathStr)) {
-        auto retryMb = MemoryBuffer::getFile(*retryPath, /*IsText=*/false,
-                                             /*RequiresNullTerminator=*/false);
+        auto retryMb = openFile(*retryPath, ctx.config.vfs.get());
         ec = retryMb.getError();
         if (!ec) {
           mb = std::move(*retryMb);
@@ -522,7 +535,8 @@ void LinkerDriver::enqueueArchiveMember(const Archive::Child &c,
             "could not get the filename for the member defining symbol " +
                 symName);
   auto future = std::make_shared<std::future<MBErrPair>>(
-      createFutureForFile(childName, ctx.config.inputPrefetchMode));
+      createFutureForFile(childName, ctx.config.vfs.get(),
+                          ctx.config.inputPrefetchMode));
   enqueueTask([=]() {
     auto mbOrErr = future->get();
     if (mbOrErr.second)
@@ -625,7 +639,7 @@ void LinkerDriver::parseDirectives(InputFile *file) {
       parseMerge(arg->getValue());
       break;
     case OPT_nodefaultlib:
-      ctx.config.noDefaultLibs.insert(findLib(arg->getValue()).lower());
+      addNoDefaultLib(arg->getValue());
       break;
     case OPT_release:
       ctx.config.peChecksumMode = PEChecksumMode::WritePEChecksum;
@@ -666,33 +680,44 @@ void LinkerDriver::parseDirectives(InputFile *file) {
 // Find file from search paths. You can omit ".obj", this function takes
 // care of that. Note that the returned path is not guaranteed to exist.
 StringRef LinkerDriver::findFile(StringRef filename) {
-  auto getFilename = [this](StringRef filename) -> StringRef {
-    if (ctx.config.vfs)
+  auto resolvePath = [this](StringRef filename) -> std::optional<StringRef> {
+    if (ctx.config.vfs) {
       if (auto statOrErr = ctx.config.vfs->status(filename))
         return saver().save(statOrErr->getName());
-    return filename;
+      return std::nullopt;
+    }
+    if (sys::fs::exists(filename))
+      return saver().save(filename);
+    return std::nullopt;
   };
 
-  if (sys::path::is_absolute(filename))
-    return getFilename(filename);
+  if (sys::path::is_absolute(filename)) {
+    if (std::optional<StringRef> path = resolvePath(filename))
+      return *path;
+    return filename;
+  }
   bool hasExt = filename.contains('.');
   for (StringRef dir : searchPaths) {
     SmallString<128> path = dir;
     sys::path::append(path, filename);
-    path = SmallString<128>{getFilename(path.str())};
-    if (sys::fs::exists(path.str()))
-      return saver().save(path.str());
+    if (std::optional<StringRef> resolvedPath = resolvePath(path.str()))
+      return *resolvedPath;
     if (!hasExt) {
       path.append(".obj");
-      path = SmallString<128>{getFilename(path.str())};
-      if (sys::fs::exists(path.str()))
-        return saver().save(path.str());
+      if (std::optional<StringRef> resolvedPath = resolvePath(path.str()))
+        return *resolvedPath;
     }
   }
   return filename;
 }
 
-static std::optional<sys::fs::UniqueID> getUniqueID(StringRef path) {
+static std::optional<sys::fs::UniqueID> getUniqueID(StringRef path,
+                                                    llvm::vfs::FileSystem *fs) {
+  if (fs) {
+    if (auto statOrErr = fs->status(path))
+      return statOrErr->getUniqueID();
+    return std::nullopt;
+  }
   sys::fs::UniqueID ret;
   if (sys::fs::getUniqueID(path, ret))
     return std::nullopt;
@@ -704,7 +729,8 @@ static std::optional<sys::fs::UniqueID> getUniqueID(StringRef path) {
 std::optional<StringRef> LinkerDriver::findFileIfNew(StringRef filename) {
   StringRef path = findFile(filename);
 
-  if (std::optional<sys::fs::UniqueID> id = getUniqueID(path)) {
+  if (std::optional<sys::fs::UniqueID> id =
+          getUniqueID(path, ctx.config.vfs.get())) {
     bool seen = !visitedFiles.insert(*id).second;
     if (seen)
       return std::nullopt;
@@ -727,12 +753,15 @@ StringRef LinkerDriver::findLibMinGW(StringRef filename) {
   return findFile(libName);
 }
 
+StringRef LinkerDriver::normalizeLibName(StringRef filename) {
+  if (!filename.contains('.'))
+    filename = saver().save(filename + ".lib");
+  return filename;
+}
+
 // Find library file from search path.
 StringRef LinkerDriver::findLib(StringRef filename) {
-  // Add ".lib" to Filename if that has no file extension.
-  bool hasExt = filename.contains('.');
-  if (!hasExt)
-    filename = saver().save(filename + ".lib");
+  filename = normalizeLibName(filename);
   StringRef ret = findFile(filename);
   // For MinGW, if the find above didn't turn up anything, try
   // looking for a MinGW formatted library name.
@@ -741,20 +770,29 @@ StringRef LinkerDriver::findLib(StringRef filename) {
   return ret;
 }
 
+void LinkerDriver::addNoDefaultLib(StringRef filename) {
+  filename = normalizeLibName(filename);
+  ctx.config.noDefaultLibs.insert(filename.lower());
+  ctx.config.noDefaultLibs.insert(findFile(filename).lower());
+}
+
 // Resolves a library path. /nodefaultlib options are taken into
 // consideration. This never returns the same path (in that case,
 // it returns std::nullopt).
 std::optional<StringRef> LinkerDriver::findLibIfNew(StringRef filename) {
   if (ctx.config.noDefaultLibAll)
     return std::nullopt;
-  if (!visitedLibs.insert(filename.lower()).second)
+  StringRef normalizedName = normalizeLibName(filename);
+  if (!visitedLibs.insert(normalizedName.lower()).second)
     return std::nullopt;
 
-  StringRef path = findLib(filename);
-  if (ctx.config.noDefaultLibs.contains(path.lower()))
+  StringRef path = findLib(normalizedName);
+  if (ctx.config.noDefaultLibs.contains(normalizedName.lower()) ||
+      ctx.config.noDefaultLibs.contains(path.lower()))
     return std::nullopt;
 
-  if (std::optional<sys::fs::UniqueID> id = getUniqueID(path))
+  if (std::optional<sys::fs::UniqueID> id =
+          getUniqueID(path, ctx.config.vfs.get()))
     if (!visitedFiles.insert(*id).second)
       return std::nullopt;
   return path;
@@ -901,6 +939,8 @@ void LinkerDriver::addWinSysRootLibSearchPaths() {
   // Libraries specified by `/nodefaultlib:` may not be found in incomplete
   // search paths before lld infers a machine type from input files.
   llvm::StringSet<> noDefaultLibs;
+  for (auto &iter : ctx.config.noDefaultLibs)
+    noDefaultLibs.insert(iter.first());
   for (auto &iter : ctx.config.noDefaultLibs)
     noDefaultLibs.insert(findLib(iter.first()).lower());
   ctx.config.noDefaultLibs = std::move(noDefaultLibs);
@@ -1959,7 +1999,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   {
     llvm::TimeTraceScope timeScope2("Nodefaultlib");
     for (auto *arg : args.filtered(OPT_nodefaultlib))
-      config->noDefaultLibs.insert(findLib(arg->getValue()).lower());
+      addNoDefaultLib(arg->getValue());
   }
 
   // Handle /nodefaultlib
@@ -2013,9 +2053,11 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   if (llvm::opt::Arg *arg = args.getLastArg(OPT_timestamp, OPT_repro)) {
     if (arg->getOption().getID() == OPT_repro) {
       config->timestamp = 0;
+      config->timestampSpecified = false;
       config->repro = true;
     } else {
       config->repro = false;
+      config->timestampSpecified = true;
       StringRef value(arg->getValue());
       if (value.getAsInteger(0, config->timestamp))
         Fatal(ctx) << "invalid timestamp: " << value
@@ -2025,11 +2067,13 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     config->repro = false;
     if (std::optional<std::string> epoch =
             Process::GetEnv("SOURCE_DATE_EPOCH")) {
+      config->timestampSpecified = true;
       StringRef value(*epoch);
       if (value.getAsInteger(0, config->timestamp))
         Fatal(ctx) << "invalid SOURCE_DATE_EPOCH timestamp: " << value
                    << ".  Expected 32-bit integer";
     } else {
+      config->timestampSpecified = false;
       config->timestamp = time(nullptr);
     }
   }
@@ -2212,7 +2256,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
 
   // Handle /aligncomm
   for (auto *arg : args.filtered(OPT_aligncomm))
-    ctx.symtab.parseAligncomm(arg->getValue());
+    SymbolTable::parseAligncomm(ctx, arg->getValue(), config->alignComm);
 
   // Handle /manifestdependency.
   for (auto *arg : args.filtered(OPT_manifestdependency))
@@ -2397,7 +2441,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   SmallSet<sys::fs::UniqueID, 0> wholeArchives;
   for (auto *arg : args.filtered(OPT_wholearchive_file))
     if (std::optional<StringRef> path = findFile(arg->getValue()))
-      if (std::optional<sys::fs::UniqueID> id = getUniqueID(*path))
+      if (std::optional<sys::fs::UniqueID> id =
+              getUniqueID(*path, ctx.config.vfs.get()))
         wholeArchives.insert(*id);
 
   // A predicate returning true if a given path is an argument for
@@ -2407,7 +2452,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   auto isWholeArchive = [&](StringRef path) -> bool {
     if (args.hasArg(OPT_wholearchive_flag))
       return true;
-    if (std::optional<sys::fs::UniqueID> id = getUniqueID(path))
+    if (std::optional<sys::fs::UniqueID> id =
+            getUniqueID(path, ctx.config.vfs.get()))
       return wholeArchives.contains(*id);
     return false;
   };
@@ -2620,7 +2666,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     llvm::TimeTraceScope timeScope("Delay load");
     for (auto *arg : args.filtered(OPT_delayload)) {
       config->delayLoads.insert(StringRef(arg->getValue()).lower());
-      ctx.forEachActiveSymtab([&](SymbolTable &symtab) {
+      ctx.forEachSymtabWithInputs([&](SymbolTable &symtab) {
         if (symtab.machine == I386) {
           symtab.delayLoadHelper = symtab.addGCRoot("___delayLoadHelper2@8");
         } else {
@@ -2910,7 +2956,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   if (errorCount())
     return;
 
-  ctx.forEachActiveSymtab([](SymbolTable &symtab) {
+  ctx.forEachSymtabWithInputs([](SymbolTable &symtab) {
     symtab.initializeECThunks();
     symtab.initializeLoadConfig();
   });
@@ -3002,6 +3048,22 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
       c->setAlignment(std::max(c->getAlignment(), alignment));
     }
   });
+  for (auto pair : config->alignComm) {
+    StringRef name = pair.first;
+    uint32_t alignment = pair.second;
+    bool found = false;
+    ctx.forEachSymtab([&](SymbolTable &symtab) {
+      auto *dc = dyn_cast_or_null<DefinedCommon>(symtab.find(name));
+      if (!dc)
+        return;
+
+      CommonChunk *c = dc->getChunk();
+      c->setAlignment(std::max(c->getAlignment(), alignment));
+      found = true;
+    });
+    if (!found)
+      Warn(ctx) << "/aligncomm symbol " << name << " not found";
+  }
 
   // Windows specific -- Create an embedded or side-by-side manifest.
   // /manifestdependency: enables /manifest unless an explicit /manifest:no is

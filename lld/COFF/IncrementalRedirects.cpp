@@ -99,7 +99,14 @@ buildIncrementalEdgeStates(COFFLinkerContext &ctx,
         if (!sym)
           continue;
 
-        auto *targetChunk = dyn_cast<SectionChunk>(sym->getChunk());
+        // Incremental edge tracking only needs stable object-backed section
+        // chunks. Import, local-import, and writer-synthetic targets are not
+        // reused via preserved chunk placement and may not be materialized yet.
+        auto *target = dyn_cast<DefinedRegular>(sym);
+        if (!target)
+          continue;
+
+        auto *targetChunk = dyn_cast<SectionChunk>(target->getChunk());
         if (!targetChunk)
           continue;
 

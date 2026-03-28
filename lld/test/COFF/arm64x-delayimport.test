@@ -10,6 +10,14 @@ RUN: llvm-mc -filetype=obj -triple=aarch64-windows %S/Inputs/loadconfig-arm64.s 
 RUN: llvm-lib -machine:arm64ec -def:test.def -out:test-arm64ec.lib
 RUN: llvm-lib -machine:arm64 -def:test.def -out:test-arm64.lib
 
+# Test delayed-load import without native helper/load-config inputs.
+
+RUN: lld-link -machine:arm64x -dll -noentry -out:out-min-ec.dll loadconfig-arm64ec.obj \
+RUN:          arm64ec-helper.obj test-arm64ec.obj test-arm64.lib test-arm64ec.lib -delayload:test.dll > out-min-ec.log 2>&1 && \
+RUN:          FileCheck --allow-empty --check-prefix=MIN-EC %s < out-min-ec.log
+MIN-EC-NOT: native version of '_load_config_used' is missing for ARM64X target
+MIN-EC-NOT: undefined symbol: __delayLoadHelper2
+
 # Test delayed-load import from both native and EC code.
 
 RUN: lld-link -machine:arm64x -dll -noentry -out:out.dll loadconfig-arm64.obj loadconfig-arm64ec.obj \

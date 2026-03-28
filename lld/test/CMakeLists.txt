@@ -40,6 +40,7 @@ configure_lit_site_cfg(
 )
 
 set(LLD_TEST_DEPS lld LLDUnitTests)
+set(LLD_COFF_TEST_DEPS lld)
 if (NOT LLD_BUILT_STANDALONE)
   list(APPEND LLD_TEST_DEPS
     FileCheck
@@ -75,6 +76,17 @@ if (NOT LLD_BUILT_STANDALONE)
     split-file
     yaml2obj
     )
+  list(APPEND LLD_COFF_TEST_DEPS
+    FileCheck
+    llvm-config
+    llvm-lib
+    llvm-mc
+    llvm-objdump
+    llvm-readobj
+    not
+    split-file
+    yaml2obj
+    )
     if (NOT WIN32 AND LLVM_BUILD_EXAMPLES)
       list(APPEND LLD_TEST_DEPS
         Bye
@@ -89,6 +101,9 @@ add_lit_testsuite(check-lld "Running lld test suite"
 
 add_custom_target(lld-test-depends DEPENDS ${LLD_TEST_DEPS})
 set_target_properties(lld-test-depends PROPERTIES FOLDER "LLD/Tests")
+
+add_custom_target(lld-coff-test-depends DEPENDS ${LLD_COFF_TEST_DEPS})
+set_target_properties(lld-coff-test-depends PROPERTIES FOLDER "LLD/Tests")
 
 add_lit_testsuites(LLD ${CMAKE_CURRENT_SOURCE_DIR}
   DEPENDS ${LLD_TEST_DEPS}

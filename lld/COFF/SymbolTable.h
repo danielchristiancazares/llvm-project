@@ -187,6 +187,8 @@ public:
   void assignExportOrdinals();
   void parseModuleDefs(StringRef path);
   void parseAlternateName(StringRef);
+  static void parseAligncomm(COFFLinkerContext &ctx, StringRef s,
+                             std::map<std::string, int> &alignComm);
   void parseAligncomm(StringRef);
 
   // Iterates symbols in non-determinstic hash table order.
@@ -196,6 +198,8 @@ public:
   }
 
   std::vector<BitcodeFile *> bitcodeFileInstances;
+  bool hasInputFiles() const { return hasInputFilesFlag; }
+  void noteInputFile() { hasInputFilesFlag = true; }
 
   DefinedRegular *loadConfigSym = nullptr;
   uint32_t loadConfigSize = 0;
@@ -225,6 +229,8 @@ private:
                        const llvm::DenseMap<Symbol *, Symbol *> *localImports,
                        bool needBitcodeFiles);
   void reportUndefinedSymbol(const UndefinedDiag &undefDiag);
+
+  bool hasInputFilesFlag = false;
 };
 
 std::vector<std::string> getSymbolLocations(ObjFile *file, uint32_t symIndex);

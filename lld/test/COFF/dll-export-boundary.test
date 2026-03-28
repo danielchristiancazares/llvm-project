@@ -1,0 +1,58 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir
+# RUN: yaml2obj %t.dir/data-boundary.yaml -o %t.dll
+# RUN: llvm-mc -filetype=obj -triple=x86_64-windows %t.dir/main.s -o %t.obj
+# RUN: not lld-link -lldmingw -auto-import:no /entry:main /subsystem:console /nodefaultlib /out:%t.exe %t.obj %t.dll 2>&1 | FileCheck %s
+
+# CHECK: error: undefined symbol: foo
+
+#--- main.s
+        .text
+        .globl main
+main:
+        call foo
+        ret
+
+#--- data-boundary.yaml
+--- !COFF
+OptionalHeader:
+  AddressOfEntryPoint: 256
+  ImageBase:       6442450944
+  SectionAlignment: 1
+  FileAlignment:   1
+  MajorOperatingSystemVersion: 6
+  MinorOperatingSystemVersion: 0
+  MajorImageVersion: 0
+  MinorImageVersion: 0
+  MajorSubsystemVersion: 6
+  MinorSubsystemVersion: 0
+  Subsystem:       IMAGE_SUBSYSTEM_WINDOWS_GUI
+  DLLCharacteristics: [ IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA, IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE, IMAGE_DLL_CHARACTERISTICS_NX_COMPAT ]
+  SizeOfStackReserve: 1048576
+  SizeOfStackCommit: 4096
+  SizeOfHeapReserve: 1048576
+  SizeOfHeapCommit: 4096
+  ExportTable:
+    RelativeVirtualAddress: 512
+    Size:            72
+header:
+  Machine:         IMAGE_FILE_MACHINE_AMD64
+  Characteristics: [ IMAGE_FILE_EXECUTABLE_IMAGE, IMAGE_FILE_LARGE_ADDRESS_AWARE, IMAGE_FILE_DLL ]
+sections:
+  - Name:            .text
+    Characteristics: [ IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_READ ]
+    VirtualAddress:  256
+    VirtualSize:     1
+    SectionData:     C3
+  - Name:            .data
+    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ, IMAGE_SCN_MEM_WRITE ]
+    VirtualAddress:  257
+    VirtualSize:     4
+    SectionData:     01020304
+  - Name:            .rdata
+    Characteristics: [ IMAGE_SCN_CNT_INITIALIZED_DATA, IMAGE_SCN_MEM_READ ]
+    VirtualAddress:  512
+    VirtualSize:     72
+    SectionData:     00000000000000000000000032020000010000000100000001000000280200002C0200003002000001010000440200000000646174612D626F756E646172792E646C6C00666F6F00
+symbols:         []
+...

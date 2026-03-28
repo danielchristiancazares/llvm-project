@@ -20,7 +20,7 @@ using llvm::support::ulittle64_t;
 
 constexpr char incrementalPDBCacheMagic[8] = {'L', 'L', 'P', 'D',
                                               'B', 'C', '6', '4'};
-constexpr uint32_t incrementalPDBCacheVersion = 2;
+constexpr uint32_t incrementalPDBCacheVersion = 3;
 constexpr uint16_t incrementalPDBCacheFlagHasTypeEntries = 1u << 0;
 constexpr uint16_t incrementalPDBCacheFlagHasModuleEntries = 1u << 1;
 
