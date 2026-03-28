@@ -651,9 +651,18 @@ void ObjFile::initializeSymbols() {
     ScopedTimer t(ctx.initializeSymbolsMainPassTimer);
     for (uint32_t i = 0; i < numSymbols; ++i) {
       COFFSymbolRef coffSym = check(coffObj->getSymbol(i));
+      StringRef name;
+      bool nameInitialized = false;
+      auto getName = [&]() -> StringRef {
+        if (!nameInitialized) {
+          name = check(coffObj->getSymbolName(coffSym));
+          nameInitialized = true;
+        }
+        return name;
+      };
       bool prevailingComdat;
       if (coffSym.isUndefined()) {
-        symbols[i] = createUndefined(coffSym, false);
+        symbols[i] = createUndefined(coffSym, getName(), false);
       } else if (coffSym.isWeakExternal()) {
         auto aux = coffSym.getAux<coff_aux_weak_external>();
         bool overrideLazy = true;
@@ -672,15 +681,14 @@ void ObjFile::initializeSymbols() {
             // alias to be part of the implementation and override potential
             // lazy archive symbols.
             StringRef targetName = check(coffObj->getSymbolName(targetSym));
-            StringRef name = check(coffObj->getSymbolName(coffSym));
             std::optional<std::string> mangledName =
-                getArm64ECMangledFunctionName(name);
+                getArm64ECMangledFunctionName(getName());
             overrideLazy = mangledName == targetName;
           } else {
             overrideLazy = false;
           }
         }
-        symbols[i] = createUndefined(coffSym, overrideLazy);
+        symbols[i] = createUndefined(coffSym, getName(), overrideLazy);
         weakAliases.emplace_back(symbols[i], aux);
       } else if (std::optional<Symbol *> optSym =
                      createDefined(coffSym, comdatDefs, prevailingComdat)) {
@@ -738,8 +746,8 @@ void ObjFile::initializeSymbols() {
   decltype(sparseChunks)().swap(sparseChunks);
 }
 
-Symbol *ObjFile::createUndefined(COFFSymbolRef sym, bool overrideLazy) {
-  StringRef name = check(coffObj->getSymbolName(sym));
+Symbol *ObjFile::createUndefined(COFFSymbolRef sym, StringRef name,
+                                 bool overrideLazy) {
   Symbol *s = symtab.addUndefined(name, this, overrideLazy);
 
   // Add an anti-dependency alias for undefined AMD64 symbols on the ARM64EC
@@ -897,7 +905,15 @@ std::optional<Symbol *> ObjFile::createDefined(
     std::vector<const coff_aux_section_definition *> &comdatDefs,
     bool &prevailing) {
   prevailing = false;
-  auto getName = [&]() { return check(coffObj->getSymbolName(sym)); };
+  StringRef name;
+  bool nameInitialized = false;
+  auto getName = [&]() -> StringRef {
+    if (!nameInitialized) {
+      name = check(coffObj->getSymbolName(sym));
+      nameInitialized = true;
+    }
+    return name;
+  };
 
   if (sym.isCommon()) {
     auto *c = make<CommonChunk>(sym);
