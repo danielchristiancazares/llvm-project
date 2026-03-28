@@ -3165,7 +3165,6 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   rootTimer.stop();
   if (config->showTiming) {
     ctx.rootTimer.print();
-    ctx.printSymbolMutationStats(outs());
   }
 
   // Clean up /linkreprofullpathrsp file
