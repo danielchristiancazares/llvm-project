@@ -144,6 +144,7 @@ public:
   bool isThin() const { return file && file->isThin(); }
 
 private:
+  void addMember(const Archive::Child &c, const Archive::Symbol &sym);
   void addMember(const Archive::Child &c, StringRef reason);
   std::unique_ptr<Archive> file;
   llvm::DenseSet<uint64_t> seen;

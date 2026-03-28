@@ -233,7 +233,14 @@ void ArchiveFile::addMember(const Archive::Symbol &sym) {
   const Archive::Child &c =
       CHECK(sym.getMember(), "could not get the member for symbol " +
                                  toCOFFString(symtab.ctx, sym));
-  addMember(c, saver().save(toCOFFString(symtab.ctx, sym)));
+  addMember(c, sym);
+}
+
+void ArchiveFile::addMember(const Archive::Child &c,
+                            const Archive::Symbol &sym) {
+  if (!seen.insert(c.getChildOffset()).second)
+    return;
+  symtab.ctx.driver.enqueueArchiveMember(c, sym, getName());
 }
 
 void ArchiveFile::addMemberByOffset(uint64_t offset, StringRef reason) {
