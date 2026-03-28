@@ -2562,9 +2562,20 @@ void PDBLinker::initialize(llvm::codeview::DebugInfo *buildId) {
   exitOnErr(builder.initialize(ctx.config.pdbPageSize));
 
   buildId->Signature.CVSignature = OMF::Signature::PDB70;
-  // Signature is set to a hash of the PDB contents when the PDB is done.
-  memset(buildId->PDB70.Signature, 0, 16);
-  buildId->PDB70.Age = 1;
+  const IncrementalOutputMetadata *oldMetadata =
+      findActiveIncrementalOutputMetadata(ctx);
+  bool reuseMetadata =
+      shouldReuseIncrementalPdbMetadata(ctx) && oldMetadata &&
+      oldMetadata->pdbGuid.has_value();
+  if (reuseMetadata) {
+    buildId->PDB70.Age = oldMetadata->pdbAge;
+    memcpy(buildId->PDB70.Signature, oldMetadata->pdbGuid->Guid,
+           sizeof(oldMetadata->pdbGuid->Guid));
+  } else {
+    // Signature is set to a hash of the PDB contents when the PDB is done.
+    memset(buildId->PDB70.Signature, 0, 16);
+    buildId->PDB70.Age = 1;
+  }
 
   // Create streams in MSF for predefined streams, namely
   // PDB, TPI, DBI and IPI.
@@ -2574,7 +2585,11 @@ void PDBLinker::initialize(llvm::codeview::DebugInfo *buildId) {
   // Add an Info stream.
   auto &infoBuilder = builder.getInfoBuilder();
   infoBuilder.setVersion(pdb::PdbRaw_ImplVer::PdbImplVC70);
-  infoBuilder.setHashPDBContentsToGUID(true);
+  infoBuilder.setHashPDBContentsToGUID(!reuseMetadata);
+  if (reuseMetadata) {
+    infoBuilder.setGuid(*oldMetadata->pdbGuid);
+    infoBuilder.setAge(oldMetadata->pdbAge);
+  }
 
   // Add an empty DBI stream.
   pdb::DbiStreamBuilder &dbiBuilder = builder.getDbiBuilder();

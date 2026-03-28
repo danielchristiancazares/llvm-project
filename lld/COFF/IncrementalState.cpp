@@ -4,6 +4,7 @@
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstring>
 #include <limits>
@@ -17,7 +18,7 @@ namespace lld::coff {
 namespace {
 
 constexpr char stateMagic[8] = {'L', 'L', 'I', 'L', 'K', '6', '4', '\0'};
-constexpr uint32_t currentStateVersion = 7;
+constexpr uint32_t currentStateVersion = 8;
 
 enum class WireIncrementalLayoutMode : uint16_t {
   Exact = 1,
@@ -1021,6 +1022,7 @@ static void appendSlotRecords(ArrayRef<IncrementalPreservedSlot> slots,
 static Expected<IncrementalBaselineSnapshot>
 loadIncrementalStateCurrent(ArrayRef<uint8_t> bytes,
                             const FileHeaderV5 &header) {
+  llvm::TimeTraceScope timeScope("Decode incremental state");
   if (static_cast<WireIncrementalLayoutMode>(uint16_t(header.layoutMode)) !=
       WireIncrementalLayoutMode::Slotted)
     return createStringError(inconvertibleErrorCode(),
@@ -1237,6 +1239,7 @@ loadIncrementalStateCurrent(ArrayRef<uint8_t> bytes,
 } // namespace
 
 Expected<IncrementalBaselineSnapshot> loadIncrementalState(StringRef path) {
+  llvm::TimeTraceScope timeScope("Read incremental state file");
   ErrorOr<std::unique_ptr<MemoryBuffer>> buffer = MemoryBuffer::getFile(
       path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
   if (!buffer)
@@ -1256,11 +1259,16 @@ Expected<IncrementalBaselineSnapshot> loadIncrementalState(StringRef path) {
     return createStringError(
         inconvertibleErrorCode(),
         "incremental state file has an unsupported version");
-  return loadIncrementalStateCurrent(bytes, *headerOrErr);
+  Expected<IncrementalBaselineSnapshot> stateOrErr =
+      loadIncrementalStateCurrent(bytes, *headerOrErr);
+  if (stateOrErr)
+    stateOrErr->stateFileSize = bytes.size();
+  return stateOrErr;
 }
 
 Error writeIncrementalState(StringRef path,
                             const IncrementalBaselineSnapshot &state) {
+  llvm::TimeTraceScope timeScope("Serialize incremental state");
   FileHeaderV5 header = {};
   memcpy(header.magic, stateMagic, sizeof(stateMagic));
   header.version = currentStateVersion;

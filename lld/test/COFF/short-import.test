@@ -1,0 +1,5 @@
+# RUN: %python -c "import pathlib; pathlib.Path(r'%t-short.lib').write_bytes(b'\\x00\\x00\\xff\\xff')"
+# RUN: %python -c "import pathlib, subprocess, sys; log = pathlib.Path(r'%/t.log'); tool = (log.parents[5] / 'bin' / 'lld-link.exe').as_posix(); r = subprocess.run([tool, '/dll', '/noentry', '/nodefaultlib', r'/out:%/t.dll', r'%/t-short.lib'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True); log.write_text('rc=' + str(r.returncode) + '\\n' + r.stdout); sys.exit(0 if r.returncode else 1)"
+# RUN: FileCheck %s < %t.log
+
+# CHECK: rc=1

@@ -62,6 +62,14 @@ public:
     f(symtab);
   }
 
+  // Invoke the specified callback for each symbol table that loaded inputs.
+  void forEachSymtabWithInputs(std::function<void(SymbolTable &symtab)> f) {
+    if (hybridSymtab && hybridSymtab->hasInputFiles())
+      f(*hybridSymtab);
+    if (symtab.hasInputFiles())
+      f(symtab);
+  }
+
   std::vector<ObjFile *> objFileInstances;
   std::vector<ArchiveFile *> archiveFileInstances;
   std::map<std::string, PDBInputFile *> pdbInputFileInstances;
@@ -107,6 +115,13 @@ public:
   Timer ltoTimer;
   Timer gcTimer;
   Timer icfTimer;
+  Timer incrementalStateReadTimer;
+  Timer incrementalOutputVerifyTimer;
+  Timer incrementalInputHashTimer;
+  Timer incrementalSymbolValidationTimer;
+  Timer incrementalLayoutTimer;
+  Timer incrementalStateBuildTimer;
+  Timer incrementalStateWriteTimer;
 
   // Writer timers.
   Timer codeLayoutTimer;
@@ -147,6 +162,7 @@ public:
   Configuration config;
   std::unique_ptr<IncrementalCoordinator> incremental;
   std::unique_ptr<IncrementalPDBCacheSession> pdbCacheSession;
+  llvm::StringSet<> loadedArchiveMemberKeys;
 
   DynamicRelocsChunk *dynamicRelocs = nullptr;
 };

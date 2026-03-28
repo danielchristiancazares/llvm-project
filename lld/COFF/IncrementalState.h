@@ -248,6 +248,7 @@ struct IncrementalBaselineSnapshot {
   llvm::COFF::MachineTypes machine = IMAGE_FILE_MACHINE_UNKNOWN;
   uint64_t outputHash = 0;
   uint64_t outputSize = 0;
+  uint64_t stateFileSize = 0;
   uint64_t hardConfigHash = 0;
   uint64_t softConfigHash = 0;
   uint64_t importTopologyHash = 0;

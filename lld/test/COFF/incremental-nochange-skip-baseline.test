@@ -1,0 +1,24 @@
+# REQUIRES: x86
+# RUN: split-file %s %t.dir && cd %t.dir && \
+# RUN:   %python -c "import os,sys; [os.remove(p) for p in sys.argv[1:] if os.path.exists(p)]" %t.llilk %t.exe %t.pdb %t.out before.exe.txt after.exe.txt before.llilk && \
+# RUN:   llvm-mc -filetype=obj -triple=x86_64-windows-msvc main.s -o main.obj && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -timestamp:123 -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe main.obj && \
+# RUN:   llvm-readobj --file-headers --coff-debug-directory %t.exe > before.exe.txt && \
+# RUN:   %python -c "import pathlib; pathlib.Path('before.llilk').write_bytes(pathlib.Path(r'%t.llilk').read_bytes())" && \
+# RUN:   env LLD_IN_TEST=1 lld-link -entry:main -subsystem:console -debug -incremental -opt:noref,noicf -ilk:%t.llilk -out:%t.exe -verbose main.obj > %t.out 2>&1 && \
+# RUN:   llvm-readobj --file-headers --coff-debug-directory %t.exe > after.exe.txt && \
+# RUN:   cmd /c fc before.exe.txt after.exe.txt > nul && \
+# RUN:   %python -c "import pathlib,sys; sys.exit(0 if pathlib.Path('before.llilk').read_bytes()==pathlib.Path(r'%t.llilk').read_bytes() else 1)" && \
+# RUN:   FileCheck %s < %t.out
+#
+# CHECK: incremental: using state
+# CHECK: incremental: exact-layout reuse active
+# CHECK: incremental: reuse counters: reused-chunks=1 rewritten-chunks=0 baseline-skip=yes
+# CHECK-NOT: incremental: soft-config metadata changed; rebuilding PDB metadata
+#
+#--- main.s
+.text
+.globl main
+main:
+  movl $3, %eax
+  retq

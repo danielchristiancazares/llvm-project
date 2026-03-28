@@ -7,12 +7,15 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Object/CVDebugRecord.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/TimeProfiler.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 #include <algorithm>
@@ -82,6 +85,176 @@ struct IncrementalStateBuildResult {
       IncrementalBaselineEmission::make<EmitNextBaseline>();
   IncrementalBaselineSnapshot snapshot;
 };
+
+struct IncrementalSnapshotCounters {
+  uint64_t slotCount = 0;
+  uint64_t placementCount = 0;
+};
+
+static IncrementalSnapshotCounters
+summarizeIncrementalSnapshot(const IncrementalBaselineSnapshot &snapshot) {
+  IncrementalSnapshotCounters counters;
+  for (const IncrementalSectionSnapshot &section : snapshot.sections) {
+    matchIncrementalSlotSectionSnapshot(
+        section,
+        [&](const IncrementalSlotSectionSnapshot &slotSection) {
+          counters.slotCount += slotSection.slots.size();
+          counters.placementCount += slotSection.preservedChunks.size();
+        },
+        [&]() {});
+    matchIncrementalPackedPrefixSectionSnapshot(
+        section,
+        [&](const IncrementalPackedPrefixSectionSnapshot &packedSection) {
+          counters.placementCount += packedSection.members.size();
+        },
+        [&]() {});
+  }
+  return counters;
+}
+
+static void logIncrementalSnapshotCounters(
+    COFFLinkerContext &ctx, const IncrementalBaselineSnapshot &snapshot) {
+  if (!ctx.config.verbose)
+    return;
+  IncrementalSnapshotCounters counters = summarizeIncrementalSnapshot(snapshot);
+  Log(ctx) << "incremental: state counters: inputs=" << snapshot.inputs.size()
+           << " chunks=" << snapshot.chunks.size()
+           << " slots=" << counters.slotCount
+           << " placements=" << counters.placementCount
+           << " symbols=" << snapshot.symbols.size()
+           << " bytes=" << snapshot.stateFileSize;
+}
+
+static std::optional<uint64_t>
+translateIncrementalRvaToFileOffset(ArrayRef<uint8_t> bytes,
+                                    ArrayRef<coff_section> sections,
+                                    uint64_t rva, uint64_t size) {
+  for (const coff_section &section : sections) {
+    uint64_t sectionRva = section.VirtualAddress;
+    uint64_t sectionSpan =
+        std::max<uint64_t>(section.VirtualSize, section.SizeOfRawData);
+    if (rva < sectionRva || rva > UINT64_MAX - size ||
+        rva + size > sectionRva + sectionSpan)
+      continue;
+
+    uint64_t fileOffset = section.PointerToRawData + (rva - sectionRva);
+    if (fileOffset > bytes.size() || bytes.size() - fileOffset < size)
+      return std::nullopt;
+    return fileOffset;
+  }
+  return std::nullopt;
+}
+
+static IncrementalOutputMetadata
+extractIncrementalOutputMetadata(StringRef outputData) {
+  IncrementalOutputMetadata metadata;
+  ArrayRef<uint8_t> bytes(reinterpret_cast<const uint8_t *>(outputData.data()),
+                          outputData.size());
+  if (bytes.size() < sizeof(dos_header))
+    return metadata;
+
+  const auto *dos = reinterpret_cast<const dos_header *>(bytes.data());
+  uint64_t peOff = dos->AddressOfNewExeHeader;
+  if (peOff > bytes.size() ||
+      bytes.size() - peOff < sizeof(llvm::COFF::PEMagic) +
+                                sizeof(coff_file_header))
+    return metadata;
+
+  const auto *coff = reinterpret_cast<const coff_file_header *>(
+      bytes.data() + peOff + sizeof(llvm::COFF::PEMagic));
+  metadata.timestamp = coff->TimeDateStamp;
+
+  uint64_t optionalHeaderOff =
+      peOff + sizeof(llvm::COFF::PEMagic) + sizeof(coff_file_header);
+  if (optionalHeaderOff > bytes.size() ||
+      bytes.size() - optionalHeaderOff < coff->SizeOfOptionalHeader)
+    return metadata;
+
+  const data_directory *dataDirs = nullptr;
+  uint32_t numberOfDataDirs = 0;
+  if (coff->SizeOfOptionalHeader >= sizeof(pe32plus_header) &&
+      bytes.size() - optionalHeaderOff >= sizeof(pe32plus_header) &&
+      reinterpret_cast<const pe32plus_header *>(bytes.data() + optionalHeaderOff)
+              ->Magic == llvm::COFF::PE32Header::PE32_PLUS) {
+    const auto *pe =
+        reinterpret_cast<const pe32plus_header *>(bytes.data() + optionalHeaderOff);
+    numberOfDataDirs = pe->NumberOfRvaAndSize;
+    if (coff->SizeOfOptionalHeader <
+        sizeof(pe32plus_header) + numberOfDataDirs * sizeof(data_directory))
+      return metadata;
+    dataDirs = reinterpret_cast<const data_directory *>(
+        bytes.data() + optionalHeaderOff + sizeof(pe32plus_header));
+  } else if (coff->SizeOfOptionalHeader >= sizeof(pe32_header) &&
+             bytes.size() - optionalHeaderOff >= sizeof(pe32_header) &&
+             reinterpret_cast<const pe32_header *>(bytes.data() + optionalHeaderOff)
+                     ->Magic == llvm::COFF::PE32Header::PE32) {
+    const auto *pe =
+        reinterpret_cast<const pe32_header *>(bytes.data() + optionalHeaderOff);
+    numberOfDataDirs = pe->NumberOfRvaAndSize;
+    if (coff->SizeOfOptionalHeader <
+        sizeof(pe32_header) + numberOfDataDirs * sizeof(data_directory))
+      return metadata;
+    dataDirs = reinterpret_cast<const data_directory *>(
+        bytes.data() + optionalHeaderOff + sizeof(pe32_header));
+  } else {
+    return metadata;
+  }
+
+  uint64_t sectionTableOff = optionalHeaderOff + coff->SizeOfOptionalHeader;
+  uint64_t sectionTableSize =
+      uint64_t(coff->NumberOfSections) * sizeof(coff_section);
+  if (sectionTableOff > bytes.size() ||
+      bytes.size() - sectionTableOff < sectionTableSize)
+    return metadata;
+  ArrayRef<coff_section> sections(
+      reinterpret_cast<const coff_section *>(bytes.data() + sectionTableOff),
+      coff->NumberOfSections);
+
+  if (numberOfDataDirs <= llvm::COFF::DEBUG_DIRECTORY)
+    return metadata;
+  const data_directory &debugDir = dataDirs[llvm::COFF::DEBUG_DIRECTORY];
+  if (debugDir.RelativeVirtualAddress == 0 ||
+      debugDir.Size < sizeof(debug_directory))
+    return metadata;
+
+  std::optional<uint64_t> debugDirFileOffset = translateIncrementalRvaToFileOffset(
+      bytes, sections, debugDir.RelativeVirtualAddress, debugDir.Size);
+  if (!debugDirFileOffset)
+    return metadata;
+  ArrayRef<debug_directory> debugEntries(
+      reinterpret_cast<const debug_directory *>(bytes.data() + *debugDirFileOffset),
+      debugDir.Size / sizeof(debug_directory));
+  for (const debug_directory &entry : debugEntries) {
+    if (entry.Type != llvm::COFF::IMAGE_DEBUG_TYPE_CODEVIEW ||
+        entry.SizeOfData < sizeof(codeview::DebugInfo))
+      continue;
+
+    uint64_t debugInfoFileOffset = entry.PointerToRawData;
+    if (debugInfoFileOffset == 0) {
+      std::optional<uint64_t> translated = translateIncrementalRvaToFileOffset(
+          bytes, sections, entry.AddressOfRawData, entry.SizeOfData);
+      if (!translated)
+        continue;
+      debugInfoFileOffset = *translated;
+    }
+    if (debugInfoFileOffset > bytes.size() ||
+        bytes.size() - debugInfoFileOffset < entry.SizeOfData)
+      continue;
+
+    const auto *info = reinterpret_cast<const codeview::DebugInfo *>(
+        bytes.data() + debugInfoFileOffset);
+    if (info->Signature.CVSignature != OMF::Signature::PDB70)
+      continue;
+
+    llvm::codeview::GUID guid = {};
+    memcpy(guid.Guid, info->PDB70.Signature, sizeof(guid.Guid));
+    metadata.pdbGuid = guid;
+    metadata.pdbAge = info->PDB70.Age;
+    break;
+  }
+
+  return metadata;
+}
 
 static bool
 shouldEmitNextBaseline(const IncrementalBaselineEmission &baselineEmission) {
@@ -222,35 +395,48 @@ takeLayoutStableLink(COFFLinkerContext &ctx) {
   return result;
 }
 
-static ByteReuseLink *findActiveByteReuseLinkImpl(COFFLinkerContext &ctx) {
+static const IncrementalBaselineData *
+findActiveIncrementalBaselineImpl(const COFFLinkerContext &ctx) {
   return ctx.incremental->match(
-      [&](IncrementalDisabled &) -> ByteReuseLink * { return nullptr; },
-      [&](PendingFullImageBuild &) -> ByteReuseLink * { return nullptr; },
-      [&](FullImageBuild &) -> ByteReuseLink * { return nullptr; },
-      [&](StateBackedLink &) -> ByteReuseLink * { return nullptr; },
-      [&](LayoutStableLink &) -> ByteReuseLink * { return nullptr; },
-      [&](ByteReuseLink &reuse) -> ByteReuseLink * { return &reuse; });
-}
-
-static IncrementalBaselineData *
-findActiveIncrementalBaselineImpl(COFFLinkerContext &ctx) {
-  return ctx.incremental->match(
-      [&](IncrementalDisabled &) -> IncrementalBaselineData * {
+      [&](const IncrementalDisabled &) -> const IncrementalBaselineData * {
         return nullptr;
       },
-      [&](PendingFullImageBuild &) -> IncrementalBaselineData * {
+      [&](const PendingFullImageBuild &) -> const IncrementalBaselineData * {
         return nullptr;
       },
-      [&](FullImageBuild &) -> IncrementalBaselineData * { return nullptr; },
-      [&](StateBackedLink &loaded) -> IncrementalBaselineData * {
+      [&](const FullImageBuild &) -> const IncrementalBaselineData * {
+        return nullptr;
+      },
+      [&](const StateBackedLink &loaded) -> const IncrementalBaselineData * {
         return &loaded.baseline;
       },
-      [&](LayoutStableLink &validated) -> IncrementalBaselineData * {
-        return &validated.baseline;
-      },
-      [&](ByteReuseLink &reuse) -> IncrementalBaselineData * {
+      [&](const LayoutStableLink &validated)
+          -> const IncrementalBaselineData * { return &validated.baseline; },
+      [&](const ByteReuseLink &reuse) -> const IncrementalBaselineData * {
         return &reuse.baseline;
       });
+}
+
+static const ByteReuseLink *
+findActiveByteReuseLinkImpl(const COFFLinkerContext &ctx) {
+  return ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const ByteReuseLink * {
+        return nullptr;
+      },
+      [&](const PendingFullImageBuild &) -> const ByteReuseLink * {
+        return nullptr;
+      },
+      [&](const FullImageBuild &) -> const ByteReuseLink * { return nullptr; },
+      [&](const StateBackedLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const LayoutStableLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const ByteReuseLink &reuse) -> const ByteReuseLink * {
+        return &reuse;
+      });
+}
+
+static bool shouldReusePdbMetadata(const IncrementalPdbReusePolicy &policy) {
+  return policy.match([](const ReusePdbMetadata &) { return true; },
+                      [](const RebuildPdbMetadata &) { return false; });
 }
 
 static bool shouldEmitIncrementalBaselineImpl(const COFFLinkerContext &ctx) {
@@ -609,6 +795,44 @@ static std::string describeIncrementalResolvedSymbol(
   return std::string(buffer);
 }
 
+static bool isLateBoundWriterSymbol(StringRef name) {
+  return StringSwitch<bool>(name)
+      .Case("__buildid", true)
+      .Case("__safe_se_handler_table", true)
+      .Case("__safe_se_handler_count", true)
+      .Case("__guard_fids_table", true)
+      .Case("__guard_fids_count", true)
+      .Case("__guard_flags", true)
+      .Case("__guard_iat_table", true)
+      .Case("__guard_iat_count", true)
+      .Case("__guard_longjmp_table", true)
+      .Case("__guard_longjmp_count", true)
+      .Case("__guard_eh_cont_table", true)
+      .Case("__guard_eh_cont_count", true)
+      .Case("__hybrid_code_map", true)
+      .Case("__hybrid_code_map_count", true)
+      .Case("__x64_code_ranges_to_entry_points", true)
+      .Case("__x64_code_ranges_to_entry_points_count", true)
+      .Case("__arm64x_redirection_metadata", true)
+      .Case("__arm64x_redirection_metadata_count", true)
+      .Case("__RUNTIME_PSEUDO_RELOC_LIST__", true)
+      .Case("__RUNTIME_PSEUDO_RELOC_LIST_END__", true)
+      .Case("__CTOR_LIST__", true)
+      .Case("__DTOR_LIST__", true)
+      .Case("__data_start__", true)
+      .Case("__data_end__", true)
+      .Case("__bss_start__", true)
+      .Case("__bss_end__", true)
+      .Case("__arm64x_extra_rfe_table", true)
+      .Case("__arm64x_extra_rfe_table_size", true)
+      .Case("__hybrid_auxiliary_iat", true)
+      .Case("__hybrid_auxiliary_iat_copy", true)
+      .Case("__hybrid_auxiliary_delayload_iat", true)
+      .Case("__hybrid_auxiliary_delayload_iat_copy", true)
+      .Case("__arm64x_native_entrypoint", true)
+      .Default(false);
+}
+
 static std::vector<IncrementalResolvedSymbolSnapshot>
 buildIncrementalSymbolStates(COFFLinkerContext &ctx,
                              const IncrementalInputIndexMap &inputIndices) {
@@ -618,6 +842,11 @@ buildIncrementalSymbolStates(COFFLinkerContext &ctx,
     symtab.forEachSymbol([&](Symbol *sym) {
       auto *def = dyn_cast<Defined>(sym);
       if (!def)
+        return;
+      // These linker-created placeholders are materialized during Writer setup,
+      // which happens after incremental plan validation. Comparing their
+      // pre-writer and post-writer forms would produce false drift.
+      if (isLateBoundWriterSymbol(sym->getName()))
         return;
       if (auto *coff = dyn_cast<DefinedCOFF>(sym))
         if (!coff->getCOFFSymbol().isExternal())
@@ -735,11 +964,19 @@ static IncrementalStateBuildResult
 buildIncrementalState(COFFLinkerContext &ctx,
                       const IncrementalCurrentInputs &currentInputs,
                       const IncrementalReuseData *reuseData) {
+  llvm::TimeTraceScope timeScope("Incremental snapshot rebuild");
+  ScopedTimer t(ctx.incrementalStateBuildTimer);
   IncrementalBaselineSnapshot snapshot;
   snapshot.machine = ctx.config.machine;
   snapshot.outputPath = ctx.config.outputFile;
   snapshot.hardConfigHash = computeIncrementalHardConfigHash(ctx.config);
-  snapshot.softConfigHash = computeIncrementalSoftConfigHash(ctx.config);
+  uint32_t effectiveTimestamp = ctx.config.timestamp;
+  if (shouldPreserveIncrementalBuildMetadata(ctx))
+    if (const IncrementalOutputMetadata *oldMetadata =
+            findActiveIncrementalOutputMetadata(ctx))
+      effectiveTimestamp = oldMetadata->timestamp;
+  snapshot.softConfigHash =
+      computeIncrementalSoftConfigHash(ctx.config, effectiveTimestamp);
   snapshot.importTopologyHash = computeIncrementalImportTopologyHash(ctx);
   snapshot.exportTopologyHash = computeIncrementalExportTopologyHash(ctx);
   snapshot.resourceInputHash = computeIncrementalResourceInputHash(ctx);
@@ -1067,7 +1304,8 @@ uint64_t computeIncrementalHardConfigHash(const Configuration &config) {
   return xxh3_64bits(buffer);
 }
 
-uint64_t computeIncrementalSoftConfigHash(const Configuration &config) {
+uint64_t computeIncrementalSoftConfigHash(
+    const Configuration &config, std::optional<uint32_t> timestampOverride) {
   SmallString<512> buffer;
   raw_svector_ostream os(buffer);
   os << config.pdbPath << '\n'
@@ -1076,7 +1314,7 @@ uint64_t computeIncrementalSoftConfigHash(const Configuration &config) {
      << config.pdbPageSize << '\n'
      << config.lldmapFile << '\n'
      << config.mapFile << '\n'
-     << config.timestamp << '\n'
+     << timestampOverride.value_or(config.timestamp) << '\n'
      << config.repro << '\n'
      << unsigned(config.buildIDHash) << '\n';
   for (const std::string &natvis : config.natvisFiles)
@@ -1087,6 +1325,8 @@ uint64_t computeIncrementalSoftConfigHash(const Configuration &config) {
 
 IncrementalCurrentInputs
 prepareCurrentIncrementalInputs(COFFLinkerContext &ctx) {
+  llvm::TimeTraceScope timeScope("Incremental input hashing");
+  ScopedTimer t(ctx.incrementalInputHashTimer);
   IncrementalCurrentInputs currentInputs;
   currentInputs.hashes.reserve(ctx.objFileInstances.size());
   currentInputs.names.reserve(ctx.objFileInstances.size());
@@ -1101,6 +1341,58 @@ prepareCurrentIncrementalInputs(COFFLinkerContext &ctx) {
     currentInputs.archiveOffsets.push_back(file->archiveOffset);
   }
   return currentInputs;
+}
+
+const IncrementalCurrentInputs *
+findActiveIncrementalCurrentInputs(const COFFLinkerContext &ctx) {
+  const IncrementalBaselineData *baseline = findActiveIncrementalBaselineImpl(ctx);
+  if (!baseline || baseline->currentInputs.hashes.empty())
+    return nullptr;
+  return &baseline->currentInputs;
+}
+
+const IncrementalBaselineData *
+findActiveIncrementalBaseline(const COFFLinkerContext &ctx) {
+  return findActiveIncrementalBaselineImpl(ctx);
+}
+
+const IncrementalOutputMetadata *
+findActiveIncrementalOutputMetadata(const COFFLinkerContext &ctx) {
+  const IncrementalBaselineData *baseline = findActiveIncrementalBaselineImpl(ctx);
+  if (!baseline)
+    return nullptr;
+  return &baseline->previousOutputMetadata;
+}
+
+bool shouldPreserveIncrementalBuildMetadata(const COFFLinkerContext &ctx) {
+  return !ctx.config.timestampSpecified && !ctx.config.repro &&
+         ctx.config.buildIDHash != BuildIDHash::Binary;
+}
+
+bool shouldReuseIncrementalPdbMetadata(const COFFLinkerContext &ctx) {
+  if (!shouldPreserveIncrementalBuildMetadata(ctx))
+    return false;
+  return ctx.incremental->match(
+      [&](const IncrementalDisabled &) { return false; },
+      [&](const PendingFullImageBuild &) { return false; },
+      [&](const FullImageBuild &) { return false; },
+      [&](const StateBackedLink &loaded) {
+        return shouldReusePdbMetadata(loaded.pdbReuse);
+      },
+      [&](const LayoutStableLink &validated) {
+        return shouldReusePdbMetadata(validated.pdbReuse);
+      },
+      [&](const ByteReuseLink &reuse) {
+        return shouldReusePdbMetadata(reuse.pdbReuse);
+      });
+}
+
+bool shouldSkipIncrementalPdbEmission(const COFFLinkerContext &ctx) {
+  if (!shouldReuseIncrementalPdbMetadata(ctx))
+    return false;
+  const ByteReuseLink *reuse = findActiveByteReuseLinkImpl(ctx);
+  return reuse && reuse->reuse.exactLayoutOnly &&
+         reuse->baseline.changedInputs.empty();
 }
 
 IncrementalChunkKind classifyIncrementalChunk(const Chunk &chunk) {
@@ -1180,6 +1472,8 @@ uint64_t computeIncrementalSymbolHash(const SectionChunk &chunk) {
 static bool
 validateIncrementalSymbolStates(COFFLinkerContext &ctx,
                                 const IncrementalBaselineData &baseline) {
+  llvm::TimeTraceScope timeScope("Incremental symbol-state validation");
+  ScopedTimer t(ctx.incrementalSymbolValidationTimer);
   std::vector<IncrementalResolvedSymbolSnapshot> currentSymbols =
       buildIncrementalSymbolStates(ctx, baseline.currentInputs.inputIndices);
   if (currentSymbols.size() != baseline.snapshot.symbols.size()) {
@@ -1264,18 +1558,18 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
     return;
   }
 
-  Expected<IncrementalBaselineSnapshot> stateOrErr =
-      loadIncrementalState(ctx.config.incrementalStatePath);
+  Expected<IncrementalBaselineSnapshot> stateOrErr = [&]() {
+    llvm::TimeTraceScope timeScope("Incremental state read/decode");
+    ScopedTimer t(ctx.incrementalStateReadTimer);
+    return loadIncrementalState(ctx.config.incrementalStatePath);
+  }();
   if (!stateOrErr) {
     installFallback(
         rebuildForRejectedBaseline(toString(stateOrErr.takeError())));
     return;
   }
 
-  uint64_t hardHash = computeIncrementalHardConfigHash(ctx.config);
-  uint64_t softHash = computeIncrementalSoftConfigHash(ctx.config);
-  if (stateOrErr->machine != ctx.config.machine ||
-      stateOrErr->hardConfigHash != hardHash) {
+  if (stateOrErr->machine != ctx.config.machine) {
     installFallback(rebuildForConfigDrift());
     return;
   }
@@ -1284,24 +1578,32 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
         "incremental state was written for a different output"));
     return;
   }
-  ErrorOr<std::unique_ptr<MemoryBuffer>> oldImage =
-      MemoryBuffer::getFile(ctx.config.outputFile, /*IsText=*/false,
-                            /*RequiresNullTerminator=*/false);
+  ErrorOr<std::unique_ptr<MemoryBuffer>> oldImage = [&]() {
+    llvm::TimeTraceScope timeScope("Incremental output verification");
+    ScopedTimer t(ctx.incrementalOutputVerifyTimer);
+    return MemoryBuffer::getFile(ctx.config.outputFile, /*IsText=*/false,
+                                 /*RequiresNullTerminator=*/false);
+  }();
   if (!oldImage) {
     installFallback(rebuildForOutputDrift());
     return;
   }
-  if ((*oldImage)->getBufferSize() != stateOrErr->outputSize ||
-      xxh3_64bits((*oldImage)->getBuffer()) != stateOrErr->outputHash) {
-    installFallback(rebuildForOutputDrift());
-    return;
+  {
+    llvm::TimeTraceScope timeScope("Incremental output verification");
+    ScopedTimer t(ctx.incrementalOutputVerifyTimer);
+    if ((*oldImage)->getBufferSize() != stateOrErr->outputSize ||
+        xxh3_64bits((*oldImage)->getBuffer()) != stateOrErr->outputHash) {
+      installFallback(rebuildForOutputDrift());
+      return;
+    }
   }
 
   IncrementalBaselineData baseline;
   baseline.snapshot = std::move(*stateOrErr);
   baseline.oldImage = std::move(*oldImage);
-  for (ArchiveFile *file : ctx.archiveFileInstances)
-    baseline.replayableArchives.insert(file->getName());
+  baseline.previousOutputMetadata =
+      extractIncrementalOutputMetadata(baseline.oldImage->getBuffer());
+  logIncrementalSnapshotCounters(ctx, baseline.snapshot);
 
   for (const IncrementalInputState &input : baseline.snapshot.inputs) {
     if (input.parentName.empty())
@@ -1314,13 +1616,10 @@ void prepareIncrementalLink(COFFLinkerContext &ctx) {
         input.parentName, input.archiveOffset, input.name));
   }
 
-  IncrementalPdbReusePolicy pdbReuse =
-      baseline.snapshot.softConfigHash == softHash
-          ? IncrementalPdbReusePolicy::make<ReusePdbMetadata>()
-          : IncrementalPdbReusePolicy::make<RebuildPdbMetadata>();
   installIncrementalCoordinator(
       ctx, IncrementalCoordinator::makeStateBackedLink(
-               std::move(baseline), std::move(pdbReuse),
+               std::move(baseline),
+               IncrementalPdbReusePolicy::make<RebuildPdbMetadata>(),
                IncrementalBaselineEmission::make<EmitNextBaseline>()));
 }
 
@@ -1335,6 +1634,27 @@ void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
         IncrementalBaselineEmission::make<SkipNextBaseline>());
     return;
   }
+
+  uint64_t hardHash = computeIncrementalHardConfigHash(ctx.config);
+  if (loaded->baseline.snapshot.machine != ctx.config.machine ||
+      loaded->baseline.snapshot.hardConfigHash != hardHash) {
+    installPendingIncrementalFullImageBuild(ctx, rebuildForConfigDrift());
+    return;
+  }
+
+  uint64_t softHash = computeIncrementalSoftConfigHash(ctx.config);
+  bool reusePdbMetadata = loaded->baseline.snapshot.softConfigHash == softHash;
+  if (!reusePdbMetadata && shouldPreserveIncrementalBuildMetadata(ctx)) {
+    uint64_t preservedTimestampHash = computeIncrementalSoftConfigHash(
+        ctx.config, loaded->baseline.previousOutputMetadata.timestamp);
+    reusePdbMetadata =
+        loaded->baseline.snapshot.softConfigHash == preservedTimestampHash;
+  }
+  IncrementalPdbReusePolicy pdbReuse = reusePdbMetadata
+                                           ? IncrementalPdbReusePolicy::make<
+                                                 ReusePdbMetadata>()
+                                           : IncrementalPdbReusePolicy::make<
+                                                 RebuildPdbMetadata>();
 
   uint64_t resourceHash = computeIncrementalResourceInputHash(ctx);
   if (resourceHash != loaded->baseline.snapshot.resourceInputHash) {
@@ -1367,6 +1687,12 @@ void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
       loaded->baseline.changedInputs.insert(ctx.objFileInstances[i]);
   }
 
+  loaded->baseline.loadedArchiveMembers.clear();
+  for (const auto &entry : ctx.loadedArchiveMemberKeys) {
+    if (loaded->baseline.expectedArchiveMembers.contains(entry.getKey()))
+      loaded->baseline.loadedArchiveMembers.insert(entry.getKey());
+  }
+
   if (loaded->baseline.loadedArchiveMembers.size() !=
       loaded->baseline.expectedArchiveMembers.size()) {
     installPendingIncrementalFullImageBuild(
@@ -1394,23 +1720,23 @@ void finalizeIncrementalLinkPlan(COFFLinkerContext &ctx) {
     return;
   }
 
-  if (!validateIncrementalSymbolStates(ctx, loaded->baseline)) {
+  if (!loaded->baseline.changedInputs.empty() &&
+      !validateIncrementalSymbolStates(ctx, loaded->baseline))
     return;
-  }
 
   if (ctx.config.verbose) {
     Log(ctx) << "incremental: using state " << ctx.config.incrementalStatePath;
-    loaded->pdbReuse.match([&](const ReusePdbMetadata &) {},
-                           [&](const RebuildPdbMetadata &) {
-                             Log(ctx) << "incremental: soft-config metadata "
-                                         "changed; rebuilding PDB metadata";
-                           });
+    pdbReuse.match([&](const ReusePdbMetadata &) {},
+                   [&](const RebuildPdbMetadata &) {
+                     Log(ctx) << "incremental: soft-config metadata "
+                                 "changed; rebuilding PDB metadata";
+                   });
   }
 
   PendingFullImageBuild pending = takePendingFullImageBuild(ctx);
   installIncrementalCoordinator(
       ctx, IncrementalCoordinator::makeLayoutStableLink(
-               std::move(loaded->baseline), std::move(loaded->pdbReuse),
+               std::move(loaded->baseline), std::move(pdbReuse),
                std::move(pending.baselineEmission)));
 }
 
@@ -1418,17 +1744,28 @@ void finalizeIncrementalLink(COFFLinkerContext &ctx) {
   if (errorCount() != 0 || !shouldEmitIncrementalBaselineImpl(ctx))
     return;
 
-  IncrementalCurrentInputs currentInputs = prepareCurrentIncrementalInputs(ctx);
+  const IncrementalCurrentInputs *activeInputs =
+      findActiveIncrementalCurrentInputs(ctx);
+  IncrementalCurrentInputs fallbackInputs;
+  if (!activeInputs) {
+    fallbackInputs = prepareCurrentIncrementalInputs(ctx);
+    activeInputs = &fallbackInputs;
+  }
   const ByteReuseLink *activeReuse = findActiveByteReuseLinkImpl(ctx);
   const IncrementalReuseData *reuseData =
       activeReuse ? &activeReuse->reuse : nullptr;
 
   IncrementalStateBuildResult buildResult =
-      buildIncrementalState(ctx, currentInputs, reuseData);
+      buildIncrementalState(ctx, *activeInputs, reuseData);
   if (!shouldEmitNextBaseline(buildResult.baselineEmission))
     return;
-  if (Error err = writeIncrementalState(ctx.config.incrementalStatePath,
-                                        buildResult.snapshot))
+  Error err = [&]() -> Error {
+    llvm::TimeTraceScope timeScope("Incremental state write");
+    ScopedTimer t(ctx.incrementalStateWriteTimer);
+    return writeIncrementalState(ctx.config.incrementalStatePath,
+                                 buildResult.snapshot);
+  }();
+  if (err)
     Warn(ctx) << "failed to write incremental state: "
               << toString(std::move(err));
 }
@@ -1440,10 +1777,7 @@ void noteIncrementalArchiveMemberLoad(COFFLinkerContext &ctx,
   if (archiveName.empty())
     return;
 
-  IncrementalBaselineData *baseline = findActiveIncrementalBaselineImpl(ctx);
-  if (!baseline || !baseline->replayableArchives.contains(archiveName))
-    return;
-  baseline->loadedArchiveMembers.insert(
+  ctx.loadedArchiveMemberKeys.insert(
       getIncrementalArchiveMemberKey(archiveName, archiveOffset, memberName));
 }
 
