@@ -889,112 +889,163 @@ void PDBLinker::analyzeSymbolSubsection(
   if (symsBuffer.empty())
     Warn(ctx) << "empty symbols subsection in " << file->getName();
 
-  Error ec = forEachCodeViewRecord<CVSymbol>(
-      symsBuffer, [&](CVSymbol sym) -> llvm::Error {
-        // Track the current scope.
-        SymbolScopeReplay scope = [&]() {
-          if (symbolOpensScope(sym.kind()))
-            return SymbolScopeReplay::make<ReplayScopeOpeningSymbol>();
-          if (symbolEndsScope(sym.kind()))
-            return SymbolScopeReplay::make<ReplayScopeClosingSymbol>();
-          return SymbolScopeReplay::make<ReplayStandaloneSymbol>();
-        }();
+  auto processSymbolNoPlan = [&](CVSymbol sym) -> llvm::Error {
+    if (symbolOpensScope(sym.kind()))
+      ++scopeLevel;
+    else if (symbolEndsScope(sym.kind()))
+      --scopeLevel;
 
-        if (symbolOpensReplayScope(scope))
-          ++scopeLevel;
-        else if (symbolClosesReplayScope(scope))
-          --scopeLevel;
+    uint32_t alignedSize =
+        alignTo(sym.length(), alignOf(CodeViewContainer::Pdb));
+    bool goesToGlobals = symbolGoesInGlobalsStream(sym, scopeLevel);
+    bool goesToModule = symbolGoesInModuleStream(sym, scopeLevel);
 
-        uint32_t alignedSize =
-            alignTo(sym.length(), alignOf(CodeViewContainer::Pdb));
-        uint32_t recordRelocIndex = nextRelocIndex;
-        SymbolReplayRouting routing = buildSymbolReplayRouting(sym, scopeLevel);
-        bool goesToGlobals = symbolRoutesToGlobals(routing);
-        bool goesToModule = symbolRoutesToModule(routing);
+    // Copy global records. Some global records (mainly procedures)
+    // reference the current offset into the module stream.
+    if (goesToGlobals) {
+      if (symbolUsesGlobalProcRef(sym)) {
+        advanceRelocIndexForSymbol(debugChunk, sectionContents, sym.data(),
+                                   nextRelocIndex);
+        addGlobalProcRefSymbol(builder.getGsiBuilder(),
+                               file->moduleDBI->getModuleIndex(),
+                               moduleSymOffset, sym);
+      } else {
+        storage.clear();
+        writeSymbolRecord(debugChunk, sectionContents, sym, alignedSize,
+                          nextRelocIndex, rewriteTimers, storage);
+        addGlobalSymbol(builder.getGsiBuilder(),
+                        file->moduleDBI->getModuleIndex(), moduleSymOffset,
+                        storage);
+      }
 
-        if (subsectionPlan) {
-          GlobalSymbolReplay globalReplay = [&]() {
-            if (!goesToGlobals)
-              return GlobalSymbolReplay::make<OmitGlobalReplay>();
-            if (symbolUsesGlobalProcRef(sym))
-              return GlobalSymbolReplay::make<ReplayGlobalProcedureReference>();
-            return GlobalSymbolReplay::make<ReplayGlobalSymbolBytes>();
-          }();
-          SymbolRewritePlan rewrite = [&]() -> SymbolRewritePlan {
-            switch (classifySymbolRewrite(sym.kind())) {
-            case SymbolRewriteKind::NoTypeRefs:
-              return SymbolRewritePlan::make<ReplaySymbolWithoutTypeRewrite>();
-            case SymbolRewriteKind::ProcIdEndOnly:
-              return SymbolRewritePlan::make<ReplayProcIdEndSymbol>();
-            case SymbolRewriteKind::ProcIdFixedIndex:
-              return SymbolRewritePlan::make<ReplayProcIdWithFixedTypeIndex>();
-            case SymbolRewriteKind::Generic: {
-              SmallVector<TiReference, 8> refs;
-              if (!discoverTypeIndicesInSymbol(sym, refs))
-                *cachePlanValid = false;
+      ctx.pdbSummary.withMeasuredStats(
+          [](PDBStats &stats) { ++stats.globalSymbols; });
+    }
 
-              std::vector<IncrementalPDBTypeRef> cachedRefs;
-              cachedRefs.reserve(refs.size());
-              for (const TiReference &ref : refs)
-                cachedRefs.push_back({ref.Kind, ref.Offset, ref.Count});
-              return SymbolRewritePlan::make<
-                  ReplaySymbolWithDiscoveredTypeRefs>(
-                  ReplaySymbolWithDiscoveredTypeRefs{std::move(cachedRefs)});
-            }
-            }
-            llvm_unreachable("unexpected symbol rewrite kind");
-          }();
+    // Update the module stream offset and record any string table index
+    // references. There are very few of these and they will be rewritten
+    // later during PDB writing.
+    if (goesToModule) {
+      recordStringTableReferences(sym, moduleSymOffset, stringTableFixups);
+      moduleSymOffset += alignedSize;
 
-          subsectionPlan->symbols.push_back(CachedSymbolReplay{
-              {uint32_t(sym.data().data() - sectionContents.data()),
-               sym.length(), recordRelocIndex},
-              alignedSize, std::move(routing), std::move(globalReplay),
-              std::move(rewrite), std::move(scope)});
+      ctx.pdbSummary.withMeasuredStats(
+          [](PDBStats &stats) { ++stats.moduleSymbols; });
+    }
+
+    return Error::success();
+  };
+
+  auto processSymbolWithPlan = [&](CVSymbol sym) -> llvm::Error {
+    // Track the current scope.
+    SymbolScopeReplay scope = [&]() {
+      if (symbolOpensScope(sym.kind()))
+        return SymbolScopeReplay::make<ReplayScopeOpeningSymbol>();
+      if (symbolEndsScope(sym.kind()))
+        return SymbolScopeReplay::make<ReplayScopeClosingSymbol>();
+      return SymbolScopeReplay::make<ReplayStandaloneSymbol>();
+    }();
+
+    if (symbolOpensReplayScope(scope))
+      ++scopeLevel;
+    else if (symbolClosesReplayScope(scope))
+      --scopeLevel;
+
+    uint32_t alignedSize =
+        alignTo(sym.length(), alignOf(CodeViewContainer::Pdb));
+    uint32_t recordRelocIndex = nextRelocIndex;
+    SymbolReplayRouting routing = buildSymbolReplayRouting(sym, scopeLevel);
+    bool goesToGlobals = symbolRoutesToGlobals(routing);
+    bool goesToModule = symbolRoutesToModule(routing);
+
+    if (subsectionPlan) {
+      GlobalSymbolReplay globalReplay = [&]() {
+        if (!goesToGlobals)
+          return GlobalSymbolReplay::make<OmitGlobalReplay>();
+        if (symbolUsesGlobalProcRef(sym))
+          return GlobalSymbolReplay::make<ReplayGlobalProcedureReference>();
+        return GlobalSymbolReplay::make<ReplayGlobalSymbolBytes>();
+      }();
+      SymbolRewritePlan rewrite = [&]() -> SymbolRewritePlan {
+        switch (classifySymbolRewrite(sym.kind())) {
+        case SymbolRewriteKind::NoTypeRefs:
+          return SymbolRewritePlan::make<ReplaySymbolWithoutTypeRewrite>();
+        case SymbolRewriteKind::ProcIdEndOnly:
+          return SymbolRewritePlan::make<ReplayProcIdEndSymbol>();
+        case SymbolRewriteKind::ProcIdFixedIndex:
+          return SymbolRewritePlan::make<ReplayProcIdWithFixedTypeIndex>();
+        case SymbolRewriteKind::Generic: {
+          SmallVector<TiReference, 8> refs;
+          if (!discoverTypeIndicesInSymbol(sym, refs))
+            *cachePlanValid = false;
+
+          std::vector<IncrementalPDBTypeRef> cachedRefs;
+          cachedRefs.reserve(refs.size());
+          for (const TiReference &ref : refs)
+            cachedRefs.push_back({ref.Kind, ref.Offset, ref.Count});
+          return SymbolRewritePlan::make<ReplaySymbolWithDiscoveredTypeRefs>(
+              ReplaySymbolWithDiscoveredTypeRefs{std::move(cachedRefs)});
         }
-
-        // Copy global records. Some global records (mainly procedures)
-        // reference the current offset into the module stream.
-        if (goesToGlobals) {
-          if (symbolUsesGlobalProcRef(sym)) {
-            advanceRelocIndexForSymbol(debugChunk, sectionContents, sym.data(),
-                                       nextRelocIndex);
-            addGlobalProcRefSymbol(builder.getGsiBuilder(),
-                                   file->moduleDBI->getModuleIndex(),
-                                   moduleSymOffset, sym);
-          } else {
-            storage.clear();
-            writeSymbolRecord(debugChunk, sectionContents, sym, alignedSize,
-                              nextRelocIndex, rewriteTimers, storage);
-            addGlobalSymbol(builder.getGsiBuilder(),
-                            file->moduleDBI->getModuleIndex(), moduleSymOffset,
-                            storage);
-          }
-
-          ctx.pdbSummary.withMeasuredStats(
-              [](PDBStats &stats) { ++stats.globalSymbols; });
         }
+        llvm_unreachable("unexpected symbol rewrite kind");
+      }();
 
-        // Update the module stream offset and record any string table index
-        // references. There are very few of these and they will be rewritten
-        // later during PDB writing.
-        if (goesToModule) {
-          size_t fixupStart = stringTableFixups.size();
-          recordStringTableReferences(sym, moduleSymOffset, stringTableFixups);
-          if (modulePlan) {
-            for (size_t i = fixupStart; i < stringTableFixups.size(); ++i) {
-              const StringTableFixup &fixup = stringTableFixups[i];
-              modulePlan->stringFixups.push_back({fixup.StrTabOffset,
-                                                  fixup.SymOffsetOfReference});
-            }
-          }
-          moduleSymOffset += alignedSize;
+      subsectionPlan->symbols.push_back(CachedSymbolReplay{
+          {uint32_t(sym.data().data() - sectionContents.data()), sym.length(),
+           recordRelocIndex},
+          alignedSize, std::move(routing), std::move(globalReplay),
+          std::move(rewrite), std::move(scope)});
+    }
 
-          ctx.pdbSummary.withMeasuredStats(
-              [](PDBStats &stats) { ++stats.moduleSymbols; });
+    // Copy global records. Some global records (mainly procedures)
+    // reference the current offset into the module stream.
+    if (goesToGlobals) {
+      if (symbolUsesGlobalProcRef(sym)) {
+        advanceRelocIndexForSymbol(debugChunk, sectionContents, sym.data(),
+                                   nextRelocIndex);
+        addGlobalProcRefSymbol(builder.getGsiBuilder(),
+                               file->moduleDBI->getModuleIndex(),
+                               moduleSymOffset, sym);
+      } else {
+        storage.clear();
+        writeSymbolRecord(debugChunk, sectionContents, sym, alignedSize,
+                          nextRelocIndex, rewriteTimers, storage);
+        addGlobalSymbol(builder.getGsiBuilder(),
+                        file->moduleDBI->getModuleIndex(), moduleSymOffset,
+                        storage);
+      }
+
+      ctx.pdbSummary.withMeasuredStats(
+          [](PDBStats &stats) { ++stats.globalSymbols; });
+    }
+
+    // Update the module stream offset and record any string table index
+    // references. There are very few of these and they will be rewritten
+    // later during PDB writing.
+    if (goesToModule) {
+      size_t fixupStart = stringTableFixups.size();
+      recordStringTableReferences(sym, moduleSymOffset, stringTableFixups);
+      if (modulePlan) {
+        for (size_t i = fixupStart; i < stringTableFixups.size(); ++i) {
+          const StringTableFixup &fixup = stringTableFixups[i];
+          modulePlan->stringFixups.push_back(
+              {fixup.StrTabOffset, fixup.SymOffsetOfReference});
         }
+      }
+      moduleSymOffset += alignedSize;
 
-        return Error::success();
-      });
+      ctx.pdbSummary.withMeasuredStats(
+          [](PDBStats &stats) { ++stats.moduleSymbols; });
+    }
+
+    return Error::success();
+  };
+
+  Error ec = subsectionPlan || modulePlan
+                 ? forEachCodeViewRecord<CVSymbol>(symsBuffer,
+                                                  processSymbolWithPlan)
+                 : forEachCodeViewRecord<CVSymbol>(symsBuffer,
+                                                  processSymbolNoPlan);
 
   // If we encountered corrupt records, ignore the whole subsection. If we wrote
   // any partial records, undo that. For globals, we just keep what we have and
