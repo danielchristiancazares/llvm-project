@@ -539,7 +539,6 @@ std::pair<Symbol *, bool> SymbolTable::insert(StringRef name) {
 
 std::pair<Symbol *, bool> SymbolTable::insert(StringRef name,
                                               SymbolMutationStats *stats) {
-  ScopedTimer t(ctx.symbolTableInsertTimer);
   if (stats)
     bumpStat(stats->insert.calls);
   bool inserted = false;
