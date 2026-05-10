@@ -13,21 +13,25 @@
 #include "Config.h"
 #include "DebugTypes.h"
 #include "Driver.h"
+#include "Incremental.h"
 #include "InputFiles.h"
 #include "PDB.h"
 #include "SymbolTable.h"
 #include "Writer.h"
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/Timer.h"
+#include <cstdint>
 
 namespace lld::coff {
+
+class IncrementalPDBCacheSession;
 
 class COFFLinkerContext : public CommonLinkerContext {
 public:
   COFFLinkerContext();
   COFFLinkerContext(const COFFLinkerContext &) = delete;
   COFFLinkerContext &operator=(const COFFLinkerContext &) = delete;
-  ~COFFLinkerContext() = default;
+  ~COFFLinkerContext();
 
   LinkerDriver driver;
   SymbolTable symtab;
@@ -59,7 +63,16 @@ public:
     f(symtab);
   }
 
+  // Invoke the specified callback for each symbol table that loaded inputs.
+  void forEachSymtabWithInputs(std::function<void(SymbolTable &symtab)> f) {
+    if (hybridSymtab && hybridSymtab->hasInputFiles())
+      f(*hybridSymtab);
+    if (symtab.hasInputFiles())
+      f(symtab);
+  }
+
   std::vector<ObjFile *> objFileInstances;
+  std::vector<ArchiveFile *> archiveFileInstances;
   std::map<std::string, PDBInputFile *> pdbInputFileInstances;
   std::vector<ImportFile *> importFileInstances;
   std::int64_t consumedInputsSize = 0;
@@ -114,11 +127,15 @@ public:
   Timer tpiStreamLayoutTimer;
   Timer diskCommitTimer;
 
-  std::optional<PDBStats> pdbStats;
+  PDBSummary pdbSummary;
 
   Configuration config;
+  std::unique_ptr<IncrementalCoordinator> incremental;
+  std::unique_ptr<IncrementalPDBCacheSession> pdbCacheSession;
+  llvm::StringSet<> loadedArchiveMemberKeys;
 
   DynamicRelocsChunk *dynamicRelocs = nullptr;
+
 };
 
 } // namespace lld::coff

@@ -325,7 +325,6 @@ void ICF::run() {
   });
 }
 
-// Entry point to ICF.
 void doICF(COFFLinkerContext &ctx) { ICF(ctx).run(); }
 
 } // namespace lld::coff

@@ -33,6 +33,7 @@ GloballyHashedType
 GloballyHashedType::hashType(ArrayRef<uint8_t> RecordData,
                              ArrayRef<GloballyHashedType> PreviousTypes,
                              ArrayRef<GloballyHashedType> PreviousIds) {
+  ArrayRef<uint8_t> FullRecord = RecordData;
   SmallVector<TiReference, 4> Refs;
   discoverTypeIndices(RecordData, Refs);
   TruncatedBLAKE3<8> S;
@@ -41,13 +42,25 @@ GloballyHashedType::hashType(ArrayRef<uint8_t> RecordData,
   S.update(RecordData.take_front(sizeof(RecordPrefix)));
   RecordData = RecordData.drop_front(sizeof(RecordPrefix));
   for (const auto &Ref : Refs) {
+    uint32_t RefByteSize = Ref.Count * sizeof(TypeIndex);
+    if (RecordData.size() < Ref.Offset ||
+        RecordData.size() - Ref.Offset < RefByteSize) {
+      // Malformed records can advertise type-reference locations that do not
+      // exist in the serialized bytes. Fall back to hashing the raw record
+      // rather than indexing past the end of the record body.
+      TruncatedBLAKE3<8> Raw;
+      Raw.init();
+      Raw.update(FullRecord);
+      return {Raw.final()};
+    }
+
     // Hash any data that comes before this TiRef.
     uint32_t PreLen = Ref.Offset - Off;
     ArrayRef<uint8_t> PreData = RecordData.slice(Off, PreLen);
     S.update(PreData);
     auto Prev = (Ref.Kind == TiRefKind::IndexRef) ? PreviousIds : PreviousTypes;
 
-    auto RefData = RecordData.slice(Ref.Offset, Ref.Count * sizeof(TypeIndex));
+    auto RefData = RecordData.slice(Ref.Offset, RefByteSize);
     // For each type index referenced, add in the previously computed hash
     // value of that type.
     ArrayRef<TypeIndex> Indices(

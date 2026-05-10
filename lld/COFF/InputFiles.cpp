@@ -90,7 +90,8 @@ static void checkAndSetWeakAlias(SymbolTable &symtab, InputFile *f,
         // of another symbol emitted near the weak symbol.
         // Just use the definition from the first object file that defined
         // this weak symbol.
-        if (symtab.ctx.config.allowDuplicateWeak)
+        if (symtab.ctx.config.duplicateWeakPolicy ==
+            DuplicateWeakPolicy::KeepFirstDuplicateWeak)
           return;
         symtab.reportDuplicate(source, f);
       }
@@ -232,6 +233,55 @@ void ArchiveFile::addMember(const Archive::Symbol &sym) {
   const Archive::Child &c =
       CHECK(sym.getMember(), "could not get the member for symbol " +
                                  toCOFFString(symtab.ctx, sym));
+  addMember(c, sym);
+}
+
+void ArchiveFile::addMember(const Archive::Child &c,
+                            const Archive::Symbol &sym) {
+  if (!seen.insert(c.getChildOffset()).second)
+    return;
+  symtab.ctx.driver.enqueueArchiveMember(c, sym, getName());
+}
+
+void ArchiveFile::addMemberByOffset(uint64_t offset, StringRef reason) {
+  Error err = Error::success();
+  for (const Archive::Child &c : file->children(err)) {
+    if (c.getChildOffset() != offset)
+      continue;
+    addMember(c, reason);
+    consumeError(std::move(err));
+    return;
+  }
+  if (err)
+    Fatal(symtab.ctx) << file->getFileName()
+                      << ": Archive::children failed: " << toString(std::move(err));
+  Err(symtab.ctx) << file->getFileName()
+                  << ": could not find archive member at offset " << offset
+                  << " for " << reason;
+}
+
+void ArchiveFile::addMemberByName(StringRef memberName, StringRef reason) {
+  Error err = Error::success();
+  for (const Archive::Child &c : file->children(err)) {
+    Expected<std::string> fullNameOrErr = c.getFullName();
+    if (!fullNameOrErr)
+      Fatal(symtab.ctx) << file->getFileName()
+                        << ": could not get the filename for archive member "
+                        << reason << ": " << fullNameOrErr.takeError();
+    if (*fullNameOrErr != memberName)
+      continue;
+    addMember(c, reason);
+    consumeError(std::move(err));
+    return;
+  }
+  if (err)
+    Fatal(symtab.ctx) << file->getFileName()
+                      << ": Archive::children failed: " << toString(std::move(err));
+  Err(symtab.ctx) << file->getFileName() << ": could not find archive member '"
+                  << memberName << "' for " << reason;
+}
+
+void ArchiveFile::addMember(const Archive::Child &c, StringRef reason) {
 
   // Return an empty buffer if we have already returned the same buffer.
   // FIXME: Remove this once we resolve all defineds before all undefineds in
@@ -239,12 +289,12 @@ void ArchiveFile::addMember(const Archive::Symbol &sym) {
   if (!seen.insert(c.getChildOffset()).second)
     return;
 
-  symtab.ctx.driver.enqueueArchiveMember(c, sym, getName());
+  symtab.ctx.driver.enqueueArchiveMember(c, reason, getName());
 }
 
-std::vector<MemoryBufferRef>
+std::vector<ArchiveMemberBuffer>
 lld::coff::getArchiveMembers(COFFLinkerContext &ctx, Archive *file) {
-  std::vector<MemoryBufferRef> v;
+  std::vector<ArchiveMemberBuffer> v;
   Error err = Error::success();
 
   // Thin archives refer to .o files, so --reproduces needs the .o files too.
@@ -259,7 +309,7 @@ lld::coff::getArchiveMembers(COFFLinkerContext &ctx, Archive *file) {
       ctx.driver.tar->append(relativeToRoot(check(c.getFullName())),
                              mbref.getBuffer());
     }
-    v.push_back(mbref);
+    v.push_back(ArchiveMemberBuffer{mbref, c.getChildOffset()});
   }
   if (err)
     Fatal(ctx) << file->getFileName()
@@ -435,9 +485,9 @@ SectionChunk *ObjFile::readSection(uint32_t sectionNumber,
 
   // CodeView sections are stored to a different vector because they are not
   // linked in the regular manner.
-  if (c->isCodeView())
+  if (c->isCodeView()) {
     debugChunks.push_back(c);
-  else if (name == ".gfids$y")
+  } else if (name == ".gfids$y")
     guardFidChunks.push_back(c);
   else if (name == ".giats$y")
     guardIATChunks.push_back(c);
@@ -449,7 +499,9 @@ SectionChunk *ObjFile::readSection(uint32_t sectionNumber,
     sxDataChunks.push_back(c);
   else if (isArm64EC(getMachineType()) && name == ".hybmp$x")
     hybmpChunks.push_back(c);
-  else if (symtab.ctx.config.tailMerge && sec->NumberOfRelocations == 0 &&
+  else if (symtab.ctx.config.tailMergeMode ==
+               TailMergeMode::TailMergeStringLiterals &&
+           sec->NumberOfRelocations == 0 &&
            name == ".rdata" && leaderName.starts_with("??_C@"))
     // COFF sections that look like string literal sections (i.e. no
     // relocations, in .rdata, leader symbol name matches the MSVC name mangling
@@ -550,7 +602,7 @@ Symbol *ObjFile::createRegular(COFFSymbolRef sym) {
     StringRef name = check(coffObj->getSymbolName(sym));
     if (sc)
       return symtab.addRegular(this, name, sym.getGeneric(), sc,
-                               sym.getValue());
+                               sym.getValue(), /*isWeak=*/false);
     // For MinGW symbols named .weak.* that point to a discarded section,
     // don't create an Undefined symbol. If nothing ever refers to the symbol,
     // everything should be fine. If something actually refers to the symbol
@@ -589,52 +641,64 @@ void ObjFile::initializeSymbols() {
 
   for (uint32_t i = 0; i < numSymbols; ++i) {
     COFFSymbolRef coffSym = check(coffObj->getSymbol(i));
+    StringRef name;
+    bool nameInitialized = false;
+    auto getName = [&]() -> StringRef {
+      if (!nameInitialized) {
+        name = check(coffObj->getSymbolName(coffSym));
+        nameInitialized = true;
+      }
+      return name;
+    };
     bool prevailingComdat;
     if (coffSym.isUndefined()) {
-      symbols[i] = createUndefined(coffSym, false);
+      symbols[i] = createUndefined(coffSym, getName(), false);
     } else if (coffSym.isWeakExternal()) {
       auto aux = coffSym.getAux<coff_aux_weak_external>();
       bool overrideLazy = true;
 
       // On ARM64EC, external function calls emit a pair of weak-dependency
       // aliases: func to #func and #func to the func guess exit thunk
-      // (instead of a single undefined func symbol, which would be emitted on
-      // other targets). Allow such aliases to be overridden by lazy archive
-      // symbols, just as we would for undefined symbols.
+      // (instead of a single undefined func symbol, which would be emitted
+      // on other targets). Allow such aliases to be overridden by lazy
+      // archive symbols, just as we would for undefined symbols.
       if (isArm64EC(getMachineType()) &&
           aux->Characteristics == IMAGE_WEAK_EXTERN_ANTI_DEPENDENCY) {
         COFFSymbolRef targetSym = check(coffObj->getSymbol(aux->TagIndex));
         if (!targetSym.isAnyUndefined()) {
           // If the target is defined, it may be either a guess exit thunk or
-          // the actual implementation. If it's the latter, consider the alias
-          // to be part of the implementation and override potential lazy
-          // archive symbols.
+          // the actual implementation. If it's the latter, consider the
+          // alias to be part of the implementation and override potential
+          // lazy archive symbols.
           StringRef targetName = check(coffObj->getSymbolName(targetSym));
-          StringRef name = check(coffObj->getSymbolName(coffSym));
           std::optional<std::string> mangledName =
-              getArm64ECMangledFunctionName(name);
+              getArm64ECMangledFunctionName(getName());
           overrideLazy = mangledName == targetName;
         } else {
           overrideLazy = false;
         }
       }
-      symbols[i] = createUndefined(coffSym, overrideLazy);
+      symbols[i] = createUndefined(coffSym, getName(), overrideLazy);
       weakAliases.emplace_back(symbols[i], aux);
-    } else if (std::optional<Symbol *> optSym =
-                   createDefined(coffSym, comdatDefs, prevailingComdat)) {
-      symbols[i] = *optSym;
-      if (ctx.config.mingw && prevailingComdat)
-        recordPrevailingSymbolForMingw(coffSym, prevailingSectionMap);
     } else {
-      // createDefined() returns std::nullopt if a symbol belongs to a section
-      // that was pending at the point when the symbol was read. This can happen
-      // in two cases:
-      // 1) section definition symbol for a comdat leader;
-      // 2) symbol belongs to a comdat section associated with another section.
-      // In both of these cases, we can expect the section to be resolved by
-      // the time we finish visiting the remaining symbols in the symbol
-      // table. So we postpone the handling of this symbol until that time.
-      pendingIndexes.push_back(i);
+      std::optional<Symbol *> optSym =
+          createDefined(coffSym, comdatDefs, prevailingComdat);
+      if (optSym) {
+        symbols[i] = *optSym;
+        if (ctx.config.mingw && prevailingComdat)
+          recordPrevailingSymbolForMingw(coffSym, prevailingSectionMap);
+      } else {
+        // createDefined() returns std::nullopt if a symbol belongs to a
+        // section that was pending at the point when the symbol was read.
+        // This can happen in two cases:
+        // 1) section definition symbol for a comdat leader;
+        // 2) symbol belongs to a comdat section associated with another
+        //    section.
+        // In both of these cases, we can expect the section to be resolved by
+        // the time we finish visiting the remaining symbols in the symbol
+        // table. So we postpone the handling of this symbol until that time.
+        pendingIndexes.push_back(i);
+      }
     }
     i += coffSym.getNumberOfAuxSymbols();
   }
@@ -668,8 +732,8 @@ void ObjFile::initializeSymbols() {
   decltype(sparseChunks)().swap(sparseChunks);
 }
 
-Symbol *ObjFile::createUndefined(COFFSymbolRef sym, bool overrideLazy) {
-  StringRef name = check(coffObj->getSymbolName(sym));
+Symbol *ObjFile::createUndefined(COFFSymbolRef sym, StringRef name,
+                                 bool overrideLazy) {
   Symbol *s = symtab.addUndefined(name, this, overrideLazy);
 
   // Add an anti-dependency alias for undefined AMD64 symbols on the ARM64EC
@@ -827,7 +891,16 @@ std::optional<Symbol *> ObjFile::createDefined(
     std::vector<const coff_aux_section_definition *> &comdatDefs,
     bool &prevailing) {
   prevailing = false;
-  auto getName = [&]() { return check(coffObj->getSymbolName(sym)); };
+  StringRef name;
+  bool nameInitialized = false;
+  auto getName = [&]() -> StringRef {
+    if (!nameInitialized) {
+      name = check(coffObj->getSymbolName(sym));
+      nameInitialized = true;
+    }
+    return name;
+  };
+  COFFLinkerContext &ctx = symtab.ctx;
 
   if (sym.isCommon()) {
     auto *c = make<CommonChunk>(sym);
@@ -836,7 +909,6 @@ std::optional<Symbol *> ObjFile::createDefined(
                             c);
   }
 
-  COFFLinkerContext &ctx = symtab.ctx;
   if (sym.isAbsolute()) {
     StringRef name = getName();
 
@@ -967,51 +1039,76 @@ ArrayRef<uint8_t> ObjFile::getDebugSection(StringRef secName) {
   return {};
 }
 
-// OBJ files systematically store critical information in a .debug$S stream,
-// even if the TU was compiled with no debug info. At least two records are
-// always there. S_OBJNAME stores a 32-bit signature, which is loaded into the
-// PCHSignature member. S_COMPILE3 stores compile-time cmd-line flags. This is
-// currently used to initialize the hotPatchable member.
-void ObjFile::initializeFlags() {
-  ArrayRef<uint8_t> data = getDebugSection(".debug$S");
-  if (data.empty())
-    return;
-
+static Error forEachPrefixSymbolRecord(ArrayRef<uint8_t> data,
+                                       unsigned maxRecords,
+                                       llvm::function_ref<Error(CVSymbol)> fn) {
   DebugSubsectionArray subsections;
-
   BinaryStreamReader reader(data, llvm::endianness::little);
-  ExitOnError exitOnErr;
-  exitOnErr(reader.readArray(subsections, data.size()));
+  if (Error e = reader.readArray(subsections, data.size()))
+    return e;
 
   for (const DebugSubsectionRecord &ss : subsections) {
     if (ss.kind() != DebugSubsectionKind::Symbols)
       continue;
 
     unsigned offset = 0;
-
-    // Only parse the first two records. We are only looking for S_OBJNAME
-    // and S_COMPILE3, and they usually appear at the beginning of the
-    // stream.
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0;
+         i < maxRecords && offset < ss.getRecordData().getLength();
+         ++i) {
       Expected<CVSymbol> sym = readSymbolFromStream(ss.getRecordData(), offset);
-      if (!sym) {
-        consumeError(sym.takeError());
-        return;
-      }
-      if (sym->kind() == SymbolKind::S_COMPILE3) {
-        auto cs =
-            cantFail(SymbolDeserializer::deserializeAs<Compile3Sym>(sym.get()));
-        hotPatchable =
-            (cs.Flags & CompileSym3Flags::HotPatch) != CompileSym3Flags::None;
-      }
-      if (sym->kind() == SymbolKind::S_OBJNAME) {
-        auto objName = cantFail(SymbolDeserializer::deserializeAs<ObjNameSym>(
-            sym.get()));
-        if (objName.Signature)
-          pchSignature = objName.Signature;
-      }
+      if (!sym)
+        return sym.takeError();
+      if (Error e = fn(*sym))
+        return e;
       offset += sym->length();
     }
+    break;
+  }
+  return Error::success();
+}
+
+// Only /FUNCTIONPADMIN needs the S_COMPILE3 flags during input parsing.
+void ObjFile::initializeFlags() {
+  if (!symtab.ctx.config.needsHotPatchableSymbols)
+    return;
+
+  ArrayRef<uint8_t> data = getDebugSection(".debug$S");
+  if (data.empty())
+    return;
+
+  if (Error e = forEachPrefixSymbolRecord(
+          data, 2, [&](CVSymbol sym) -> Error {
+            if (sym.kind() != SymbolKind::S_COMPILE3)
+              return Error::success();
+            auto cs = cantFail(
+                SymbolDeserializer::deserializeAs<Compile3Sym>(sym));
+            hotPatchable = (cs.Flags & CompileSym3Flags::HotPatch) !=
+                           CompileSym3Flags::None;
+            return Error::success();
+          })) {
+    consumeError(std::move(e));
+  }
+}
+
+void ObjFile::initializePchSignature() {
+  if (pchSignature && *pchSignature)
+    return;
+
+  ArrayRef<uint8_t> data = getDebugSection(".debug$S");
+  if (data.empty())
+    return;
+
+  if (Error e = forEachPrefixSymbolRecord(
+          data, 2, [&](CVSymbol sym) -> Error {
+            if (sym.kind() != SymbolKind::S_OBJNAME)
+              return Error::success();
+            auto objName =
+                cantFail(SymbolDeserializer::deserializeAs<ObjNameSym>(sym));
+            if (objName.Signature)
+              pchSignature = objName.Signature;
+            return Error::success();
+          })) {
+    consumeError(std::move(e));
   }
 }
 
@@ -1057,6 +1154,7 @@ void ObjFile::initializeDependencies() {
 
   // This object file is a PCH file that others will depend on.
   if (isPCH) {
+    initializePchSignature();
     debugTypesObj = makePrecompSource(ctx, this);
     return;
   }
@@ -1221,6 +1319,8 @@ ImportFile::ImportFile(COFFLinkerContext &ctx, MemoryBufferRef m)
       live(!ctx.config.doGC) {}
 
 MachineTypes ImportFile::getMachineType(MemoryBufferRef m) {
+  if (m.getBufferSize() < sizeof(coff_import_header))
+    return IMAGE_FILE_MACHINE_UNKNOWN;
   uint16_t machine =
       reinterpret_cast<const coff_import_header *>(m.getBufferStart())->Machine;
   return MachineTypes(machine);
@@ -1362,7 +1462,8 @@ BitcodeFile *BitcodeFile::create(COFFLinkerContext &ctx, MemoryBufferRef mb,
                                  StringRef archiveName,
                                  uint64_t offsetInArchive, bool lazy) {
   std::string path = mb.getBufferIdentifier().str();
-  if (ctx.config.thinLTOIndexOnly)
+  if (ctx.config.thinLTOIndexingMode ==
+      ThinLTOIndexingMode::WriteThinLTOIndexes)
     path = replaceThinLTOSuffix(mb.getBufferIdentifier(),
                                 ctx.config.thinLTOObjectSuffixReplace.first,
                                 ctx.config.thinLTOObjectSuffixReplace.second);
@@ -1489,8 +1590,9 @@ std::string lld::coff::replaceThinLTOSuffix(StringRef path, StringRef suffix,
 static bool isRVACode(COFFObjectFile *coffObj, uint64_t rva, InputFile *file) {
   for (size_t i = 1, e = coffObj->getNumberOfSections(); i <= e; i++) {
     const coff_section *sec = CHECK(coffObj->getSection(i), file);
-    if (rva >= sec->VirtualAddress &&
-        rva <= sec->VirtualAddress + sec->VirtualSize) {
+    uint64_t secStart = sec->VirtualAddress;
+    uint64_t secEnd = secStart + sec->VirtualSize;
+    if (rva >= secStart && rva < secEnd) {
       return (sec->Characteristics & COFF::IMAGE_SCN_CNT_CODE) != 0;
     }
   }

@@ -88,12 +88,16 @@ lto::Config BitcodeCompiler::createConfig() {
   assert(optLevelOrNone && "Invalid optimization level!");
   c.CGOptLevel = *optLevelOrNone;
   c.AlwaysEmitRegularLTOObj = !ctx.config.ltoObjPath.empty();
-  c.DebugPassManager = ctx.config.ltoDebugPassManager;
+  c.DebugPassManager =
+      ctx.config.ltoDebugPassManagerMode ==
+      LTODebugPassManagerMode::EmitDebugPassManagerOutput;
   c.CSIRProfile = std::string(ctx.config.ltoCSProfileFile);
   c.RunCSIRInstr = ctx.config.ltoCSProfileGenerate;
-  c.PGOWarnMismatch = ctx.config.ltoPGOWarnMismatch;
+  c.PGOWarnMismatch =
+      ctx.config.ltoPGOWarnMismatchMode ==
+      LTOPGOMismatchWarningMode::WarnOnProfileMismatch;
   c.SampleProfile = ctx.config.ltoSampleProfileName;
-  c.TimeTraceEnabled = ctx.config.timeTraceEnabled;
+  c.TimeTraceEnabled = ctx.config.timeTraceMode == TimeTraceMode::EmitTimeTrace;
   c.TimeTraceGranularity = ctx.config.timeTraceGranularity;
 
   if (ctx.config.emit == EmitKind::LLVM) {
@@ -136,14 +140,17 @@ BitcodeCompiler::BitcodeCompiler(COFFLinkerContext &c) : ctx(c) {
         ctx.config.dtltoCompiler, ctx.config.dtltoCompilerPrependArgs,
         ctx.config.dtltoCompilerArgs, !ctx.config.saveTempsArgs.empty(),
         createAddBufferFn(files, file_names));
-  } else if (ctx.config.thinLTOIndexOnly) {
+  } else if (ctx.config.thinLTOIndexingMode ==
+             ThinLTOIndexingMode::WriteThinLTOIndexes) {
     auto OnIndexWrite = [&](StringRef S) { thinIndices.erase(S); };
     backend = lto::createWriteIndexesThinBackend(
         llvm::hardware_concurrency(ctx.config.thinLTOJobs),
         std::string(ctx.config.thinLTOPrefixReplaceOld),
         std::string(ctx.config.thinLTOPrefixReplaceNew),
         std::string(ctx.config.thinLTOPrefixReplaceNativeObject),
-        ctx.config.thinLTOEmitImportsFiles, indexFile.get(), OnIndexWrite);
+        ctx.config.thinLTOImportsFileMode ==
+            ThinLTOImportsFileMode::EmitImportsFiles,
+        indexFile.get(), OnIndexWrite);
   } else {
     backend = lto::createInProcessThinBackend(
         llvm::heavyweight_hardware_concurrency(ctx.config.thinLTOJobs));
@@ -169,7 +176,8 @@ void BitcodeCompiler::add(BitcodeFile &f) {
   std::vector<Symbol *> symBodies = f.getSymbols();
   std::vector<lto::SymbolResolution> resols(symBodies.size());
 
-  if (ctx.config.thinLTOIndexOnly)
+  if (ctx.config.thinLTOIndexingMode ==
+      ThinLTOIndexingMode::WriteThinLTOIndexes)
     thinIndices.insert(obj.getName());
 
   // Provide a resolution to the LTO API for each symbol.
@@ -225,14 +233,16 @@ std::vector<InputFile *> BitcodeCompiler::compile() {
   for (StringRef s : thinIndices) {
     std::string path = getThinLTOOutputFile(s);
     openFile(path + ".thinlto.bc");
-    if (ctx.config.thinLTOEmitImportsFiles)
+    if (ctx.config.thinLTOImportsFileMode ==
+        ThinLTOImportsFileMode::EmitImportsFiles)
       openFile(path + ".imports");
   }
 
   // ThinLTO with index only option is required to generate only the index
   // files. After that, we exit from linker and ThinLTO backend runs in a
   // distributed environment.
-  if (ctx.config.thinLTOIndexOnly) {
+  if (ctx.config.thinLTOIndexingMode ==
+      ThinLTOIndexingMode::WriteThinLTOIndexes) {
     if (!ctx.config.ltoObjPath.empty())
       saveBuffer(buf[0].second, ctx.config.ltoObjPath);
     if (indexFile)
@@ -281,7 +291,7 @@ std::vector<InputFile *> BitcodeCompiler::compile() {
       ltoObjName = saver().save(path.str());
     }
     if (llvm::is_contained(ctx.config.saveTempsArgs, "prelink") || emitASM)
-      saveBuffer(buf[i].second, ltoObjName);
+      saveBuffer(objBuf, ltoObjName);
     if (!emitASM)
       ret.push_back(ObjFile::create(ctx, MemoryBufferRef(objBuf, ltoObjName)));
   }

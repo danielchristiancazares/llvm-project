@@ -11,6 +11,8 @@
 #include "CallGraphSort.h"
 #include "Config.h"
 #include "DLL.h"
+#include "Incremental.h"
+#include "IncrementalLayout.h"
 #include "InputFiles.h"
 #include "LLDMapFile.h"
 #include "MapFile.h"
@@ -68,12 +70,11 @@ $ nasm -fbin /tmp/DOSProgram.asm -o /tmp/DOSProgram.bin
 $ xxd -i /tmp/DOSProgram.bin
 */
 static unsigned char dosProgram[] = {
-  0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
-  0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
-  0x61, 0x6d, 0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65,
-  0x20, 0x72, 0x75, 0x6e, 0x20, 0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20,
-  0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x24, 0x00, 0x00
-};
+    0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01, 0x4c,
+    0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72,
+    0x61, 0x6d, 0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65,
+    0x20, 0x72, 0x75, 0x6e, 0x20, 0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20,
+    0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x24, 0x00, 0x00};
 static_assert(sizeof(dosProgram) % 8 == 0,
               "DOSProgram size must be multiple of 8");
 static_assert((sizeof(dos_header) + sizeof(dosProgram)) % 8 == 0,
@@ -97,7 +98,7 @@ public:
   void writeTo(uint8_t *b) const override {
     auto *d = reinterpret_cast<debug_directory *>(b);
 
-    for (const std::pair<COFF::DebugType, Chunk *>& record : records) {
+    for (const std::pair<COFF::DebugType, Chunk *> &record : records) {
       Chunk *c = record.second;
       const OutputSection *os = ctx.getOutputSection(c);
       uint64_t offs = os->getFileOff() + (c->getRVA() - os->getRVA());
@@ -200,7 +201,6 @@ struct ChunkRange {
   Chunk *first = nullptr, *last;
 };
 
-// The writer writes a SymbolTable result to a file.
 class Writer {
 public:
   Writer(COFFLinkerContext &c)
@@ -234,6 +234,7 @@ private:
   void createECCodeMap();
   void finalizeAddresses();
   void removeEmptySections();
+  void refreshExceptionTableRanges();
   void assignOutputSectionIndices();
   void createSymbolAndStringTable();
   void openFile(StringRef outputPath);
@@ -252,7 +253,7 @@ private:
                               ArrayRef<SectionChunk *> symIdxChunks,
                               std::vector<Symbol *> &symbols);
   void maybeAddRVATable(SymbolRVASet tableSymbols, StringRef tableSym,
-                        StringRef countSym, bool hasFlag=false);
+                        StringRef countSym, bool hasFlag = false);
   void setSectionPermissions();
   void setECSymbols();
   void writeSections();
@@ -364,9 +365,7 @@ void lld::coff::writeResult(COFFLinkerContext &ctx) {
   Writer(ctx).run();
 }
 
-void OutputSection::addChunk(Chunk *c) {
-  chunks.push_back(c);
-}
+void OutputSection::addChunk(Chunk *c) { chunks.push_back(c); }
 
 void OutputSection::insertChunkAtStart(Chunk *c) {
   chunks.insert(chunks.begin(), c);
@@ -375,6 +374,41 @@ void OutputSection::insertChunkAtStart(Chunk *c) {
 void OutputSection::setPermissions(uint32_t c) {
   header.Characteristics &= ~permMask;
   header.Characteristics |= c;
+}
+
+static bool isIncrementalPreservedSection(const COFFLinkerContext &ctx,
+                                          const OutputSection *section) {
+  const IncrementalBaselineSnapshot *loadedState = ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const IncrementalBaselineSnapshot * {
+        return nullptr;
+      },
+      [&](const PendingFullImageBuild &) -> const IncrementalBaselineSnapshot * {
+        return nullptr;
+      },
+      [&](const FullImageBuild &) -> const IncrementalBaselineSnapshot * {
+        return nullptr;
+      },
+      [&](const StateBackedLink &loaded) -> const IncrementalBaselineSnapshot * {
+        return &loaded.baseline.snapshot;
+      },
+      [&](const LayoutStableLink &validated)
+          -> const IncrementalBaselineSnapshot * {
+        return &validated.baseline.snapshot;
+      },
+      [&](const ByteReuseLink &reuse) -> const IncrementalBaselineSnapshot * {
+        return &reuse.baseline.snapshot;
+      });
+  if (!loadedState)
+    return false;
+  for (const IncrementalSectionSnapshot &oldSectionSnapshot :
+       loadedState->sections) {
+    const IncrementalSectionState &oldSection =
+        getIncrementalSectionState(oldSectionSnapshot);
+    if (section->name == oldSection.name &&
+        section->header.Characteristics == oldSection.characteristics)
+      return true;
+  }
+  return false;
 }
 
 void OutputSection::merge(OutputSection *other) {
@@ -393,7 +427,6 @@ void OutputSection::merge(OutputSection *other) {
   }
 }
 
-// Write the section header to a given buffer.
 void OutputSection::writeHeaderTo(uint8_t *buf, bool isDebug) {
   auto *hdr = reinterpret_cast<coff_section *>(buf);
   *hdr = header;
@@ -732,7 +765,7 @@ void Writer::finalizeAddresses() {
 }
 
 void Writer::writePEChecksum() {
-  if (!ctx.config.writeCheckSum) {
+  if (ctx.config.peChecksumMode != PEChecksumMode::WritePEChecksum) {
     return;
   }
 
@@ -768,7 +801,6 @@ void Writer::writePEChecksum() {
   peHeader->CheckSum = sum;
 }
 
-// The main function of the writer.
 void Writer::run() {
   {
     llvm::TimeTraceScope timeScope("Write PE");
@@ -791,7 +823,28 @@ void Writer::run() {
     removeUnusedSections();
     layoutSections();
     finalizeAddresses();
+    applyIncrementalLayout(ctx).match(
+        [&](const WriteCurrentFullImageLayout &) {},
+        [&](const RecomputeCurrentFullImageLayout &) {
+          // applyIncrementalLayout() may have mutated section membership,
+          // RVAs, and relocations before deciding to fall back. Recompute the
+          // clean full-link layout before continuing to write the image.
+          finalizeAddresses();
+        },
+        [&](const WriteReusedIncrementalLayout &layout) {
+          fileSize = layout.layout.fileSize;
+          sizeOfImage = layout.layout.sizeOfImage;
+          sizeOfHeaders = layout.layout.sizeOfHeaders;
+        });
     removeEmptySections();
+    if (ctx.incremental->match(
+            [&](const IncrementalDisabled &) { return false; },
+            [&](const PendingFullImageBuild &) { return false; },
+            [&](const FullImageBuild &) { return false; },
+            [&](const StateBackedLink &) { return false; },
+            [&](const LayoutStableLink &) { return false; },
+            [&](const ByteReuseLink &) { return true; }))
+      refreshExceptionTableRanges();
     assignOutputSectionIndices();
     setSectionPermissions();
     setECSymbols();
@@ -819,7 +872,8 @@ void Writer::run() {
 
   if (!ctx.config.pdbPath.empty() && ctx.config.debug) {
     assert(buildId);
-    createPDB(ctx, sectionTable, buildId->buildId);
+    if (!shouldSkipIncrementalPdbEmission(ctx))
+      createPDB(ctx, sectionTable, buildId->buildId);
   }
   writeBuildId();
 
@@ -848,7 +902,6 @@ static StringRef getOutputSectionName(StringRef name) {
   return s.substr(0, s.find('.', 1));
 }
 
-// For /order.
 void Writer::sortBySectionOrder(std::vector<Chunk *> &chunks) {
   auto getPriority = [&ctx = ctx](const Chunk *c) {
     if (auto *sec = dyn_cast<SectionChunk>(c))
@@ -862,8 +915,6 @@ void Writer::sortBySectionOrder(std::vector<Chunk *> &chunks) {
   });
 }
 
-// Change the characteristics of existing PartialSections that belong to the
-// section Name to Chars.
 void Writer::fixPartialSectionChars(StringRef name, uint32_t chars) {
   for (auto it : partialSections) {
     PartialSection *pSec = it.second;
@@ -1062,10 +1113,8 @@ void Writer::calculateStubDependentSizes() {
   dataDirOffset64 = peHeaderOffset + sizeof(pe32plus_header);
 }
 
-// Create output section objects and add them to OutputSections.
 void Writer::createSections() {
   llvm::TimeTraceScope timeScope("Output sections");
-  // First, create the builtin sections.
   const uint32_t data = IMAGE_SCN_CNT_INITIALIZED_DATA;
   const uint32_t bss = IMAGE_SCN_CNT_UNINITIALIZED_DATA;
   const uint32_t code = IMAGE_SCN_CNT_CODE;
@@ -1106,7 +1155,6 @@ void Writer::createSections() {
   ctorsSec = createSection(".ctors", data | r | w);
   dtorsSec = createSection(".dtors", data | r | w);
 
-  // Then bin chunks by name and output characteristics.
   for (Chunk *c : ctx.driver.getChunks()) {
     auto *sc = dyn_cast<SectionChunk>(c);
     if (sc && !sc->live) {
@@ -1125,8 +1173,8 @@ void Writer::createSections() {
     if (name.starts_with(".tls"))
       tlsAlignment = std::max(tlsAlignment, c->getAlignment());
 
-    PartialSection *pSec = createPartialSection(name,
-                                                c->getOutputCharacteristics());
+    PartialSection *pSec =
+        createPartialSection(name, c->getOutputCharacteristics());
     pSec->chunks.push_back(c);
   }
 
@@ -1149,7 +1197,6 @@ void Writer::createSections() {
   for (auto thunk : ctx.symtab.sameAddressThunks)
     wowthkSec->addChunk(thunk);
 
-  // Then create an OutputSection for each section.
   // '$' and all following characters in input section names are
   // discarded when determining output section. So, .text$foo
   // contributes to .text, for example. See PE/COFF spec 3.2.
@@ -1233,7 +1280,6 @@ void Writer::createMiscChunks() {
     }
   });
 
-  // Create Debug Information Chunks
   if (config->mingw) {
     debugInfoSec = buildidSec;
   } else if (!config->mergeDebugDirectory) {
@@ -1293,16 +1339,14 @@ void Writer::createMiscChunks() {
     debugInfoSec->addChunk(r.second);
   }
 
-  // Create SEH table. x86-only.
   if (config->safeSEH)
     createSEHTable();
 
-  // Create /guard:cf tables if requested.
   createGuardCFTables();
 
   createECChunks();
 
-  if (config->autoImport)
+  if (config->autoImportMode == AutoImportMode::ApplyAutoImport)
     createRuntimePseudoRelocs();
 
   if (config->mingw) {
@@ -1419,7 +1463,8 @@ void Writer::createExportTable() {
   }
   ctx.forEachActiveSymtab([&](SymbolTable &symtab) {
     if (symtab.edataStart) {
-      if (symtab.hadExplicitExports)
+      if (symtab.exportConfigurationMode ==
+          ExportConfigurationMode::HonorExplicitExports)
         Warn(ctx) << "literal .edata sections override exports";
     } else if (!symtab.exports.empty()) {
       std::vector<Chunk *> edataChunks;
@@ -1444,6 +1489,8 @@ void Writer::removeUnusedSections() {
   auto isUnused = [this](OutputSection *s) {
     if (s == relocSec)
       return false; // This section is populated later.
+    if (isIncrementalPreservedSection(ctx, s))
+      return false;
     // MergeChunks have zero size at this point, as their size is finalized
     // later. Only remove sections that have no Chunks at all.
     return s->chunks.empty();
@@ -1482,14 +1529,49 @@ void Writer::layoutSections() {
 // so we remove them if any.
 void Writer::removeEmptySections() {
   llvm::TimeTraceScope timeScope("Remove empty sections");
-  auto isEmpty = [](OutputSection *s) { return s->getVirtualSize() == 0; };
+  auto isEmpty = [this](OutputSection *s) {
+    return s->getVirtualSize() == 0 && !isIncrementalPreservedSection(ctx, s);
+  };
   llvm::erase_if(ctx.outputSections, isEmpty);
+}
+
+void Writer::refreshExceptionTableRanges() {
+  pdata = {};
+  hybridPdata = {};
+  if (!pdataSec || pdataSec->chunks.empty())
+    return;
+
+  if (ctx.config.machine == AMD64) {
+    pdata.first = pdataSec->chunks.front();
+    pdata.last = pdataSec->chunks.back();
+    return;
+  }
+
+  if (isArm64EC(ctx.config.machine)) {
+    llvm::stable_sort(pdataSec->chunks, [=](const Chunk *a, const Chunk *b) {
+      return (a->getMachine() == AMD64) < (b->getMachine() == AMD64);
+    });
+
+    for (Chunk *chunk : pdataSec->chunks) {
+      if (chunk->getMachine() == AMD64) {
+        hybridPdata.first = chunk;
+        hybridPdata.last = pdataSec->chunks.back();
+        break;
+      }
+      if (!pdata.first)
+        pdata.first = chunk;
+      pdata.last = chunk;
+    }
+    return;
+  }
+
+  pdata.first = pdataSec->chunks.front();
+  pdata.last = pdataSec->chunks.back();
 }
 
 void Writer::assignOutputSectionIndices() {
   llvm::TimeTraceScope timeScope("Output sections indices");
-  // Assign final output section indices, and assign each chunk to its output
-  // section.
+  // Assign final output section indices.
   uint32_t idx = 1;
   for (OutputSection *os : ctx.outputSections) {
     os->sectionIndex = idx;
@@ -1823,7 +1905,6 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   uint8_t *buf = buffer->getBufferStart();
   auto *dos = reinterpret_cast<dos_header *>(buf);
 
-  // Write DOS program.
   if (config->dosStub) {
     memcpy(buf, config->dosStub->getBufferStart(),
            config->dosStub->getBufferSize());
@@ -1851,11 +1932,9 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   // Make sure DOS stub is aligned to 8 bytes at this point
   assert((buf - buffer->getBufferStart()) % 8 == 0);
 
-  // Write PE magic
   memcpy(buf, PEMagic, sizeof(PEMagic));
   buf += sizeof(PEMagic);
 
-  // Write COFF header
   assert(coffHeaderOffset ==
          static_cast<size_t>(buf - buffer->getBufferStart()));
   auto *coff = reinterpret_cast<coff_file_header *>(buf);
@@ -1882,7 +1961,6 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   coff->SizeOfOptionalHeader =
       sizeof(PEHeaderTy) + sizeof(data_directory) * numberOfDataDirectory;
 
-  // Write PE header
   assert(peHeaderOffset == static_cast<size_t>(buf - buffer->getBufferStart()));
   auto *pe = reinterpret_cast<PEHeaderTy *>(buf);
   buf += sizeof(*pe);
@@ -1948,7 +2026,6 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
   }
   pe->SizeOfInitializedData = getSizeOfInitializedData();
 
-  // Write data directory
   assert(!ctx.config.is64() ||
          dataDirOffset64 ==
              static_cast<size_t>(buf - buffer->getBufferStart()));
@@ -2012,7 +2089,6 @@ template <typename PEHeaderTy> void Writer::writeHeader() {
     dir[DELAY_IMPORT_DESCRIPTOR].Size = delayIdata.getDirSize();
   }
 
-  // Write section table
   for (OutputSection *sec : ctx.outputSections) {
     sec->writeHeaderTo(buf, config->debug);
     buf += sizeof(coff_section);
@@ -2332,7 +2408,6 @@ void Writer::maybeAddRVATable(SymbolRVASet tableSymbols, StringRef tableSym,
   });
 }
 
-// Create CHPE metadata chunks.
 void Writer::createECChunks() {
   if (!ctx.symtab.isEC())
     return;
@@ -2412,7 +2487,7 @@ void Writer::createRuntimePseudoRelocs() {
       sc->getRuntimePseudoRelocs(rels);
     }
 
-    if (!ctx.config.pseudoRelocs) {
+    if (ctx.config.pseudoRelocMode != PseudoRelocMode::EmitRuntimePseudoRelocs) {
       // Not writing any pseudo relocs; if some were needed, error out and
       // indicate what required them.
       for (const RuntimePseudoReloc &rpr : rels)
@@ -2502,8 +2577,6 @@ void Writer::insertBssDataStartEndSymbols() {
   }
 }
 
-// Handles /section options to allow users to overwrite
-// section attributes.
 void Writer::setSectionPermissions() {
   llvm::TimeTraceScope timeScope("Sections permissions");
   for (auto &p : ctx.config.section) {
@@ -2515,7 +2588,6 @@ void Writer::setSectionPermissions() {
   }
 }
 
-// Set symbols used by ARM64EC metadata.
 void Writer::setECSymbols() {
   if (!ctx.symtab.isEC())
     return;
@@ -2605,7 +2677,6 @@ void Writer::setECSymbols() {
     thunk->setDynamicRelocs(ctx);
 }
 
-// Write section contents to a mmap'ed file.
 void Writer::writeSections() {
   llvm::TimeTraceScope timeScope("Write sections");
   uint8_t *buf = buffer->getBufferStart();
@@ -2672,11 +2743,17 @@ void Writer::writeBuildId() {
 
   uint32_t timestamp = config->timestamp;
   uint64_t hash = 0;
+  const IncrementalOutputMetadata *oldMetadata =
+      findActiveIncrementalOutputMetadata(ctx);
+  bool preserveMetadata =
+      shouldPreserveIncrementalBuildMetadata(ctx) && oldMetadata;
 
   if (config->repro || generateSyntheticBuildId)
     hash = xxh3_64bits(outputFileData);
 
-  if (config->repro)
+  if (preserveMetadata)
+    timestamp = oldMetadata->timestamp;
+  else if (config->repro)
     timestamp = static_cast<uint32_t>(hash);
 
   if (generateSyntheticBuildId) {
@@ -2685,6 +2762,12 @@ void Writer::writeBuildId() {
     memcpy(buildId->buildId->PDB70.Signature, &hash, 8);
     // xxhash only gives us 8 bytes, so put some fixed data in the other half.
     memcpy(&buildId->buildId->PDB70.Signature[8], "LLD PDB.", 8);
+  } else if (buildId && shouldReuseIncrementalPdbMetadata(ctx) && oldMetadata &&
+             oldMetadata->pdbGuid) {
+    buildId->buildId->PDB70.CVSignature = OMF::Signature::PDB70;
+    buildId->buildId->PDB70.Age = oldMetadata->pdbAge;
+    memcpy(buildId->buildId->PDB70.Signature, oldMetadata->pdbGuid->Guid,
+           sizeof(oldMetadata->pdbGuid->Guid));
   }
 
   if (debugDirectory)
@@ -2811,10 +2894,8 @@ void Writer::addBaserels() {
     if (sec->header.Characteristics & IMAGE_SCN_MEM_DISCARDABLE)
       continue;
     llvm::TimeTraceScope timeScope("Base relocations: ", sec->name);
-    // Collect all locations for base relocations.
     for (Chunk *c : sec->chunks)
       c->getBaserels(&v);
-    // Add the addresses to .reloc section.
     if (!v.empty())
       addBaserelBlocks(v);
     v.clear();
@@ -2970,7 +3051,7 @@ void Writer::fixTlsAlignment() {
 }
 
 void Writer::prepareLoadConfig() {
-  ctx.forEachActiveSymtab([&](SymbolTable &symtab) {
+  ctx.forEachSymtabWithInputs([&](SymbolTable &symtab) {
     if (!symtab.loadConfigSym)
       return;
 
@@ -3088,26 +3169,36 @@ void Writer::printSummary() {
            << " " << s << '\n';
   };
 
-  bool hasStats = ctx.pdbStats.has_value();
-
   print(ctx.objFileInstances.size(),
         "Input OBJ files (expanded from all cmd-line inputs)");
   print(ctx.consumedInputsSize,
         "Size of all consumed OBJ files (non-lazy), in bytes");
   print(ctx.typeServerSourceMappings.size(), "PDB type server dependencies");
   print(ctx.precompSourceMappings.size(), "Precomp OBJ dependencies");
-  print(hasStats ? ctx.pdbStats->nbTypeRecords : 0, "Input debug type records");
-  print(hasStats ? ctx.pdbStats->nbTypeRecordsBytes : 0,
-        "Size of all input debug type records, in bytes");
-  print(hasStats ? ctx.pdbStats->nbTPIrecords : 0, "Merged TPI records");
-  print(hasStats ? ctx.pdbStats->nbIPIrecords : 0, "Merged IPI records");
-  print(hasStats ? ctx.pdbStats->strTabSize : 0, "Output PDB strings");
-  print(hasStats ? ctx.pdbStats->globalSymbols : 0, "Global symbol records");
-  print(hasStats ? ctx.pdbStats->moduleSymbols : 0, "Module symbol records");
-  print(hasStats ? ctx.pdbStats->publicSymbols : 0, "Public symbol records");
-
-  if (hasStats)
-    stream << ctx.pdbStats->largeInputTypeRecs;
+  ctx.pdbSummary.match(
+      [&](const PrintZeroedPDBSummary &) {
+        print(0, "Input debug type records");
+        print(0, "Size of all input debug type records, in bytes");
+        print(0, "Merged TPI records");
+        print(0, "Merged IPI records");
+        print(0, "Output PDB strings");
+        print(0, "Global symbol records");
+        print(0, "Module symbol records");
+        print(0, "Public symbol records");
+      },
+      [&](const PrintMeasuredPDBSummary &summary) {
+        const PDBStats &stats = summary.stats;
+        print(stats.nbTypeRecords, "Input debug type records");
+        print(stats.nbTypeRecordsBytes,
+              "Size of all input debug type records, in bytes");
+        print(stats.nbTPIrecords, "Merged TPI records");
+        print(stats.nbIPIrecords, "Merged IPI records");
+        print(stats.strTabSize, "Output PDB strings");
+        print(stats.globalSymbols, "Global symbol records");
+        print(stats.moduleSymbols, "Module symbol records");
+        print(stats.publicSymbols, "Public symbol records");
+        stream << stats.largeInputTypeRecs;
+      });
 
   Msg(ctx) << buffer;
 }

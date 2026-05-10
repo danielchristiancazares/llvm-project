@@ -87,6 +87,8 @@ public:
   // Used by ArchiveFile to enqueue members.
   void enqueueArchiveMember(const Archive::Child &c, const Archive::Symbol &sym,
                             StringRef parentName);
+  void enqueueArchiveMember(const Archive::Child &c, StringRef symName,
+                            StringRef parentName);
 
   enum class InputOpt { None, DefaultLib, WholeArchive };
   void enqueuePDB(StringRef Path) { enqueuePath(Path, false); }
@@ -98,6 +100,7 @@ public:
 
   // Returns a list of chunks of selected symbols.
   std::vector<Chunk *> getChunks() const;
+  llvm::ArrayRef<MemoryBufferRef> getResources() const { return resources; }
 
   std::unique_ptr<llvm::TarWriter> tar; // for /linkrepro
 
@@ -110,6 +113,8 @@ private:
   StringRef findFile(StringRef filename);
   StringRef findLib(StringRef filename);
   StringRef findLibMinGW(StringRef filename);
+  StringRef normalizeLibName(StringRef filename);
+  void addNoDefaultLib(StringRef filename);
 
   // Determines the location of the sysroot based on `args`, environment, etc.
   void detectWinSysRoot(const llvm::opt::InputArgList &args);
@@ -179,7 +184,8 @@ private:
                  bool lazy);
   void addArchiveBuffer(MemoryBufferRef mbref, StringRef symName,
                         StringRef parentName, uint64_t offsetInArchive);
-  void addThinArchiveBuffer(MemoryBufferRef mbref, StringRef symName);
+  void addThinArchiveBuffer(MemoryBufferRef mbref, StringRef symName,
+                            StringRef parentName, uint64_t offsetInArchive);
 
   void enqueueTask(std::function<void()> task);
   bool run();

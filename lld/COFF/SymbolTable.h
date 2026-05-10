@@ -44,6 +44,11 @@ struct WrappedSymbol {
 
 struct UndefinedDiag;
 
+enum class ExportConfigurationMode {
+  AllowAutoExports,
+  HonorExplicitExports,
+};
+
 // SymbolTable is a bucket of all known symbols, including defined,
 // undefined, or lazy symbols (the last one is symbols in archive
 // files whose archive members are not yet loaded).
@@ -155,18 +160,16 @@ public:
   // An entry point symbol.
   Symbol *entry = nullptr;
 
-  // A list of chunks which to be added to .rdata.
   std::vector<Chunk *> localImportChunks;
 
-  // A list of EC EXP+ symbols.
   std::vector<Symbol *> expSymbols;
 
   std::vector<SameAddressThunkARM64EC *> sameAddressThunks;
 
-  // A list of DLL exports.
   std::vector<Export> exports;
   llvm::DenseSet<StringRef> directivesExports;
-  bool hadExplicitExports;
+  ExportConfigurationMode exportConfigurationMode =
+      ExportConfigurationMode::AllowAutoExports;
 
   Chunk *edataStart = nullptr;
   Chunk *edataEnd = nullptr;
@@ -174,19 +177,18 @@ public:
   Symbol *delayLoadHelper = nullptr;
   Chunk *tailMergeUnwindInfoChunk = nullptr;
 
-  // A list of wrapped symbols.
   std::vector<WrappedSymbol> wrapped;
 
-  // Used for /alternatename.
   std::map<StringRef, StringRef> alternateNames;
 
-  // Used for /aligncomm.
   std::map<std::string, int> alignComm;
 
   void fixupExports();
   void assignExportOrdinals();
   void parseModuleDefs(StringRef path);
   void parseAlternateName(StringRef);
+  static void parseAligncomm(COFFLinkerContext &ctx, StringRef s,
+                             std::map<std::string, int> &alignComm);
   void parseAligncomm(StringRef);
 
   // Iterates symbols in non-determinstic hash table order.
@@ -196,6 +198,8 @@ public:
   }
 
   std::vector<BitcodeFile *> bitcodeFileInstances;
+  bool hasInputFiles() const { return hasInputFilesFlag; }
+  void noteInputFile() { hasInputFilesFlag = true; }
 
   DefinedRegular *loadConfigSym = nullptr;
   uint32_t loadConfigSize = 0;
@@ -204,6 +208,8 @@ public:
   std::string printSymbol(Symbol *sym) const;
 
 private:
+  friend class ObjFile;
+
   /// Given a name without "__imp_" prefix, returns a defined symbol
   /// with the "__imp_" prefix, if it exists.
   Defined *impSymbol(StringRef name);
@@ -213,7 +219,6 @@ private:
   std::pair<Symbol *, bool> insert(StringRef name, InputFile *f);
 
   bool findUnderscoreMangle(StringRef sym);
-  std::vector<Symbol *> getSymsWithPrefix(StringRef prefix);
 
   llvm::DenseMap<llvm::CachedHashStringRef, Symbol *> symMap;
   std::unique_ptr<BitcodeCompiler> lto;
@@ -225,6 +230,8 @@ private:
                        const llvm::DenseMap<Symbol *, Symbol *> *localImports,
                        bool needBitcodeFiles);
   void reportUndefinedSymbol(const UndefinedDiag &undefDiag);
+
+  bool hasInputFilesFlag = false;
 };
 
 std::vector<std::string> getSymbolLocations(ObjFile *file, uint32_t symIndex);

@@ -10,12 +10,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "COFFLinkerContext.h"
+#include "Incremental.h"
+#include "IncrementalPDBCache.h"
 #include "Symbols.h"
 #include "llvm/BinaryFormat/COFF.h"
 
 namespace lld::coff {
+
 COFFLinkerContext::COFFLinkerContext()
     : driver(*this), symtab(*this),
+      incremental(IncrementalCoordinator::makeDisabled()),
       ltoTextSection(llvm::COFF::IMAGE_SCN_MEM_EXECUTE),
       ltoDataSection(llvm::COFF::IMAGE_SCN_CNT_INITIALIZED_DATA),
       ltoTextSectionChunk(&ltoTextSection.section),
@@ -23,7 +27,8 @@ COFFLinkerContext::COFFLinkerContext()
       rootTimer("Total Linking Time"),
       inputFileTimer("Input File Reading", rootTimer),
       ltoTimer("LTO", rootTimer), gcTimer("GC", rootTimer),
-      icfTimer("ICF", rootTimer), codeLayoutTimer("Code Layout", rootTimer),
+      icfTimer("ICF", rootTimer),
+      codeLayoutTimer("Code Layout", rootTimer),
       outputCommitTimer("Commit Output File", rootTimer),
       totalMapTimer("MAP Emission (Cumulative)", rootTimer),
       symbolGatherTimer("Gather Symbols", totalMapTimer),
@@ -38,4 +43,6 @@ COFFLinkerContext::COFFLinkerContext()
       publicsLayoutTimer("Publics Stream Layout", totalPdbLinkTimer),
       tpiStreamLayoutTimer("TPI Stream Layout", totalPdbLinkTimer),
       diskCommitTimer("Commit to Disk", totalPdbLinkTimer) {}
+
+COFFLinkerContext::~COFFLinkerContext() = default;
 } // namespace lld::coff

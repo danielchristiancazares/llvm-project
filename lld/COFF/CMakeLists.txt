@@ -11,6 +11,11 @@ add_lld_library(lldCOFF
   Driver.cpp
   DriverUtils.cpp
   ICF.cpp
+  Incremental.cpp
+  IncrementalPDBCache.cpp
+  IncrementalLayout.cpp
+  IncrementalRedirects.cpp
+  IncrementalState.cpp
   InputFiles.cpp
   LLDMapFile.cpp
   LTO.cpp

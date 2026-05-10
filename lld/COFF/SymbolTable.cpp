@@ -16,6 +16,7 @@
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "lld/Common/Timer.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/DebugInfo/DIContext.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Mangler.h"
@@ -264,7 +265,8 @@ void SymbolTable::loadMinGWSymbols() {
       continue;
     StringRef name = undef->getName();
 
-    if (machine == I386 && ctx.config.stdcallFixup) {
+    if (machine == I386 &&
+        ctx.config.stdcallFixupMode == StdcallFixupMode::ApplyStdcallFixups) {
       // Check if we can resolve an undefined decorated symbol by finding
       // the intended target as an undecorated symbol (only with a leading
       // underscore).
@@ -285,7 +287,8 @@ void SymbolTable::loadMinGWSymbols() {
         }
         // If it's lazy or already defined, hook it up as weak alias.
         if (l->isLazy() || isa<Defined>(l)) {
-          if (ctx.config.warnStdcallFixup)
+          if (ctx.config.stdcallFixupDiagnosticMode ==
+              StdcallFixupDiagnosticMode::WarnOnResolvedFixup)
             Warn(ctx) << "Resolving " << origName << " by linking to "
                       << newName;
           else
@@ -297,7 +300,7 @@ void SymbolTable::loadMinGWSymbols() {
       }
     }
 
-    if (ctx.config.autoImport) {
+    if (ctx.config.autoImportMode == AutoImportMode::ApplyAutoImport) {
       if (name.starts_with("__imp_"))
         continue;
       // If we have an undefined symbol, but we have a lazy symbol we could
@@ -341,7 +344,7 @@ bool SymbolTable::handleMinGWAutomaticImport(Symbol *sym, StringRef name) {
     impSize = sizeof(DefinedRegular);
   } else {
     Warn(ctx) << "unable to automatically import " << name << " from "
-              << imp->getName() << " from " << cast<DefinedRegular>(imp)->file
+              << imp->getName() << " from " << toString(imp->getFile())
               << "; unexpected symbol type";
     return false;
   }
@@ -444,7 +447,8 @@ void SymbolTable::reportUnresolvable() {
     }
     if (name.contains("_PchSym_"))
       continue;
-    if (ctx.config.autoImport && impSymbol(name))
+    if (ctx.config.autoImportMode == AutoImportMode::ApplyAutoImport &&
+        impSymbol(name))
       continue;
     undefs.insert(sym);
   }
@@ -509,7 +513,8 @@ void SymbolTable::resolveRemainingUndefines(std::vector<Undefined *> &aliases) {
     if (name.contains("_PchSym_"))
       continue;
 
-    if (ctx.config.autoImport && handleMinGWAutomaticImport(sym, name))
+    if (ctx.config.autoImportMode == AutoImportMode::ApplyAutoImport &&
+        handleMinGWAutomaticImport(sym, name))
       continue;
 
     // Remaining undefined symbols are not fatal if /force is specified.
@@ -622,9 +627,9 @@ void SymbolTable::initializeECThunks() {
     // We need to be able to add padding to the function and fill it with an
     // offset to its entry thunks. To ensure that padding the function is
     // feasible, functions are required to be COMDAT symbols with no offset.
-    if (!from || !from->getChunk()->isCOMDAT() ||
-        cast<DefinedRegular>(from)->getValue()) {
-      Err(ctx) << "non COMDAT symbol '" << from->getName() << "' in hybrid map";
+    if (!from || !from->getChunk()->isCOMDAT() || from->getValue()) {
+      Err(ctx) << "non COMDAT symbol '" << it.first->getName()
+               << "' in hybrid map";
       continue;
     }
     from->getChunk()->setEntryThunk(to);
@@ -691,8 +696,10 @@ Symbol *SymbolTable::addUndefined(StringRef name, InputFile *f,
     replaceSymbol<Undefined>(s, name);
     return s;
   }
-  if (s->isLazy())
+  if (s->isLazy()) {
     forceLazy(s);
+    return s;
+  }
   return s;
 }
 
@@ -874,7 +881,7 @@ void SymbolTable::reportDuplicate(Symbol *existing, InputFile *newFile,
 }
 
 Symbol *SymbolTable::addAbsolute(StringRef n, COFFSymbolRef sym) {
-  auto [s, wasInserted] = insert(n, nullptr);
+  auto [s, wasInserted] = insert(n);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy())
     replaceSymbol<DefinedAbsolute>(s, ctx, n, sym);
@@ -887,7 +894,7 @@ Symbol *SymbolTable::addAbsolute(StringRef n, COFFSymbolRef sym) {
 }
 
 Symbol *SymbolTable::addAbsolute(StringRef n, uint64_t va) {
-  auto [s, wasInserted] = insert(n, nullptr);
+  auto [s, wasInserted] = insert(n);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy())
     replaceSymbol<DefinedAbsolute>(s, ctx, n, va);
@@ -900,7 +907,7 @@ Symbol *SymbolTable::addAbsolute(StringRef n, uint64_t va) {
 }
 
 Symbol *SymbolTable::addSynthetic(StringRef n, Chunk *c) {
-  auto [s, wasInserted] = insert(n, nullptr);
+  auto [s, wasInserted] = insert(n);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy())
     replaceSymbol<DefinedSynthetic>(s, n, c);
@@ -913,11 +920,12 @@ Symbol *SymbolTable::addRegular(InputFile *f, StringRef n,
                                 const coff_symbol_generic *sym, SectionChunk *c,
                                 uint32_t sectionOffset, bool isWeak) {
   auto [s, wasInserted] = insert(n, f);
-  if (wasInserted || !isa<DefinedRegular>(s) || s->isWeak)
+  if (wasInserted || !isa<DefinedRegular>(s) || s->isWeak) {
     replaceSymbol<DefinedRegular>(s, f, n, /*IsCOMDAT*/ false,
                                   /*IsExternal*/ true, sym, c, isWeak);
-  else if (!isWeak)
+  } else if (!isWeak) {
     reportDuplicate(s, f, c, sectionOffset);
+  }
   return s;
 }
 
@@ -939,17 +947,18 @@ SymbolTable::addComdat(InputFile *f, StringRef n,
 Symbol *SymbolTable::addCommon(InputFile *f, StringRef n, uint64_t size,
                                const coff_symbol_generic *sym, CommonChunk *c) {
   auto [s, wasInserted] = insert(n, f);
-  if (wasInserted || !isa<DefinedCOFF>(s))
+  if (wasInserted || !isa<DefinedCOFF>(s)) {
     replaceSymbol<DefinedCommon>(s, f, n, size, sym, c);
-  else if (auto *dc = dyn_cast<DefinedCommon>(s))
+  } else if (auto *dc = dyn_cast<DefinedCommon>(s)) {
     if (size > dc->getSize())
       replaceSymbol<DefinedCommon>(s, f, n, size, sym, c);
+  }
   return s;
 }
 
 DefinedImportData *SymbolTable::addImportData(StringRef n, ImportFile *f,
                                               Chunk *&location) {
-  auto [s, wasInserted] = insert(n, nullptr);
+  auto [s, wasInserted] = insert(n);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy()) {
     replaceSymbol<DefinedImportData>(s, n, f, location);
@@ -962,7 +971,7 @@ DefinedImportData *SymbolTable::addImportData(StringRef n, ImportFile *f,
 
 Defined *SymbolTable::addImportThunk(StringRef name, DefinedImportData *id,
                                      ImportThunkChunk *chunk) {
-  auto [s, wasInserted] = insert(name, nullptr);
+  auto [s, wasInserted] = insert(name);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy()) {
     replaceSymbol<DefinedImportThunk>(s, ctx, name, id, chunk);
@@ -998,21 +1007,6 @@ Symbol *SymbolTable::findUnderscore(StringRef name) const {
   return find(name);
 }
 
-// Return all symbols that start with Prefix, possibly ignoring the first
-// character of Prefix or the first character symbol.
-std::vector<Symbol *> SymbolTable::getSymsWithPrefix(StringRef prefix) {
-  std::vector<Symbol *> syms;
-  for (auto pair : symMap) {
-    StringRef name = pair.first.val();
-    if (name.starts_with(prefix) || name.starts_with(prefix.drop_front()) ||
-        name.drop_front().starts_with(prefix) ||
-        name.drop_front().starts_with(prefix.drop_front())) {
-      syms.push_back(pair.second);
-    }
-  }
-  return syms;
-}
-
 Symbol *SymbolTable::findMangle(StringRef name) {
   if (Symbol *sym = find(name)) {
     if (auto *u = dyn_cast<Undefined>(sym)) {
@@ -1026,36 +1020,42 @@ Symbol *SymbolTable::findMangle(StringRef name) {
     }
   }
 
-  // Efficient fuzzy string lookup is impossible with a hash table, so iterate
-  // the symbol table once and collect all possibly matching symbols into this
-  // vector. Then compare each possibly matching symbol with each possible
-  // mangling.
-  std::vector<Symbol *> syms = getSymsWithPrefix(name);
-  auto findByPrefix = [&syms](const Twine &t) -> Symbol * {
-    std::string prefix = t.str();
-    for (auto *s : syms)
-      if (s->getName().starts_with(prefix))
-        return s;
-    return nullptr;
-  };
-
   // For non-x86, just look for C++ functions.
-  if (machine != I386)
-    return findByPrefix("?" + name + "@@Y");
+  if (machine != I386) {
+    SmallString<64> cxxPrefix;
+    ("?" + name + "@@Y").toVector(cxxPrefix);
+    for (auto &pair : symMap) {
+      if (pair.first.val().starts_with(cxxPrefix))
+        return pair.second;
+    }
+    return nullptr;
+  }
 
   if (!name.starts_with("_"))
     return nullptr;
-  // Search for x86 stdcall function.
-  if (Symbol *s = findByPrefix(name + "@"))
-    return s;
-  // Search for x86 fastcall function.
-  if (Symbol *s = findByPrefix("@" + name.substr(1) + "@"))
-    return s;
-  // Search for x86 vectorcall function.
-  if (Symbol *s = findByPrefix(name.substr(1) + "@@"))
-    return s;
-  // Search for x86 C++ non-member function.
-  return findByPrefix("?" + name.substr(1) + "@@Y");
+
+  // Precompute all exact prefixes for x86 mangling variants.
+  // Use SmallString to keep prefix storage on the stack.
+  StringRef base = name.drop_front(); // strip leading _
+  SmallString<64> stdcallPfx, fastcallPfx, vectorcallPfx, cxxPfx;
+  (name + "@").toVector(stdcallPfx);
+  ("@" + base + "@").toVector(fastcallPfx);
+  (base + "@@").toVector(vectorcallPfx);
+  ("?" + base + "@@Y").toVector(cxxPfx);
+
+  // Single scan checking exact prefixes — C++ first (most common).
+  for (auto &pair : symMap) {
+    StringRef symName = pair.first.val();
+    if (symName.starts_with(cxxPfx))
+      return pair.second;
+    if (symName.starts_with(stdcallPfx))
+      return pair.second;
+    if (symName.starts_with(fastcallPfx))
+      return pair.second;
+    if (symName.starts_with(vectorcallPfx))
+      return pair.second;
+  }
+  return nullptr;
 }
 
 bool SymbolTable::findUnderscoreMangle(StringRef sym) {
@@ -1408,7 +1408,8 @@ void SymbolTable::resolveAlternateNames() {
 }
 
 // Parses /aligncomm option argument.
-void SymbolTable::parseAligncomm(StringRef s) {
+void SymbolTable::parseAligncomm(COFFLinkerContext &ctx, StringRef s,
+                                 std::map<std::string, int> &alignComm) {
   auto [name, align] = s.split(',');
   if (name.empty() || align.empty()) {
     Err(ctx) << "/aligncomm: invalid argument: " << s;
@@ -1420,6 +1421,10 @@ void SymbolTable::parseAligncomm(StringRef s) {
     return;
   }
   alignComm[std::string(name)] = std::max(alignComm[std::string(name)], 1 << v);
+}
+
+void SymbolTable::parseAligncomm(StringRef s) {
+  parseAligncomm(ctx, s, alignComm);
 }
 
 Symbol *SymbolTable::addUndefined(StringRef name) {

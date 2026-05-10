@@ -8,6 +8,7 @@
 
 #include "Chunks.h"
 #include "COFFLinkerContext.h"
+#include "Incremental.h"
 #include "InputFiles.h"
 #include "SymbolTable.h"
 #include "Symbols.h"
@@ -34,11 +35,9 @@ namespace lld::coff {
 
 SectionChunk::SectionChunk(ObjFile *f, const coff_section *h, Kind k)
     : Chunk(k), file(f), header(h), repl(this) {
-  // Initialize relocs.
   if (file)
     setRelocs(file->getCOFFObj()->getRelocations(header));
 
-  // Initialize sectionName.
   StringRef sectionName;
   if (file) {
     if (Expected<StringRef> e = file->getCOFFObj()->getSectionName(header))
@@ -75,6 +74,63 @@ MachineTypes SectionChunk::getMachine() const {
 // important to keep it as compact as possible. As of this writing, the number
 // below is the size of this class on x64 platforms.
 static_assert(sizeof(SectionChunk) <= 88, "SectionChunk grew unexpectedly");
+
+IncrementalPaddingChunk::IncrementalPaddingChunk(StringRef secName,
+                                                 uint32_t chars, uint32_t size,
+                                                 uint8_t fillByte)
+    : NonSectionChunk(IncrementalPaddingKind), secName(secName.str()),
+      chars(chars), size(size), fillByte(fillByte) {
+  setAlignment(1);
+}
+
+void IncrementalPaddingChunk::writeTo(uint8_t *buf) const {
+  if (size == 0)
+    return;
+  memset(buf, fillByte, size);
+}
+
+IncrementalEntryRedirectChunkX64::IncrementalEntryRedirectChunkX64(
+    StringRef debugName, Defined *target, uint32_t slotSize, uint32_t align)
+    : NonSectionCodeChunk(IncrementalEntryRedirectKind),
+      debugName(debugName.str()), target(target), slotSize(slotSize) {
+  setAlignment(align);
+}
+
+void IncrementalEntryRedirectChunkX64::writeTo(uint8_t *buf) const {
+  memset(buf, 0xCC, slotSize);
+  if (slotSize < 5)
+    return;
+  buf[0] = 0xE9;
+  write32le(buf + 1, target->getRVA() - rva - 5);
+}
+
+bool IncrementalEntryRedirectChunkX64::verifyRanges() {
+  if (slotSize < 5)
+    return false;
+  return isIncrementalAmd64Rel32InRange(llvm::COFF::IMAGE_REL_AMD64_REL32,
+                                        rva + 1, target->getRVA());
+}
+
+IncrementalLongThunkChunkX64::IncrementalLongThunkChunkX64(StringRef debugName,
+                                                           Defined *target,
+                                                           uint64_t imageBase)
+    : NonSectionCodeChunk(IncrementalLongThunkKind),
+      debugName(debugName.str()), target(target), imageBase(imageBase) {
+  setAlignment(16);
+}
+
+void IncrementalLongThunkChunkX64::writeTo(uint8_t *buf) const {
+  memset(buf, 0xCC, getSize());
+  buf[0] = 0x48;
+  buf[1] = 0xB8;
+  write64le(buf + 2, imageBase + target->getRVA());
+  buf[10] = 0xFF;
+  buf[11] = 0xE0;
+}
+
+void IncrementalLongThunkChunkX64::getBaserels(std::vector<Baserel> *res) {
+  res->emplace_back(getRVA() + 2, AMD64);
+}
 
 static void add16(uint8_t *p, int16_t v) { write16le(p, read16le(p) + v); }
 static void add32(uint8_t *p, int32_t v) { write32le(p, read32le(p) + v); }
@@ -403,12 +459,33 @@ static void maybeReportRelocationToDiscarded(const SectionChunk *fromChunk,
 void SectionChunk::writeTo(uint8_t *buf) const {
   if (!hasData)
     return;
-  // Copy section contents from source object file to output file.
+  COFFLinkerContext &ctx = file->symtab.ctx;
+  const ByteReuseLink *reuseLink = ctx.incremental->match(
+      [&](const IncrementalDisabled &) -> const ByteReuseLink * {
+        return nullptr;
+      },
+      [&](const PendingFullImageBuild &) -> const ByteReuseLink * {
+        return nullptr;
+      },
+      [&](const FullImageBuild &) -> const ByteReuseLink * { return nullptr; },
+      [&](const StateBackedLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const LayoutStableLink &) -> const ByteReuseLink * { return nullptr; },
+      [&](const ByteReuseLink &reuse) -> const ByteReuseLink * {
+        return &reuse;
+      });
+  if (reuseLink) {
+    auto it = reuseLink->reuse.reusedChunkData.find(this);
+    if (it != reuseLink->reuse.reusedChunkData.end()) {
+      ArrayRef<uint8_t> reused = it->second;
+      if (!reused.empty())
+        memcpy(buf, reused.data(), reused.size());
+      return;
+    }
+  }
   ArrayRef<uint8_t> a = getContents();
   if (!a.empty())
     memcpy(buf, a.data(), a.size());
 
-  // Apply relocations.
   size_t inputSize = getSize();
   for (const coff_relocation &rel : getRelocs()) {
     // Check for an invalid relocation offset. This check isn't perfect, because
@@ -520,7 +597,6 @@ void SectionChunk::addAssociative(SectionChunk *child) {
       break;
   }
 
-  // Insert child between prev and next.
   assert(prev->assocChildren == next);
   prev->assocChildren = child;
   child->assocChildren = next;

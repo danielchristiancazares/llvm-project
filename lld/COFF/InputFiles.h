@@ -38,12 +38,18 @@ namespace lld {
 class DWARFCache;
 
 namespace coff {
+
 class COFFLinkerContext;
 
 const COFFSyncStream &operator<<(const COFFSyncStream &, const InputFile *);
 
-std::vector<MemoryBufferRef> getArchiveMembers(COFFLinkerContext &,
-                                               llvm::object::Archive *file);
+struct ArchiveMemberBuffer {
+  MemoryBufferRef buffer;
+  uint64_t offsetInArchive;
+};
+
+std::vector<ArchiveMemberBuffer> getArchiveMembers(COFFLinkerContext &,
+                                                   llvm::object::Archive *file);
 
 using llvm::COFF::IMAGE_FILE_MACHINE_UNKNOWN;
 using llvm::COFF::MachineTypes;
@@ -96,6 +102,12 @@ public:
   // An archive file name if this file is created from an archive.
   StringRef parentName;
 
+  // A stable archive identity for incremental replay. Unlike parentName, this
+  // is also set for thin archive members, where the buffer identifier remains
+  // the member path on disk.
+  StringRef archiveName;
+  uint64_t archiveOffset = 0;
+
   // Returns .drectve section contents if exist.
   StringRef getDirectives() { return directives; }
 
@@ -126,8 +138,13 @@ public:
   // enqueued a load for the same archive member, this function does nothing,
   // which ensures that we don't load the same member more than once.
   void addMember(const Archive::Symbol &sym);
+  void addMemberByOffset(uint64_t offset, StringRef reason);
+  void addMemberByName(StringRef memberName, StringRef reason);
+  bool isThin() const { return file && file->isThin(); }
 
 private:
+  void addMember(const Archive::Child &c, const Archive::Symbol &sym);
+  void addMember(const Archive::Child &c, StringRef reason);
   std::unique_ptr<Archive> file;
   llvm::DenseSet<uint64_t> seen;
 };
@@ -145,6 +162,7 @@ public:
   MachineTypes getMachineType() const override;
   ArrayRef<Chunk *> getChunks() { return chunks; }
   ArrayRef<SectionChunk *> getDebugChunks() { return debugChunks; }
+  ArrayRef<SectionChunk *> getDebugChunks() const { return debugChunks; }
   ArrayRef<SectionChunk *> getSXDataChunks() { return sxDataChunks; }
   ArrayRef<SectionChunk *> getGuardFidChunks() { return guardFidChunks; }
   ArrayRef<SectionChunk *> getGuardIATChunks() { return guardIATChunks; }
@@ -235,6 +253,7 @@ private:
   void initializeChunks();
   void initializeSymbols();
   void initializeFlags();
+  void initializePchSignature();
   void initializeDependencies();
   void initializeECThunks();
 
@@ -277,7 +296,8 @@ private:
                     &comdatDefs,
                 bool &prevailingComdat);
   Symbol *createRegular(COFFSymbolRef sym);
-  Symbol *createUndefined(COFFSymbolRef sym, bool overrideLazy);
+  Symbol *createUndefined(COFFSymbolRef sym, StringRef name,
+                          bool overrideLazy);
 
   std::unique_ptr<COFFObjectFile> coffObj;
 
