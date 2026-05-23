@@ -131,7 +131,8 @@ public:
 // .lib or .a file.
 class ArchiveFile : public InputFile {
 public:
-  explicit ArchiveFile(COFFLinkerContext &ctx, MemoryBufferRef m);
+  explicit ArchiveFile(COFFLinkerContext &ctx, MemoryBufferRef mb,
+                       std::unique_ptr<Archive> &f);
   static bool classof(const InputFile *f) { return f->kind() == ArchiveKind; }
   void parse() override;
 

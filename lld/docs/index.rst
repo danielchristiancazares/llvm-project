@@ -140,7 +140,6 @@ document soon.
    windows_x64_speed_audit
    missingkeyfunction
    error_handling_script
-   Partitions
    ReleaseNotes
    ELF/large_sections
    ELF/linker_script
