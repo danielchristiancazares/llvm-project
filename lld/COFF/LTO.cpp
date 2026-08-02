@@ -130,27 +130,19 @@ BitcodeCompiler::BitcodeCompiler(COFFLinkerContext &c) : ctx(c) {
 
   // Initialize ltoObj.
   lto::ThinBackend backend;
-  if (!ctx.config.dtltoDistributor.empty()) {
-    backend = lto::createOutOfProcessThinBackend(
-        llvm::hardware_concurrency(ctx.config.thinLTOJobs),
-        /*OnWrite=*/nullptr,
-        /*ShouldEmitIndexFiles=*/false,
-        /*ShouldEmitImportFiles=*/false, ctx.config.outputFile,
-        ctx.config.dtltoDistributor, ctx.config.dtltoDistributorArgs,
-        ctx.config.dtltoCompiler, ctx.config.dtltoCompilerPrependArgs,
-        ctx.config.dtltoCompilerArgs, !ctx.config.saveTempsArgs.empty(),
-        createAddBufferFn(files, file_names));
-  } else if (ctx.config.thinLTOIndexingMode ==
-             ThinLTOIndexingMode::WriteThinLTOIndexes) {
+  const bool indexOnly = ctx.config.thinLTOIndexingMode ==
+                         ThinLTOIndexingMode::WriteThinLTOIndexes;
+  const bool emitImportsFiles =
+      ctx.config.thinLTOImportsFileMode ==
+      ThinLTOImportsFileMode::EmitImportsFiles;
+  if (indexOnly) {
     auto OnIndexWrite = [&](StringRef S) { thinIndices.erase(S); };
     backend = lto::createWriteIndexesThinBackend(
         llvm::hardware_concurrency(ctx.config.thinLTOJobs),
         std::string(ctx.config.thinLTOPrefixReplaceOld),
         std::string(ctx.config.thinLTOPrefixReplaceNew),
         std::string(ctx.config.thinLTOPrefixReplaceNativeObject),
-        ctx.config.thinLTOImportsFileMode ==
-            ThinLTOImportsFileMode::EmitImportsFiles,
-        indexFile.get(), OnIndexWrite);
+        emitImportsFiles, indexFile.get(), OnIndexWrite);
   } else {
     backend = lto::createInProcessThinBackend(
         llvm::heavyweight_hardware_concurrency(ctx.config.thinLTOJobs));
@@ -161,12 +153,22 @@ BitcodeCompiler::BitcodeCompiler(COFFLinkerContext &c) : ctx(c) {
                                         ctx.config.ltoPartitions);
   else
     ltoObj = std::make_unique<lto::DTLTO>(
-        createConfig(), backend, ctx.config.ltoPartitions,
-        llvm::lto::LTO::LTOKind::LTOK_Default, ctx.config.outputFile,
+        createConfig(), ctx.config.ltoPartitions,
+        llvm::lto::LTO::LTOKind::LTOK_Default, nullptr,
+        emitImportsFiles, indexOnly,
+        ctx.config.outputFile, ctx.config.dtltoDistributor,
+        ctx.config.dtltoDistributorArgs, ctx.config.dtltoCompiler,
+        ctx.config.dtltoCompilerPrependArgs, ctx.config.dtltoCompilerArgs,
+        createAddBufferFn(files, file_names),
         !ctx.config.saveTempsArgs.empty());
 }
 
 BitcodeCompiler::~BitcodeCompiler() = default;
+
+void BitcodeCompiler::waitForLTOCleanup() {
+  if (ltoObj)
+    ltoObj->waitForCleanup();
+}
 
 static void undefine(Symbol *s) { replaceSymbol<Undefined>(s, s->getName()); }
 

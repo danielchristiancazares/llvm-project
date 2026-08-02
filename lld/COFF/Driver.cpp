@@ -282,21 +282,45 @@ MemoryBufferRef LinkerDriver::takeBuffer(std::unique_ptr<MemoryBuffer> mb) {
   return mbref;
 }
 
-static InputFile *tryCreateFatLTOFile(COFFLinkerContext &ctx,
-                                      MemoryBufferRef mb, StringRef archiveName,
-                                      uint64_t offsetInArchive, bool lazy) {
-  if (ctx.config.fatLTOObjects) {
-    Expected<MemoryBufferRef> fatLTOData =
-        IRObjectFile::findBitcodeInMemBuffer(mb);
+InputFile *LinkerDriver::addObjectFile(COFFLinkerContext &ctx,
+                                       MemoryBufferRef mb,
+                                       StringRef archiveName,
+                                       uint64_t offsetInArchive, bool lazy) {
+  std::unique_ptr<COFFObjectFile> coffObj = ObjFile::createCOFFObject(ctx, mb);
+  InputFile *obj = nullptr;
 
-    if (!errorToBool(fatLTOData.takeError())) {
-      return BitcodeFile::create(ctx, *fatLTOData, archiveName, offsetInArchive,
-                                 lazy);
+  // On ARM64EC, check for a hybrid object section and use it for the EC object.
+  if (ctx.symtab.isEC()) {
+    if (std::optional<MemoryBufferRef> hybridSec =
+            coffObj->findHybridObjectSection()) {
+      InputFile *hybridObj =
+          addObjectFile(ctx, *hybridSec, archiveName, offsetInArchive, lazy);
+      // For the ARM64X target, continue processing the native file.
+      if (ctx.config.machine != ARM64X)
+        return hybridObj;
     }
   }
 
-  InputFile *obj = ObjFile::create(ctx, mb, lazy);
+  if (ctx.config.fatLTOObjects) {
+    Expected<MemoryBufferRef> fatLTOData =
+        IRObjectFile::findBitcodeInObject(*coffObj);
+
+    if (!errorToBool(fatLTOData.takeError())) {
+      obj = BitcodeFile::create(ctx, *fatLTOData, archiveName, offsetInArchive,
+                                lazy);
+    }
+  }
+
+  if (!obj)
+    obj = ObjFile::create(ctx, coffObj.release(), lazy);
   obj->parentName = archiveName;
+  if (!archiveName.empty()) {
+    obj->archiveName = archiveName;
+    obj->archiveOffset = offsetInArchive;
+    noteIncrementalArchiveMemberLoad(ctx, obj->archiveName, obj->archiveOffset,
+                                     obj->getName());
+  }
+  addFile(obj);
   return obj;
 }
 
@@ -343,7 +367,7 @@ void LinkerDriver::addBuffer(std::unique_ptr<MemoryBuffer> mb,
     addFile(BitcodeFile::create(ctx, mbref, "", 0, lazy));
     break;
   case file_magic::coff_object: {
-    addFile(tryCreateFatLTOFile(ctx, mbref, "", 0, lazy));
+    addObjectFile(ctx, mbref, "", 0, lazy);
     break;
   }
   case file_magic::coff_import_library:
@@ -358,7 +382,21 @@ void LinkerDriver::addBuffer(std::unique_ptr<MemoryBuffer> mb,
     break;
   case file_magic::pecoff_executable:
     if (ctx.config.mingw) {
-      addFile(make<DLLFile>(ctx.symtab, mbref));
+      std::unique_ptr<COFFObjectFile> obj =
+          ObjFile::createCOFFObject(ctx, mbref);
+      if (ctx.symtab.isEC()) {
+        // When importing an ARM64X image, add both the native and EC views.
+        if (std::unique_ptr<MemoryBuffer> hybridView =
+                obj->getHybridObjectView()) {
+          std::unique_ptr<COFFObjectFile> hybridObj =
+              ObjFile::createCOFFObject(ctx, takeBuffer(std::move(hybridView)));
+          addFile(make<DLLFile>(ctx.symtab, hybridObj));
+          addFile(make<DLLFile>(*ctx.hybridSymtab, obj));
+          break;
+        }
+      }
+      auto machine = static_cast<MachineTypes>(obj->getMachine());
+      addFile(make<DLLFile>(ctx.getSymtab(machine), obj));
       break;
     }
     if (filename.ends_with_insensitive(".dll")) {
@@ -458,9 +496,15 @@ void LinkerDriver::addArchiveBuffer(MemoryBufferRef mb, StringRef symName,
 
   InputFile *obj;
   if (magic == file_magic::coff_object) {
-    obj = tryCreateFatLTOFile(ctx, mb, parentName, offsetInArchive, lazy);
+    obj = addObjectFile(ctx, mb, parentName, offsetInArchive, lazy);
   } else if (magic == file_magic::bitcode) {
     obj = BitcodeFile::create(ctx, mb, parentName, offsetInArchive, lazy);
+    obj->parentName = parentName;
+    obj->archiveName = parentName;
+    obj->archiveOffset = offsetInArchive;
+    noteIncrementalArchiveMemberLoad(ctx, obj->archiveName, obj->archiveOffset,
+                                     obj->getName());
+    addFile(obj);
   } else if (magic == file_magic::coff_cl_gl_object) {
     Err(ctx) << mb.getBufferIdentifier()
              << ": is not a native COFF file. Recompile without /GL?";
@@ -470,12 +514,6 @@ void LinkerDriver::addArchiveBuffer(MemoryBufferRef mb, StringRef symName,
     return;
   }
 
-  obj->parentName = parentName;
-  obj->archiveName = parentName;
-  obj->archiveOffset = offsetInArchive;
-  noteIncrementalArchiveMemberLoad(ctx, obj->archiveName, obj->archiveOffset,
-                                   obj->getName());
-  addFile(obj);
   Log(ctx) << "Loaded " << obj << " for " << symName;
 }
 
@@ -489,11 +527,12 @@ void LinkerDriver::addThinArchiveBuffer(MemoryBufferRef mb, StringRef symName,
   file_magic magic = identify_magic(mb.getBuffer());
   InputFile *obj;
   if (magic == file_magic::coff_object) {
-    obj = tryCreateFatLTOFile(ctx, mb, /*archiveName=*/"", /*offsetInArchive=*/0,
-                              lazy);
+    obj = addObjectFile(ctx, mb, /*archiveName=*/"", /*offsetInArchive=*/0,
+                        lazy);
   } else if (magic == file_magic::bitcode) {
     obj = BitcodeFile::create(ctx, mb, /*archiveName=*/"",
                               /*offsetInArchive=*/0, lazy);
+    addFile(obj);
   } else if (magic == file_magic::coff_cl_gl_object) {
     Err(ctx) << mb.getBufferIdentifier()
              << ": is not a native COFF file. Recompile without /GL?";
@@ -507,7 +546,6 @@ void LinkerDriver::addThinArchiveBuffer(MemoryBufferRef mb, StringRef symName,
   obj->archiveOffset = offsetInArchive;
   noteIncrementalArchiveMemberLoad(ctx, obj->archiveName, obj->archiveOffset,
                                    obj->getName());
-  addFile(obj);
   Log(ctx) << "Loaded " << obj << " for " << symName;
 }
 
@@ -3173,6 +3211,9 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   // Write the result.
   writeResult(ctx);
   finalizeIncrementalLink(ctx);
+  // LTO cleanup may create time trace events. Wait for it to complete before
+  // writing the time trace data.
+  ctx.forEachSymtab([](SymbolTable &symtab) { symtab.waitForLTOCleanup(); });
 
   // Stop early so we can print the results.
   rootTimer.stop();
