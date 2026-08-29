@@ -50,6 +50,18 @@ This file is the active structured rejection record. [OPTIMIZATION_PATH_FAILURES
 - Reopen only if: the intended benchmark explicitly measures overwrite-in-place linking and names that policy.
 - Related commit or revert: external harness now derives output siblings from /OUT.
 
+## PERF-001 - Remove dormant symbol-mutation counters
+
+- Hypothesis: deleting always-null SymbolMutationStats parameters and guarded counter branches would reduce hot regular-object symbol initialization work.
+- Scope: lld/COFF/COFFLinkerContext.cpp/.h, InputFiles.cpp/.h, and SymbolTable.cpp/.h.
+- Attempted change: removed the stats types, context field, uncalled printer, forwarding overloads, nullable parameters, and counter-only branches while preserving all symbol operations.
+- Benchmark evidence: the clean-output n=50 screen slightly improved wall 1904 to 1898 ms and Initialize Symbols 393.24 to 391.56 ms. The lower-noise existing-output n=100 confirmation regressed wall 1685 to 1687 ms, Initialize Symbols 357.55 to 359.49 ms, Input Parse 483.32 to 485.47 ms, and Total Linking Time 1560.99 to 1565.89 ms.
+- Correctness evidence: the candidate built successfully; exhaustive search proved the facility had no non-null producer or live consumer.
+- Failure mode: the source and binary became smaller, but code layout/register-allocation changes or noise outweighed predictable null-branch removal in the confirmation run.
+- Why not to retry unchanged: the intended timer and total linker timer both regressed across 100 alternating pairs.
+- Reopen only if: production builds gain LTO/PGO changes that materially alter these functions, or a new profile attributes retired instructions to the dormant branches.
+- Related commit or revert: candidate discarded by explicit reverse patch; documented in this record-only commit.
+
 ## ARCHIVE-001 - Broad debug S caching and module-symbol buffering
 
 - Hypothesis: caching parsed debug subsections and buffering module symbols per object would avoid repeated parsing and writes.

@@ -58,7 +58,7 @@
 - Benchmark evidence: current source build averaged 1504.4 ms wall and 1400.48 ms internal over 50 links. Its byte-identical frozen lane averaged 1505.7 ms wall.
 - Correctness evidence: all 150 active direct links exited successfully; Cargo manifests were unchanged; capture used one shared materialized response set.
 - Decision: accepted as the active baseline and measurement protocol.
-- Commit: same commit as PERF-004.
+- Commit: 0d1ba1fb7d86.
 
 ### 2026-08-28 18:40 PDT - MEASURE-001 sequential lane batches
 
@@ -66,7 +66,7 @@
 - Benchmark evidence: byte-identical current and frozen lanes reported 1504-200 ms apart at p50 due broad temporal drift; current/frozen/rust-lld averages were 1908, 2088, and 1542 ms.
 - Correctness evidence: all links succeeded.
 - Decision: rejected for A/B decisions. Raw samples remain in this log's Git history once committed; the active artifact directory now contains the rotated rerun.
-- Commit: same commit as PERF-004.
+- Commit: 0d1ba1fb7d86.
 
 ### 2026-08-28 19:20 PDT - PERF-004 direct GC symbol dispatch
 
@@ -79,18 +79,29 @@
 - Correctness evidence: focused associative COMDAT, PDB import GC, symbol-table GC, TLS GC, ARM64EC import, delay-import, entry-thunk, and entry-mangle tests passed 8/8. LLDCOFFTests passed 32/32. Full COFF lit discovered 615 tests: 589 passed, 14 unsupported, 8 failed, and 4 unresolved; all 12 non-passes are incremental-link tests outside markLive, including five Python 3.14 internal-shell failures on the nul device. The failing incremental commands use opt:noref or fail in incremental-state/PDB behavior, so this doGC-only path is unreachable in them.
 - Output equivalence: candidate and baseline import libraries were byte-identical. PE headers, section layout, entry point, and data directories matched. Extracted text, data, pdata, tls, and reloc sections were byte-identical. Whole EXE/PDB hashes differ between repeated links because the capture omits /Brepro, producing timestamps/PDB GUIDs and nondeterministic parallel PDB block allocation.
 - Decision: accepted. Two independent n=100 batches improved end-to-end wall and internal linker time, while three batches consistently reduced the target GC phase by about 4 ms.
-- Commit: this optimization commit.
+- Commit: 0d1ba1fb7d86.
 
 #### PERF-004 clean-output raw wall samples
 
 - Candidate ms: 1548, 1415, 1413, 1399, 1405, 1371, 1371, 1903, 1971, 1937, 2065, 1794, 2011, 1998, 1934, 1966, 1844, 2067, 1977, 1933, 1953, 2032, 1912, 1835, 2025, 2033, 1986, 2246, 2022, 1930, 1852, 1889, 2108, 1874, 2135, 2077, 1961, 1927, 1915, 2214, 1948, 2060, 2105, 1973, 1891, 1917, 1864, 1845, 1803, 1705, 1746, 1670, 1689, 1654, 1650, 1787, 1843, 1799, 1922, 1878, 1854, 1825, 1782, 1624, 1645, 1568, 1572, 1561, 1511, 1513, 1515, 1455, 1422, 1463, 1443, 1388, 1448, 1388, 1453, 1470, 1465, 1437, 1457, 1453, 1473, 1450, 1447, 1457, 1436, 1472, 1465, 1379, 1354, 1361, 1364, 1344, 1345, 1328, 1334, 1336.
 - Frozen baseline ms: 1485, 1477, 1413, 1418, 1407, 1365, 1392, 1772, 1823, 1873, 2013, 1989, 2090, 1943, 2096, 1932, 1743, 1974, 1914, 2120, 1985, 2053, 1972, 1834, 2143, 2170, 2077, 1956, 2100, 2001, 2141, 1956, 2161, 2039, 2118, 2015, 1949, 1993, 2145, 1904, 1946, 2006, 2042, 1943, 1949, 1914, 1893, 1869, 1763, 1748, 1822, 1757, 1677, 1677, 1675, 1811, 1820, 1812, 1885, 1822, 1897, 1864, 1736, 1692, 1665, 1610, 1583, 1575, 1584, 1541, 1491, 1498, 1483, 1468, 1423, 1416, 1361, 1355, 1459, 1493, 1467, 1438, 1465, 1460, 1483, 1456, 1426, 1476, 1433, 1467, 1462, 1432, 1375, 1393, 1395, 1361, 1337, 1372, 1363, 1354.
 
+### 2026-08-28 19:39 PDT - PERF-001 remove dormant symbol-mutation counters
+
+- Change: removed SymbolMutationStats, its uncalled printer, nullable parameters, forwarding overloads, and guarded counter branches from regular-object symbol initialization.
+- Production reachability: ObjFile initializeSymbols calls the affected create helpers and SymbolTable insert/add operations for the measured Rust objects. Exhaustive search proved every stats argument was null and the printer had no caller.
+- Mechanism evidence: the candidate lld-link.exe was 72,185,344 bytes versus 72,189,440 bytes for the frozen parent, a 4,096-byte reduction. All counter symbols and parameters were absent.
+- Clean-output n=50 screen: wall 1898 versus 1904 ms, Initialize Symbols 391.56 versus 393.24 ms, and Total Linking Time 1745.56 versus 1747.08 ms. This was a small favorable result under high disk/PDB variance.
+- Existing-output n=100 confirmation: wall 1687 versus 1685 ms, Initialize Symbols 359.49 versus 357.55 ms, Input Parse 485.47 versus 483.32 ms, and Total Linking Time 1565.89 versus 1560.99 ms.
+- Correctness evidence: the complete LLD target rebuilt successfully; the candidate was rejected before spending a full correctness cycle.
+- Decision: rejected. The 100-pair confirmation regressed the intended phase by 1.94 ms and total linker time by 4.90 ms, so code-size and cleanup value do not satisfy this optimization campaign's performance bar.
+- Commit: this record-only rejection commit.
+
 ## Candidate Inventory
 
 | ID | Hypothesis | Scope | Status | Evidence |
 |---|---|---|---|---|
-| PERF-001 | Reduce repeated work in the live regular-object symbol initialization path | lld/COFF/InputFiles.cpp and SymbolTable.cpp | Survey | Initialize Symbols averages 329.60 ms; avoid archived prehash/reserve/store-guard variants |
+| PERF-001 | Remove dormant SymbolMutationStats plumbing | COFF context, InputFiles, and SymbolTable | Rejected | n=100 confirmation regressed Initialize Symbols 1.94 ms and Total Linking Time 4.90 ms |
 | PERF-002 | Cut a narrow currently repeated operation in debug S symbol merging | lld/COFF/PDB.cpp | Survey | Handle debug S averages 138.86 ms; broad buffering and replay plans are archived failures |
 | PERF-003 | Reduce allocation or lookup overhead in module-symbol rewrite without changing storage family | lld/COFF/PDB.cpp | Survey | Rewrite Module Symbols averages 297.34 ms cumulative; SmallVector and broad batching lost |
 | PERF-004 | Remove type-erased dispatch from reachable GC symbol traversal | lld/COFF/MarkLive.cpp | Accepted | Three A/B batches reduced GC about 4 ms; two n=100 batches improved wall time |
@@ -101,4 +112,5 @@
 
 | Commit | Candidate | Result |
 |---|---|---|
-| This commit | PERF-000, PERF-004 | Baseline records plus validated GC dispatch optimization |
+| 0d1ba1fb7d86 | PERF-000, PERF-004 | Baseline records plus validated GC dispatch optimization |
+| This commit | PERF-001 | Rejected dormant-counter removal evidence |
