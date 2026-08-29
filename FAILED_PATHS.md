@@ -62,6 +62,18 @@ This file is the active structured rejection record. [OPTIMIZATION_PATH_FAILURES
 - Reopen only if: production builds gain LTO/PGO changes that materially alter these functions, or a new profile attributes retired instructions to the dormant branches.
 - Related commit or revert: candidate discarded by explicit reverse patch; documented in this record-only commit.
 
+## PERF-007 - Traverse object chunk arrays directly
+
+- Hypothesis: avoiding LinkerDriver::getChunks allocation and pointer copying in GC and writer section creation would reduce two O(chunks) staging passes.
+- Scope: lld/COFF/MarkLive.cpp and Writer.cpp.
+- Attempted change: replaced the two Hauberk-reachable flat snapshot loops with identically ordered nested objFileInstances and ObjFile::getChunks loops; conditional callers retained snapshots.
+- Benchmark evidence: existing-output n=50 wall regressed 1343 to 1415 ms, GC 115.54 to 119.20 ms, Code Layout 88.50 to 92.40 ms, and Total Linking Time 1242.60 to 1309.72 ms. The candidate won 20/50 GC pairs and 22/50 Code Layout pairs.
+- Correctness evidence: the candidate built successfully; callbacks and structural mutation were avoided by using direct loops.
+- Failure mode: losing the contiguous flat pointer stream and inlining the two-level traversal outweighed allocation/copy savings; MarkLive object code also grew 1,993 bytes.
+- Why not to retry unchanged: both intended consumer timers regressed in the same A/B batch.
+- Reopen only if: a profile proves getChunks allocation dominates on a substantially larger chunk graph or a lazy range preserves flat-stream locality.
+- Related commit or revert: candidate discarded by explicit reverse patch; documented in this record-only commit.
+
 ## ARCHIVE-001 - Broad debug S caching and module-symbol buffering
 
 - Hypothesis: caching parsed debug subsections and buffering module symbols per object would avoid repeated parsing and writes.
