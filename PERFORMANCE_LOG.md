@@ -2,12 +2,18 @@
 
 ## Current Active Timings
 
-| Benchmark | Baseline | Current | Delta | Command | Last Updated |
+| Benchmark | Frozen Parent | Current | Delta | Command | Last Updated |
 |---|---:|---:|---:|---|---|
-| Hauberk clean-output direct-link wall, n=100 average | 1723.9 ms | 1710.5 ms | -13.4 ms (-0.78%) | linker-bench hauberk dev, alternating A/B | 2026-08-28 19:20 PDT |
-| Hauberk clean-output Total Linking Time, n=100 average | 1600.85 ms | 1587.79 ms | -13.06 ms (-0.82%) | lld-link /time from the same replay | 2026-08-28 19:20 PDT |
-| Hauberk clean-output GC, n=100 average | 152.52 ms | 148.84 ms | -3.68 ms (-2.41%) | lld-link /time from the same replay | 2026-08-28 19:20 PDT |
-| Hauberk existing-output direct-link wall, n=100 average | 1356 ms | 1343 ms | -13 ms (-0.96%) | linker-bench hauberk dev, alternating A/B | 2026-08-28 19:08 PDT |
+| Hauberk clean-output direct-link wall, n=100 average | 1185.7 ms | 1180.5 ms | -5.2 ms (-0.44%) | linker-bench hauberk dev, alternating A/B | 2026-08-28 20:20 PDT |
+| Hauberk clean-output Total Linking Time, n=100 average | 1105.88 ms | 1100.53 ms | -5.35 ms (-0.48%) | lld-link /time from the same replay | 2026-08-28 20:20 PDT |
+| Hauberk clean-output GC, n=100 average | 102.25 ms | 101.14 ms | -1.11 ms (-1.09%) | lld-link /time from the same replay | 2026-08-28 20:20 PDT |
+| Hauberk clean-output Code Layout, n=100 average | 77.88 ms | 76.25 ms | -1.63 ms (-2.09%) | lld-link /time from the same replay | 2026-08-28 20:20 PDT |
+| Hauberk existing-output direct-link wall, n=100 average | 1212 ms | 1208 ms | -4 ms (-0.33%) | linker-bench hauberk dev, alternating A/B | 2026-08-28 20:10 PDT |
+| Hauberk existing-output Total Linking Time, n=100 average | 1102.43 ms | 1100.81 ms | -1.62 ms (-0.15%) | lld-link /time from the same replay | 2026-08-28 20:10 PDT |
+| Hauberk existing-output GC, n=100 average | 101.03 ms | 99.35 ms | -1.68 ms (-1.66%) | lld-link /time from the same replay | 2026-08-28 20:10 PDT |
+| Hauberk existing-output Code Layout, n=100 average | 77.21 ms | 75.82 ms | -1.39 ms (-1.80%) | lld-link /time from the same replay | 2026-08-28 20:10 PDT |
+
+The active rows compare PERF-008 against its frozen immediate parent, commit 49f9b82bc6ec. PERF-004's campaign-baseline measurements remain in its delta entry below.
 
 ## Baseline
 
@@ -107,6 +113,18 @@
 - Decision: rejected. Avoiding the flat snapshot regressed both direct consumer buckets and end-to-end time.
 - Commit: this record-only rejection commit.
 
+### 2026-08-28 20:25 PDT - PERF-008 reserve exact flat chunk capacity
+
+- Change: summed each ObjFile chunk-array size and reserved the exact total before LinkerDriver::getChunks appends the arrays.
+- Production reachability: the measured /OPT:REF Rust link materializes this flat chunk stream in both markLive and Writer::createSections. Conditional ICF, /order, and MinGW pseudo-relocation consumers use the same helper.
+- Mechanism evidence: the change retains the contiguous flat pointer stream and its ordering while eliminating geometric vector growth. Candidate and parent lld-link binaries were both 72,189,440 bytes.
+- Existing-output n=100 A/B: wall 1208 versus 1212 ms, GC 99.35 versus 101.03 ms, Code Layout 75.82 versus 77.21 ms, and Total Linking Time 1100.81 versus 1102.43 ms. The candidate won 61/100 wall and GC pairs and 65/100 Code Layout pairs.
+- Clean-output n=100 confirmation: wall 1180.5 versus 1185.7 ms, GC 101.14 versus 102.25 ms, Code Layout 76.25 versus 77.88 ms, and Total Linking Time 1100.53 versus 1105.88 ms. Candidate wins were 61/100 wall, 64/100 GC, 63/100 Code Layout, and 65/100 total-time pairs.
+- Correctness evidence: 14/14 focused GC, ICF, /order, and MinGW pseudo-relocation lit tests passed; 32/32 LLDCOFFTests passed. The 615-test COFF run passed 587 with 14 unsupported, 10 failed, and 4 unresolved. Twelve incremental-test non-passes were pre-existing; the FatLTO failure passed alone, and the remaining ThinLTO failure reproduced with the frozen parent.
+- Output equivalence: extracted .text, .data, .pdata, .tls, and .reloc sections and the import library matched the frozen parent byte-for-byte.
+- Decision: accepted. Two independent 100-pair runs improved both direct consumer timers and end-to-end wall time.
+- Commit: this commit.
+
 ## Candidate Inventory
 
 | ID | Hypothesis | Scope | Status | Evidence |
@@ -118,6 +136,7 @@
 | PERF-005 | Reduce output section/layout work on the Hauberk graph | lld/COFF/Writer.cpp | Survey | Code Layout averages 104.28 ms |
 | PERF-006 | Improve benchmark diagnostics with paired lane deltas and timer summaries | external linker-bench harness | Rotation and clean-output policy active | Rotated duplicate lanes reduced average drift to 0.09% |
 | PERF-007 | Traverse per-object chunk arrays without a flat temporary | MarkLive.cpp and Writer.cpp | Rejected | n=50 regressed GC 3.66 ms, Code Layout 3.90 ms, and wall 72 ms |
+| PERF-008 | Reserve exact capacity for the flat chunk snapshot | lld/COFF/Driver.cpp | Accepted | Two n=100 batches improved wall, GC, Code Layout, and total link time |
 
 ## Commit History
 
@@ -125,4 +144,5 @@
 |---|---|---|
 | 0d1ba1fb7d86 | PERF-000, PERF-004 | Baseline records plus validated GC dispatch optimization |
 | 49f9b82bc6ec | PERF-001 | Rejected dormant-counter removal evidence |
-| This commit | PERF-007 | Rejected direct chunk-traversal evidence |
+| 5c50f49e1811 | PERF-007 | Rejected direct chunk-traversal evidence |
+| This commit | PERF-008 | Accepted exact flat-chunk reserve |

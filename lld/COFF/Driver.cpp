@@ -192,6 +192,10 @@ llvm::Triple::ArchType LinkerDriver::getArch() {
 
 std::vector<Chunk *> LinkerDriver::getChunks() const {
   std::vector<Chunk *> res;
+  size_t numChunks = 0;
+  for (ObjFile *file : ctx.objFileInstances)
+    numChunks += file->getChunks().size();
+  res.reserve(numChunks);
   for (ObjFile *file : ctx.objFileInstances) {
     ArrayRef<Chunk *> v = file->getChunks();
     res.insert(res.end(), v.begin(), v.end());
