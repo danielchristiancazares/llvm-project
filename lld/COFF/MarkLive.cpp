@@ -41,31 +41,29 @@ void markLive(COFFLinkerContext &ctx) {
     worklist.push_back(c);
   };
 
-  std::function<void(Symbol *)> addSym;
-
-  auto addImportFile = [&](ImportFile *file) {
+  auto addImportFile = [](auto &addSym, ImportFile *file) {
     file->live = true;
     if (file->impchkThunk && file->impchkThunk->exitThunk)
-      addSym(file->impchkThunk->exitThunk);
+      addSym(addSym, file->impchkThunk->exitThunk);
   };
 
-  addSym = [&](Symbol *s) {
+  auto addSym = [&](auto &self, Symbol *s) -> void {
     Defined *b = s->getDefined();
     if (!b)
       return;
     if (auto *sym = dyn_cast<DefinedRegular>(b)) {
       enqueue(sym->getChunk());
     } else if (auto *sym = dyn_cast<DefinedImportData>(b)) {
-      addImportFile(sym->file);
+      addImportFile(self, sym->file);
     } else if (auto *sym = dyn_cast<DefinedImportThunk>(b)) {
-      addImportFile(sym->wrappedSym->file);
+      addImportFile(self, sym->wrappedSym->file);
       sym->getChunk()->live = true;
     }
   };
 
   // Add GC root chunks.
   for (Symbol *b : ctx.config.gcroot)
-    addSym(b);
+    addSym(addSym, b);
 
   while (!worklist.empty()) {
     SectionChunk *sc = worklist.pop_back_val();
@@ -74,7 +72,7 @@ void markLive(COFFLinkerContext &ctx) {
     // Mark all symbols listed in the relocation table for this section.
     for (Symbol *b : sc->symbols())
       if (b)
-        addSym(b);
+        addSym(addSym, b);
 
     // Mark associative sections if any.
     for (SectionChunk &c : sc->children())
@@ -82,7 +80,7 @@ void markLive(COFFLinkerContext &ctx) {
 
     // Mark EC entry thunks.
     if (Defined *entryThunk = sc->getEntryThunk())
-      addSym(entryThunk);
+      addSym(addSym, entryThunk);
   }
 }
-}
+} // namespace lld::coff
