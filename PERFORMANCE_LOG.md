@@ -97,6 +97,16 @@
 - Decision: rejected. The 100-pair confirmation regressed the intended phase by 1.94 ms and total linker time by 4.90 ms, so code-size and cleanup value do not satisfy this optimization campaign's performance bar.
 - Commit: this record-only rejection commit.
 
+### 2026-08-28 19:52 PDT - PERF-007 traverse object chunk arrays directly
+
+- Change: replaced getChunks materialization only in the two Hauberk-reachable consumers, markLive and Writer::createSections, with ordered nested ObjFile/chunk loops.
+- Production reachability: both callers execute in the measured /OPT:REF Rust link. Conditional ICF, /order, and MinGW consumers retained snapshot behavior.
+- Mechanism evidence: llvm-nm confirmed MarkLive no longer referenced LinkerDriver::getChunks. MarkLive.cpp.obj grew from 124,591 to 126,584 bytes because traversal was inlined; final lld-link size was unchanged.
+- Existing-output n=50 A/B: wall 1415 versus 1343 ms, GC 119.20 versus 115.54 ms, Code Layout 92.40 versus 88.50 ms, and Total Linking Time 1309.72 versus 1242.60 ms. Candidate won only 20/50 GC and 22/50 Code Layout pairs.
+- Correctness evidence: the LLD target built successfully; the decisive performance regression stopped the candidate before a full correctness cycle.
+- Decision: rejected. Avoiding the flat snapshot regressed both direct consumer buckets and end-to-end time.
+- Commit: this record-only rejection commit.
+
 ## Candidate Inventory
 
 | ID | Hypothesis | Scope | Status | Evidence |
@@ -107,10 +117,12 @@
 | PERF-004 | Remove type-erased dispatch from reachable GC symbol traversal | lld/COFF/MarkLive.cpp | Accepted | Three A/B batches reduced GC about 4 ms; two n=100 batches improved wall time |
 | PERF-005 | Reduce output section/layout work on the Hauberk graph | lld/COFF/Writer.cpp | Survey | Code Layout averages 104.28 ms |
 | PERF-006 | Improve benchmark diagnostics with paired lane deltas and timer summaries | external linker-bench harness | Rotation and clean-output policy active | Rotated duplicate lanes reduced average drift to 0.09% |
+| PERF-007 | Traverse per-object chunk arrays without a flat temporary | MarkLive.cpp and Writer.cpp | Rejected | n=50 regressed GC 3.66 ms, Code Layout 3.90 ms, and wall 72 ms |
 
 ## Commit History
 
 | Commit | Candidate | Result |
 |---|---|---|
 | 0d1ba1fb7d86 | PERF-000, PERF-004 | Baseline records plus validated GC dispatch optimization |
-| This commit | PERF-001 | Rejected dormant-counter removal evidence |
+| 49f9b82bc6ec | PERF-001 | Rejected dormant-counter removal evidence |
+| This commit | PERF-007 | Rejected direct chunk-traversal evidence |
